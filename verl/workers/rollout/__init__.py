@@ -15,5 +15,6 @@
 from .base import BaseRollout
 from .hf_rollout import HFRollout
 from .naive import NaiveRollout
+from .diffusion_rollout import StableDiffusionRollout, WanRollout
 
-__all__ = ["BaseRollout", "NaiveRollout", "HFRollout"]
+__all__ = ["BaseRollout", "NaiveRollout", "HFRollout", "StableDiffusionRollout", "WanRollout"]

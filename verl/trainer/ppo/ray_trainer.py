@@ -27,7 +27,7 @@ from copy import deepcopy
 from dataclasses import dataclass, field
 from enum import Enum
 from pprint import pprint
-from typing import Optional
+from typing import Any, Optional
 
 import numpy as np
 import ray
@@ -154,7 +154,7 @@ class ResourcePoolManager:
                 )
 
 
-def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, kl_penalty="kl"):
+def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, kl_penalty="kl", diffusion=False):
     """Apply KL penalty to the token-level rewards.
 
     This function computes the KL divergence between the reference policy and current policy,
@@ -165,28 +165,56 @@ def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, 
         kl_ctrl (core_algos.AdaptiveKLController): Controller for adaptive KL penalty.
         kl_penalty (str, optional): Type of KL penalty to apply. Defaults to "kl".
         multi_turn (bool, optional): Whether the data is from a multi-turn conversation. Defaults to False.
+        diffusion (bool, optional): Whether this is for diffusion models. Defaults to False.
 
     Returns:
         tuple: A tuple containing:
             - The updated data with token-level rewards adjusted by KL penalty
             - A dictionary of metrics related to the KL penalty
     """
-    response_mask = data.batch["response_mask"]
     token_level_scores = data.batch["token_level_scores"]
     batch_size = data.batch.batch_size[0]
-
-    # compute kl between ref_policy and current policy
-    # When apply_kl_penalty, algorithm.use_kl_in_reward=True, so the reference model has been enabled.
-    kld = core_algos.kl_penalty(
-        data.batch["old_log_probs"], data.batch["ref_log_prob"], kl_penalty=kl_penalty
-    )  # (batch_size, response_length)
-    kld = kld * response_mask
     beta = kl_ctrl.value
 
-    token_level_rewards = token_level_scores - beta * kld
-
-    current_kl = masked_mean(kld, mask=response_mask, axis=-1)  # average over sequence
-    current_kl = torch.mean(current_kl, dim=0).item()
+    if diffusion:
+        # For diffusion models: handle sequence-level KL penalty
+        # In diffusion models, token_level_scores has shape (batch_size, 1)
+        # and we use MSE-based KL between prev_sample_mean and ref_prev_sample_mean
+        if "ref_prev_sample_mean" in data.batch and "prev_sample_mean" in data.batch:
+            # Compute MSE-based KL for diffusion models
+            prev_sample_mean = data.batch["prev_sample_mean"]
+            ref_prev_sample_mean = data.batch["ref_prev_sample_mean"]
+            
+            # Compute MSE KL: (prev_sample_mean - ref_prev_sample_mean)^2 / (2 * std_dev^2)
+            # For simplicity, we assume std_dev^2 = 1.0 here, but this could be made configurable
+            kld = (prev_sample_mean - ref_prev_sample_mean) ** 2 / 2.0
+            
+            # Average over all dimensions except batch dimension
+            kld = kld.mean(dim=tuple(range(1, kld.ndim)))
+            
+            # Apply KL penalty to sequence-level rewards
+            token_level_rewards = token_level_scores - beta * kld.unsqueeze(-1)
+            
+            current_kl = torch.mean(kld, dim=0).item()
+        else:
+            # No reference data available, use original rewards
+            token_level_rewards = token_level_scores
+            current_kl = 0.0
+    else:
+        # For non-diffusion models: handle token-level KL penalty
+        response_mask = data.batch["response_mask"]
+        
+        # compute kl between ref_policy and current policy
+        # When apply_kl_penalty, algorithm.use_kl_in_reward=True, so the reference model has been enabled.
+        kld = core_algos.kl_penalty(
+            data.batch["old_log_probs"], data.batch["ref_log_prob"], kl_penalty=kl_penalty
+        )  # (batch_size, response_length)
+        kld = kld * response_mask
+        
+        token_level_rewards = token_level_scores - beta * kld
+        
+        current_kl = masked_mean(kld, mask=response_mask, axis=-1)  # average over sequence
+        current_kl = torch.mean(current_kl, dim=0).item()
 
     # according to https://github.com/huggingface/trl/blob/951ca1841f29114b969b57b26c7d3e80a39f75a0/trl/trainer/ppo_trainer.py#L837
     kl_ctrl.update(current_kl=current_kl, n_steps=batch_size)
@@ -295,6 +323,35 @@ def compute_advantage(
     return data
 
 
+def compute_advantage_diffusion(data: DataProto, adv_estimator: AdvantageEstimator, gamma: float = 1.0, lam: float = 1.0) -> DataProto:
+    """Compute advantage estimates for diffusion models using GRPO estimator.
+    
+    This function is specifically designed for diffusion models and uses the GRPO (Group Relative Policy Optimization)
+    advantage estimator to compute advantages and returns for policy optimization in diffusion settings.
+    
+    Args:
+        data (DataProto): The data containing batched model outputs and inputs.
+        adv_estimator (AdvantageEstimator): The advantage estimator to use (should be GRPO for diffusion).
+        gamma (float, optional): Discount factor for future rewards. Defaults to 1.0.
+        lam (float, optional): Lambda parameter for GAE. Defaults to 1.0.
+        
+    Returns:
+        DataProto: The updated data with computed advantages and returns.
+    """
+    token_level_rewards = data.batch["token_level_rewards"]  # (batch_size, 1)
+    if adv_estimator == AdvantageEstimator.GRPO:
+        batch_size = token_level_rewards.shape[0]
+        response_mask = torch.ones((batch_size, 1), dtype=torch.bool)
+        index = torch.zeros((batch_size), dtype=torch.long)
+        advantages, returns = core_algos.compute_grpo_outcome_advantage(token_level_rewards, response_mask, index)
+    else:
+        raise NotImplementedError
+
+    data.batch["advantages"] = advantages
+    data.batch["returns"] = returns
+    return data
+
+
 class RayPPOTrainer:
     """Distributed PPO trainer using Ray for scalable reinforcement learning.
 
@@ -386,6 +443,9 @@ class RayPPOTrainer:
                 stacklevel=2,
             )
             self.use_critic = False
+
+        # Initialize diffusion flag from config
+        self.diffusion = getattr(config.trainer, 'diffusion', False)
 
         self._validate_config()
         self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
@@ -502,6 +562,59 @@ class RayPPOTrainer:
             assert config.actor_rollout_ref.rollout.temperature > 0, (
                 "validation gen temperature should be greater than 0 when enabling do_sample"
             )
+
+        # Diffusion-specific validation
+        if self.diffusion:
+            # Validate rollout name for diffusion
+            if config.actor_rollout_ref.rollout.name != "diffusion":
+                raise ValueError(
+                    f"When trainer.diffusion=True, rollout.name must be 'diffusion', got '{config.actor_rollout_ref.rollout.name}'"
+                )
+            
+            # Validate diffusion-specific parameters
+            if config.actor_rollout_ref.rollout.num_steps is None:
+                raise ValueError("When using diffusion models, rollout.num_steps must be specified")
+            
+            if config.actor_rollout_ref.rollout.num_steps <= 0:
+                raise ValueError(f"rollout.num_steps must be positive, got {config.actor_rollout_ref.rollout.num_steps}")
+            
+            if config.actor_rollout_ref.rollout.guidance_scale is None:
+                raise ValueError("When using diffusion models, rollout.guidance_scale must be specified")
+            
+            if config.actor_rollout_ref.rollout.guidance_scale < 1.0:
+                raise ValueError(f"rollout.guidance_scale must be >= 1.0, got {config.actor_rollout_ref.rollout.guidance_scale}")
+            
+            # Validate resolution for SD3 image diffusion
+            if config.actor_rollout_ref.rollout.resolution is not None:
+                if not isinstance(config.actor_rollout_ref.rollout.resolution, int) or config.actor_rollout_ref.rollout.resolution <= 0:
+                    raise ValueError(f"rollout.resolution must be a positive integer, got {config.actor_rollout_ref.rollout.resolution}")
+            
+            # Validate WAN video parameters
+            if config.actor_rollout_ref.rollout.height is not None:
+                if not isinstance(config.actor_rollout_ref.rollout.height, int) or config.actor_rollout_ref.rollout.height <= 0:
+                    raise ValueError(f"rollout.height must be a positive integer, got {config.actor_rollout_ref.rollout.height}")
+            
+            if config.actor_rollout_ref.rollout.width is not None:
+                if not isinstance(config.actor_rollout_ref.rollout.width, int) or config.actor_rollout_ref.rollout.width <= 0:
+                    raise ValueError(f"rollout.width must be a positive integer, got {config.actor_rollout_ref.rollout.width}")
+            
+            if config.actor_rollout_ref.rollout.num_frames is not None:
+                if not isinstance(config.actor_rollout_ref.rollout.num_frames, int) or config.actor_rollout_ref.rollout.num_frames <= 0:
+                    raise ValueError(f"rollout.num_frames must be a positive integer, got {config.actor_rollout_ref.rollout.num_frames}")
+            
+            # Validate actor configuration for diffusion
+            if not getattr(config.actor_rollout_ref.actor.config, 'extra', {}).get('diffusion', False):
+                raise ValueError(
+                    "When trainer.diffusion=True, actor.config.extra.diffusion must be True"
+                )
+            
+            # Validate that we're not using incompatible settings
+            if config.actor_rollout_ref.rollout.do_sample is False:
+                raise ValueError("Diffusion models require rollout.do_sample=True")
+            
+            # Check that log_prob computation settings are compatible
+            if config.actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu is None and config.actor_rollout_ref.rollout.log_prob_micro_batch_size is None:
+                raise ValueError("For diffusion models, either rollout.log_prob_micro_batch_size_per_gpu or rollout.log_prob_micro_batch_size must be specified")
 
         print("[validate_config] All configuration checks passed successfully!")
 
@@ -644,76 +757,112 @@ class RayPPOTrainer:
             test_batch = DataProto.from_single_dict(test_data)
 
             # repeat test batch
-            test_batch = test_batch.repeat(
-                repeat_times=self.config.actor_rollout_ref.rollout.val_kwargs.n, interleave=True
-            )
+            if not self.diffusion:
+                test_batch = test_batch.repeat(
+                    repeat_times=self.config.actor_rollout_ref.rollout.val_kwargs.n, interleave=True
+                )
 
             # we only do validation on rule-based rm
             if self.config.reward_model.enable and test_batch[0].non_tensor_batch["reward_model"]["style"] == "model":
                 return {}
 
             # Store original inputs
-            input_ids = test_batch.batch["input_ids"]
-            # TODO: Can we keep special tokens except for padding tokens?
-            input_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in input_ids]
+            if self.diffusion:
+                # For diffusion models, handle differently based on what's available
+                if "text" in test_batch.non_tensor_batch:
+                    input_texts = test_batch.non_tensor_batch["text"].tolist()
+                else:
+                    # Fallback to placeholder if no text prompts available
+                    input_texts = [f"Diffusion prompt {i}" for i in range(len(test_batch))]
+            else:
+                input_ids = test_batch.batch["input_ids"]
+                # TODO: Can we keep special tokens except for padding tokens?
+                input_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in input_ids]
             sample_inputs.extend(input_texts)
 
-            batch_keys_to_pop = ["input_ids", "attention_mask", "position_ids"]
-            non_tensor_batch_keys_to_pop = ["raw_prompt_ids"]
-            if "multi_modal_data" in test_batch.non_tensor_batch:
-                non_tensor_batch_keys_to_pop.append("multi_modal_data")
-            if "raw_prompt" in test_batch.non_tensor_batch:
-                non_tensor_batch_keys_to_pop.append("raw_prompt")
-            if "tools_kwargs" in test_batch.non_tensor_batch:
-                non_tensor_batch_keys_to_pop.append("tools_kwargs")
-            if "interaction_kwargs" in test_batch.non_tensor_batch:
-                non_tensor_batch_keys_to_pop.append("interaction_kwargs")
-            if "agent_name" in test_batch.non_tensor_batch:
-                non_tensor_batch_keys_to_pop.append("agent_name")
-            test_gen_batch = test_batch.pop(
-                batch_keys=batch_keys_to_pop,
-                non_tensor_batch_keys=non_tensor_batch_keys_to_pop,
-            )
-
-            test_gen_batch.meta_info = {
-                "eos_token_id": self.tokenizer.eos_token_id,
-                "pad_token_id": self.tokenizer.pad_token_id,
-                "recompute_log_prob": False,
-                "do_sample": self.config.actor_rollout_ref.rollout.val_kwargs.do_sample,
-                "validate": True,
-                "global_steps": self.global_steps,
-            }
+            if self.diffusion:
+                # For diffusion models, pop embedding-related keys
+                test_gen_batch = test_batch.pop(
+                    batch_keys=["prompt_embeds", "pooled_prompt_embeds", "negative_prompt_embeds",
+                               "negative_pooled_prompt_embeds"]
+                )
+                test_gen_batch.meta_info = self.config.actor_rollout_ref.rollout.val_kwargs
+            else:
+                batch_keys_to_pop = ["input_ids", "attention_mask", "position_ids"]
+                non_tensor_batch_keys_to_pop = ["raw_prompt_ids"]
+                if "multi_modal_data" in test_batch.non_tensor_batch:
+                    non_tensor_batch_keys_to_pop.append("multi_modal_data")
+                if "raw_prompt" in test_batch.non_tensor_batch:
+                    non_tensor_batch_keys_to_pop.append("raw_prompt")
+                if "tools_kwargs" in test_batch.non_tensor_batch:
+                    non_tensor_batch_keys_to_pop.append("tools_kwargs")
+                if "interaction_kwargs" in test_batch.non_tensor_batch:
+                    non_tensor_batch_keys_to_pop.append("interaction_kwargs")
+                if "agent_name" in test_batch.non_tensor_batch:
+                    non_tensor_batch_keys_to_pop.append("agent_name")
+                test_gen_batch = test_batch.pop(
+                    batch_keys=batch_keys_to_pop,
+                    non_tensor_batch_keys=non_tensor_batch_keys_to_pop,
+                )
+                test_gen_batch.meta_info = {
+                    "eos_token_id": self.tokenizer.eos_token_id,
+                    "pad_token_id": self.tokenizer.pad_token_id,
+                    "recompute_log_prob": False,
+                    "do_sample": self.config.actor_rollout_ref.rollout.val_kwargs.do_sample,
+                    "validate": True,
+                    "global_steps": self.global_steps,
+                }
             print(f"test_gen_batch meta info: {test_gen_batch.meta_info}")
 
             # pad to be divisible by dp_size
-            if self.disaggregate_actor_rollout:
-                size_divisor = (
-                    self.actor_rollout_llm_wg.world_size
-                    if not self.async_rollout_mode
-                    else self.config.actor_rollout_ref_llm_wg.rollout.agent.num_workers
-                )
+            if self.diffusion:
+                # For diffusion, directly generate without padding/unpadding
+                if not self.async_rollout_mode:
+                    test_output_gen_batch = self.actor_rollout_wg.generate_sequences(test_gen_batch)
+                else:
+                    test_output_gen_batch = self.async_rollout_manager.generate_sequences(test_gen_batch)
             else:
-                size_divisor = (
-                    self.actor_rollout_wg.world_size
-                    if not self.async_rollout_mode
-                    else self.config.actor_rollout_ref.rollout.agent.num_workers
-                )
-            test_gen_batch_padded, pad_size = pad_dataproto_to_divisor(test_gen_batch, size_divisor)
-            if not self.async_rollout_mode:
-                test_output_gen_batch_padded = self.actor_rollout_wg.generate_sequences(test_gen_batch_padded)
-            else:
-                test_output_gen_batch_padded = self.async_rollout_manager.generate_sequences(test_gen_batch_padded)
+                if self.disaggregate_actor_rollout:
+                    size_divisor = (
+                        self.actor_rollout_llm_wg.world_size
+                        if not self.async_rollout_mode
+                        else self.config.actor_rollout_ref_llm_wg.rollout.agent.num_workers
+                    )
+                else:
+                    size_divisor = (
+                        self.actor_rollout_wg.world_size
+                        if not self.async_rollout_mode
+                        else self.config.actor_rollout_ref.rollout.agent.num_workers
+                    )
+                test_gen_batch_padded, pad_size = pad_dataproto_to_divisor(test_gen_batch, size_divisor)
+                if not self.async_rollout_mode:
+                    test_output_gen_batch_padded = self.actor_rollout_wg.generate_sequences(test_gen_batch_padded)
+                else:
+                    test_output_gen_batch_padded = self.async_rollout_manager.generate_sequences(test_gen_batch_padded)
 
-            # unpad
-            test_output_gen_batch = unpad_dataproto(test_output_gen_batch_padded, pad_size=pad_size)
+                # unpad
+                test_output_gen_batch = unpad_dataproto(test_output_gen_batch_padded, pad_size=pad_size)
 
             print("validation generation end")
 
             # Store generated outputs
-            output_ids = test_output_gen_batch.batch["responses"]
-            output_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in output_ids]
+            if self.diffusion:
+                # For diffusion models, handle differently based on what's available
+                # Assume generated images are available in the batch
+                if "responses" in test_output_gen_batch.batch:
+                    # If responses exist, treat them as generated outputs
+                    output_ids = test_output_gen_batch.batch["responses"]
+                    output_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in output_ids]
+                else:
+                    # Fallback to placeholder if no generated outputs available
+                    output_texts = [f"Diffusion output {i}" for i in range(len(test_output_gen_batch))]
+            else:
+                output_ids = test_output_gen_batch.batch["responses"]
+                output_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in output_ids]
             sample_outputs.extend(output_texts)
 
+            if not self.diffusion:
+                test_batch = test_batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.val_kwargs.n, interleave=True)
             test_batch = test_batch.union(test_output_gen_batch)
             test_batch.meta_info["validate"] = True
 
@@ -781,6 +930,100 @@ class RayPPOTrainer:
             metric_dict["val-aux/num_turns/mean"] = sample_turns.mean()
 
         return metric_dict
+
+    def _make_batch_data(self, metrics: dict[str, Any]) -> DataProto:
+        """Create batch data with diffusion support."""
+        batch = None
+        all_metrics = defaultdict(list)
+        num_try_make_batch = 0
+        print("Start generating batch...")
+        while True:
+            num_try_make_batch += 1
+            try:
+                batch_dict = next(self.data_iterator)
+            except StopIteration:
+                self.data_iterator = iter(self.train_dataloader)
+                batch_dict = next(self.data_iterator)
+
+            meta_info = {"min_pixels": self.config.data.min_pixels, "max_pixels": self.config.data.max_pixels}
+            new_batch: DataProto = DataProto.from_single_dict(batch_dict, meta_info=meta_info)
+            
+            if self.diffusion:
+                gen_batch = new_batch.pop(batch_keys=["prompt_embeds", "pooled_prompt_embeds", "negative_prompt_embeds", "negative_pooled_prompt_embeds"])
+            else:
+                # pop those keys for generation
+                gen_batch = new_batch.pop(
+                    batch_keys=["input_ids", "attention_mask", "position_ids"],
+                    non_tensor_batch_keys=["raw_prompt_ids", "multi_modal_data", "ground_truth"],
+                    meta_info_keys=["min_pixels", "max_pixels"],
+                )
+
+            # generate a batch
+            gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch)
+
+            if self.config.algorithm.adv_estimator == "remax":
+                gen_baseline_batch = deepcopy(gen_batch)
+                gen_baseline_batch.meta_info["temperature"] = 0
+                gen_baseline_batch.meta_info["n"] = 1
+                gen_baseline_output = self.actor_rollout_wg.generate_sequences(gen_baseline_batch)
+
+                new_batch = new_batch.union(gen_baseline_output)
+                reward_baseline_tensor, _ = ray.get(self.reward_fn.compute_reward.remote(new_batch))
+                reward_baseline_tensor = reward_baseline_tensor.sum(dim=-1)
+
+                new_batch.pop(batch_keys=list(gen_baseline_output.batch.keys()))
+                new_batch.batch["reward_baselines"] = reward_baseline_tensor
+                del gen_baseline_batch, gen_baseline_output
+
+            new_batch.non_tensor_batch["uid"] = np.array(
+                [str(uuid.uuid4()) for _ in range(len(new_batch.batch))], dtype=object
+            )
+            # repeat to align with repeated responses in rollout
+            if not self.diffusion:
+                new_batch = new_batch.repeat(repeat_times=self.config.worker.rollout.n, interleave=True)
+            new_batch = new_batch.union(gen_batch_output)
+
+            # filter group
+            if self.config.algorithm.online_filtering:
+                reward_tensor, reward_metrics = ray.get(self.reward_fn.compute_reward.remote(new_batch))
+                new_batch.batch["token_level_scores"] = reward_tensor
+                for k, v in reward_metrics.items():
+                    all_metrics[k].extend(v)
+
+                filter_scores = reward_metrics[self.config.algorithm.filter_key]
+                uids = new_batch.non_tensor_batch["uid"]
+                uid2scores = defaultdict(list)
+                for uid, score in zip(uids, filter_scores):
+                    uid2scores[uid].append(score)
+
+                uid2mean = {uid: np.mean(scores) for uid, scores in uid2scores.items()}
+                kept_uids = [
+                    uid
+                    for uid, avg_score in uid2mean.items()
+                    if avg_score > self.config.algorithm.filter_low and avg_score < self.config.algorithm.filter_high
+                ]
+                kept_sample_idxs = [idx for idx, uid in enumerate(uids) if uid in kept_uids]
+                if len(kept_sample_idxs) > 0:
+                    new_batch = new_batch[kept_sample_idxs]
+
+            batch = DataProto.concat([batch, new_batch]) if batch is not None else new_batch
+            current_batch_size = len(batch) // self.config.worker.rollout.n
+            rollout_batch_size = self.config.data.rollout_batch_size
+            if current_batch_size < rollout_batch_size:
+                print(f"{current_batch_size=} < {rollout_batch_size=}")
+                max_try_make_batch = self.config.trainer.max_try_make_batch
+                if max_try_make_batch <= 0 or num_try_make_batch < max_try_make_batch:
+                    print(f"{num_try_make_batch=}. Continue generating...")
+                else:
+                    raise ValueError(
+                        f"{num_try_make_batch=} >= {max_try_make_batch=}. Generated too many. Please check your data."
+                    )
+            else:
+                print(f"{current_batch_size=} >= {rollout_batch_size=}. Finish generating.")
+                if self.config.algorithm.online_filtering:
+                    metrics.update({f"reward/{k}": v for k, v in reduce_metrics(all_metrics).items()})
+
+                return batch[: self.config.data.rollout_batch_size * self.config.worker.rollout.n]
 
     def init_workers(self):
         """Initialize distributed training workers using Ray backend.
@@ -1278,6 +1521,14 @@ class RayPPOTrainer:
                 with marked_timer("step", timing_raw):
                     # # generate a batch
                     with marked_timer("gen", timing_raw, color="red"):
+                        # Prepare rollout engine for non-diffusion models
+                        if not self.diffusion:
+                            if self.disaggregate_actor_rollout:
+                                self.actor_rollout_encoder_wg.prepare_rollout_engine()
+                                self.actor_rollout_llm_wg.prepare_rollout_engine()
+                            else:
+                                self.actor_rollout_wg.prepare_rollout_engine()
+                        
                         if not self.async_rollout_mode:
                             if self.disaggregate_actor_rollout:
                                 modality_embeddings = self.actor_rollout_encoder_wg.rollout_forward(modality_batch)
@@ -1315,7 +1566,8 @@ class RayPPOTrainer:
                         [str(uuid.uuid4()) for _ in range(len(batch.batch))], dtype=object
                     )
                     # repeat to align with repeated responses in rollout
-                    batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
+                    if not self.diffusion:
+                        batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
                     batch = batch.union(gen_batch_output)
 
                     if "response_mask" not in batch.batch.keys():
@@ -1337,6 +1589,7 @@ class RayPPOTrainer:
                             reward_tensor = self.rm_wg.compute_rm_score(batch)
                             batch = batch.union(reward_tensor)
 
+                        # Handle reward computation based on diffusion mode
                         if self.config.reward_model.launch_reward_fn_async:
                             future_reward = compute_reward_async.remote(data=batch, reward_fn=self.reward_fn)
                         else:
@@ -1353,31 +1606,64 @@ class RayPPOTrainer:
                                 batch.non_tensor_batch.pop(key)
                         else:
                             old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
-                        entropys = old_log_prob.batch["entropys"]
-                        response_masks = batch.batch["response_mask"]
-                        loss_agg_mode = self.config.actor_rollout_ref.actor.loss_agg_mode
-                        entropy_agg = agg_loss(loss_mat=entropys, loss_mask=response_masks, loss_agg_mode=loss_agg_mode)
-                        old_log_prob_metrics = {"actor/entropy": entropy_agg.detach().item()}
-                        metrics.update(old_log_prob_metrics)
-                        old_log_prob.batch.pop("entropys")
+                        
+                        # Handle entropy calculation for diffusion vs non-diffusion models
+                        if self.diffusion:
+                            # For diffusion models, entropy might not be available or in different format
+                            if "entropys" in old_log_prob.batch:
+                                entropys = old_log_prob.batch["entropys"]
+                                # For diffusion, entropy shape might be different
+                                if len(entropys.shape) == 2:  # (batch_size, num_steps)
+                                    # Aggregate entropy over diffusion steps
+                                    entropy_agg = entropys.mean(dim=1)  # Average over steps
+                                else:
+                                    entropy_agg = entropys
+                                old_log_prob_metrics = {"actor/entropy": entropy_agg.mean().detach().item()}
+                                metrics.update(old_log_prob_metrics)
+                                old_log_prob.batch.pop("entropys")
+                        else:
+                            # Original non-diffusion entropy handling
+                            entropys = old_log_prob.batch["entropys"]
+                            response_masks = batch.batch["response_mask"]
+                            loss_agg_mode = self.config.actor_rollout_ref.actor.loss_agg_mode
+                            entropy_agg = agg_loss(loss_mat=entropys, loss_mask=response_masks, loss_agg_mode=loss_agg_mode)
+                            old_log_prob_metrics = {"actor/entropy": entropy_agg.detach().item()}
+                            metrics.update(old_log_prob_metrics)
+                            old_log_prob.batch.pop("entropys")
+                        
                         batch = batch.union(old_log_prob)
 
                         if "rollout_log_probs" in batch.batch.keys():
                             # TODO: we may want to add diff of probs too.
                             rollout_old_log_probs = batch.batch["rollout_log_probs"]
                             actor_old_log_probs = batch.batch["old_log_probs"]
-                            attention_mask = batch.batch["attention_mask"]
-                            responses = batch.batch["responses"]
-                            response_length = responses.size(1)
-                            response_mask = attention_mask[:, -response_length:]
+                            
+                            if self.diffusion:
+                                # For diffusion models, handle different tensor structures
+                                # rollout_old_log_probs and actor_old_log_probs should have shape (batch_size, num_steps)
+                                rollout_probs = torch.exp(rollout_old_log_probs)
+                                actor_probs = torch.exp(actor_old_log_probs)
+                                rollout_probs_diff = torch.abs(rollout_probs - actor_probs)
+                                
+                                # For diffusion, we average over the diffusion steps
+                                rollout_probs_diff_max = torch.max(rollout_probs_diff.mean(dim=1))
+                                rollout_probs_diff_mean = torch.mean(rollout_probs_diff.mean(dim=1))
+                                rollout_probs_diff_std = torch.std(rollout_probs_diff.mean(dim=1))
+                            else:
+                                # Original non-diffusion logic
+                                attention_mask = batch.batch["attention_mask"]
+                                responses = batch.batch["responses"]
+                                response_length = responses.size(1)
+                                response_mask = attention_mask[:, -response_length:]
 
-                            rollout_probs = torch.exp(rollout_old_log_probs)
-                            actor_probs = torch.exp(actor_old_log_probs)
-                            rollout_probs_diff = torch.abs(rollout_probs - actor_probs)
-                            rollout_probs_diff = torch.masked_select(rollout_probs_diff, response_mask.bool())
-                            rollout_probs_diff_max = torch.max(rollout_probs_diff)
-                            rollout_probs_diff_mean = torch.mean(rollout_probs_diff)
-                            rollout_probs_diff_std = torch.std(rollout_probs_diff)
+                                rollout_probs = torch.exp(rollout_old_log_probs)
+                                actor_probs = torch.exp(actor_old_log_probs)
+                                rollout_probs_diff = torch.abs(rollout_probs - actor_probs)
+                                rollout_probs_diff = torch.masked_select(rollout_probs_diff, response_mask.bool())
+                                rollout_probs_diff_max = torch.max(rollout_probs_diff)
+                                rollout_probs_diff_mean = torch.mean(rollout_probs_diff)
+                                rollout_probs_diff_std = torch.std(rollout_probs_diff)
+                            
                             metrics.update(
                                 {
                                     "training/rollout_probs_diff_max": rollout_probs_diff_max.detach().item(),
@@ -1398,6 +1684,15 @@ class RayPPOTrainer:
                                     ref_log_prob = self.ref_policy_wg.compute_ref_log_prob(batch)
                             else:
                                 ref_log_prob = self.actor_rollout_wg.compute_ref_log_prob(batch)
+                            
+                            # Handle diffusion-specific reference log probability data
+                            if self.diffusion:
+                                # For diffusion models, reference log prob might include additional data
+                                # like ref_prev_sample_mean for KL regularization
+                                if "ref_prev_sample_mean" in ref_log_prob.batch:
+                                    # Store this for potential KL computation in advantage calculation
+                                    batch.batch["ref_prev_sample_mean"] = ref_log_prob.batch["ref_prev_sample_mean"]
+                            
                             batch = batch.union(ref_log_prob)
 
                             if self.disaggregate_ref:
@@ -1415,7 +1710,14 @@ class RayPPOTrainer:
                         reward_extra_infos_dict: dict[str, list]
                         if self.config.reward_model.launch_reward_fn_async:
                             reward_tensor, reward_extra_infos_dict = ray.get(future_reward)
-                        batch.batch["token_level_scores"] = reward_tensor
+                        
+                        # Handle different reward tensor structures for diffusion vs non-diffusion
+                        if self.diffusion:
+                            # For diffusion: reward_tensor shape is (batch_size, 1)
+                            batch.batch["token_level_scores"] = reward_tensor
+                        else:
+                            # For non-diffusion: reward_tensor shape is (batch_size, sequence_length)
+                            batch.batch["token_level_scores"] = reward_tensor
 
                         if reward_extra_infos_dict:
                             batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
@@ -1423,7 +1725,7 @@ class RayPPOTrainer:
                         # compute rewards. apply_kl_penalty if available
                         if self.config.algorithm.use_kl_in_reward:
                             batch, kl_metrics = apply_kl_penalty(
-                                batch, kl_ctrl=self.kl_ctrl_in_reward, kl_penalty=self.config.algorithm.kl_penalty
+                                batch, kl_ctrl=self.kl_ctrl_in_reward, kl_penalty=self.config.algorithm.kl_penalty, diffusion=self.diffusion
                             )
                             metrics.update(kl_metrics)
                         else:
@@ -1435,15 +1737,24 @@ class RayPPOTrainer:
                             "norm_adv_by_std_in_grpo", True
                         )  # GRPO adv normalization factor
 
-                        batch = compute_advantage(
-                            batch,
-                            adv_estimator=self.config.algorithm.adv_estimator,
-                            gamma=self.config.algorithm.gamma,
-                            lam=self.config.algorithm.lam,
-                            num_repeat=self.config.actor_rollout_ref.rollout.n,
-                            norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
-                            config=self.config.algorithm,
-                        )
+                        # Use diffusion-specific advantage computation if enabled
+                        if self.diffusion:
+                            batch = compute_advantage_diffusion(
+                                batch,
+                                adv_estimator=self.config.algorithm.adv_estimator,
+                                gamma=self.config.algorithm.gamma,
+                                lam=self.config.algorithm.lam,
+                            )
+                        else:
+                            batch = compute_advantage(
+                                batch,
+                                adv_estimator=self.config.algorithm.adv_estimator,
+                                gamma=self.config.algorithm.gamma,
+                                lam=self.config.algorithm.lam,
+                                num_repeat=self.config.actor_rollout_ref.rollout.n,
+                                norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+                                config=self.config.algorithm,
+                            )
 
                     # update critic
                     if self.use_critic:

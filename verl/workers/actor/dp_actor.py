@@ -37,6 +37,10 @@ from verl.utils.ulysses import gather_outputs_and_unpad, ulysses_pad, ulysses_pa
 from verl.workers.actor import BasePPOActor
 from verl.workers.config import ActorConfig
 
+# Diffusion support (ported from Long-RL)
+from diffusers import FlowMatchEulerDiscreteScheduler
+from verl.workers.diffusion_helper import compute_log_prob_flow_grpo
+
 if is_cuda_available:
     from flash_attn.bert_padding import index_first_axis, pad_input, rearrange, unpad_input
 elif is_npu_available:
@@ -86,6 +90,19 @@ class DataParallelPPOActor(BasePPOActor):
             else entropy_from_logits
         )
         self.device_name = get_device_name()
+
+        # diffusion scheduler init when enabled via config.extra
+        self.is_diffusion = self.config.get("diffusion", False)
+        self.diffusion_scheduler = None
+        if self.is_diffusion:
+            scheduler_path = self.config.get("diffusion_scheduler", None)
+            if scheduler_path is None:
+                scheduler_path = os.path.join(config.model.model_path, "scheduler")
+            self.diffusion_scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(scheduler_path)
+
+            # route to diffusion variant
+            self._forward_micro_batch = self._forward_micro_batch_diffusion
+            self.update_policy = self.update_policy_diffusion
 
     def _forward_micro_batch(
         self, micro_batch, temperature, calculate_entropy=False, disaggregate=False, encoder_grad=False,
@@ -392,6 +409,135 @@ class DataParallelPPOActor(BasePPOActor):
                 entropys = restore_dynamic_batch(entropys, batch_idx_list)
 
         return log_probs, entropys
+
+    def _forward_micro_batch_diffusion(self, micro_batch: Dict[str, torch.Tensor], temperature: float) -> torch.Tensor:
+        """
+        Returns:
+            log_probs: # (bs, response_len)
+        """
+        # print("***micro_batch***", micro_batch)
+        prev_sample, log_prob, prev_sample_mean, std_dev_t = compute_log_prob_flow_grpo(self.actor_module,
+                                                                                        self.scheduler,
+                                                                                        micro_batch,
+                                                                                        0,
+                                                                                        micro_batch["prompt_embeds"],
+                                                                                        micro_batch["pooled_prompt_embeds"] if "pooled_prompt_embeds" in micro_batch else None,
+                                                                                        micro_batch["negative_prompt_embeds"] if "negative_prompt_embeds" in micro_batch else None,
+                                                                                        micro_batch["negative_pooled_prompt_embeds"] if "negative_pooled_prompt_embeds" in micro_batch else None,
+                                                                                        self.config)
+
+        return log_prob, prev_sample_mean
+
+    @torch.no_grad()
+    def compute_log_prob_diffusion(self, data: DataProto) -> torch.Tensor:
+        """Compute the log probability of the responses given input_ids, attention_mask and position_ids
+
+        Args:
+            data (DataProto): a DataProto containing keys
+
+        Returns:
+            torch.Tensor: the log_prob tensor
+        """
+        self.actor_module.eval()
+
+        temperature = 0.0
+        select_keys = ["latents", "next_latents", "timesteps", "prompt_embeds", "pooled_prompt_embeds",
+                       "negative_prompt_embeds", "negative_pooled_prompt_embeds"]
+        non_tensor_select_keys = []
+
+        micro_batches = data.select(select_keys, non_tensor_select_keys).split(
+            self.config.micro_batch_size_per_device_for_experience
+        )
+        log_probs_lst = []
+        prev_sample_mean_lst = []
+        if self.rank == 0:
+            micro_batches = tqdm(micro_batches, desc="Compute log probs", position=1)
+
+        for micro_batch in micro_batches:
+            model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch}
+            log_probs, prev_sample_mean = self._forward_micro_batch(model_inputs, temperature=temperature)
+            log_probs_lst.append(log_probs)
+            prev_sample_mean_lst.append(prev_sample_mean)
+
+        log_probs = torch.concat(log_probs_lst, dim=0)
+        prev_sample_mean = torch.concat(prev_sample_mean_lst, dim=0)
+        return log_probs, prev_sample_mean
+
+    @GPUMemoryLogger(role="dp actor", logger=logger)
+    def update_policy_diffusion(self, data: DataProto) -> Dict[str, Any]:
+        self.actor_module.train()
+
+        temperature = 0.0
+        select_keys = ["old_log_probs", "advantages", "latents", "next_latents", "kl", "timesteps",
+                       'prompt_embeds', 'pooled_prompt_embeds', 'negative_prompt_embeds', 'negative_pooled_prompt_embeds']
+        select_keys.extend(["ref_log_probs", "ref_prev_sample_mean"])
+        non_tensor_select_keys = []
+
+        # Split to make minibatch iterator for updating the actor
+        # See PPO paper for details. https://arxiv.org/abs/1707.06347
+        mini_batches = data.select(select_keys, non_tensor_select_keys).split(self.config.global_batch_size_per_device)
+
+        metrics = defaultdict(list)
+        for _ in range(self.config.ppo_epochs):
+            if self.rank == 0:
+                mini_batches = tqdm(mini_batches, desc="Train mini-batches", position=1)
+
+            for mini_batch in mini_batches:
+                gradient_accumulation = (
+                    self.config.global_batch_size_per_device // self.config.micro_batch_size_per_device_for_update
+                )
+                micro_batches = mini_batch.split(self.config.micro_batch_size_per_device_for_update)
+                if self.rank == 0:
+                    micro_batches = tqdm(micro_batches, desc="Update policy", position=2)
+
+                for micro_batch in micro_batches:
+                    model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch}
+                    old_log_probs = model_inputs["old_log_probs"]
+                    advantages = model_inputs["advantages"]
+                    response_mask = torch.ones_like(old_log_probs)
+
+                    # all return: (bsz, response_length)
+                    log_probs, prev_sample_mean = self._forward_micro_batch(model_inputs, temperature=temperature)
+
+                    pg_loss, pg_metrics = compute_policy_loss(
+                        old_log_probs=old_log_probs,
+                        log_probs=log_probs,
+                        advantages=advantages,
+                        response_mask=response_mask,
+                        clip_ratio_low=self.config.clip_ratio_low,
+                        clip_ratio_high=self.config.clip_ratio_high,
+                        clip_ratio_dual=self.config.clip_ratio_dual,
+                        loss_avg_mode=self.config.loss_avg_mode,
+                    )
+                    if self.config.use_kl_loss and "ref_log_probs" in model_inputs:
+                        ref_log_probs = model_inputs["ref_log_probs"]
+                        # compute kl loss
+                        kld = compute_kl(
+                            log_probs=prev_sample_mean,
+                            ref_log_probs=model_inputs["ref_prev_sample_mean"],
+                            kl_penalty=self.config.kl_penalty,
+                        )
+                        kl_loss = average_loss(kld, torch.ones_like(kld), mode=self.config.loss_avg_mode)
+                        pg_loss = pg_loss + kl_loss * self.config.kl_coef
+                        metrics["actor/kl_loss"] = kl_loss.detach().item()
+                        metrics["actor/kl_coef"] = self.config.kl_coef
+
+                    loss = pg_loss / gradient_accumulation
+                    loss.backward()
+
+                    batch_metrics = {
+                        "actor/pg_loss": pg_loss.detach().item(),
+                        "actor/pg_clipfrac_higher": pg_metrics["pg_clipfrac_higher"],
+                        "actor/pg_clipfrac_lower": pg_metrics["pg_clipfrac_lower"],
+                        "actor/entropy_loss": pg_metrics["entropy_loss"],
+                        "actor/ppo_kl": pg_metrics["ppo_kl"],
+                    }
+                    append_to_dict(metrics, batch_metrics)
+
+                grad_norm = self._optimizer_step()
+                append_to_dict(metrics, {"actor/grad_norm": grad_norm.detach().item()})
+
+        return metrics
     
     @GPUMemoryLogger(role="dp actor", logger=logger)
     def compute_log_prob_llm(self, data: DataProto, calculate_entropy=False) -> torch.Tensor:

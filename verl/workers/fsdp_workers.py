@@ -480,6 +480,21 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             device_name, mesh_shape=(dp, infer_tp), mesh_dim_names=["dp", "infer_tp"]
         )
         rollout_name = self.config.rollout.name
+        # Add diffusion rollout support based on model path patterns
+        if rollout_name == "diffusion":
+            from verl.workers.rollout import StableDiffusionRollout, WanRollout
+            from verl.workers.sharding_manager.base import BaseShardingManager
+
+            local_path = copy_to_local(self.config.model.path, use_shm=self.config.model.get("use_shm", False))
+            model_path_lower = local_path.lower()
+            if "wan" in model_path_lower:
+                rollout = WanRollout(model_path=local_path, config=omega_conf_to_dataclass(self.config.rollout))
+            elif "stable-diffusion" in model_path_lower or "stable_diffusion" in model_path_lower:
+                rollout = StableDiffusionRollout(model_path=local_path, config=omega_conf_to_dataclass(self.config.rollout))
+            else:
+                raise ValueError(f"Model {local_path} is not supported for diffusion rollout.")
+            rollout_sharding_manager = BaseShardingManager()
+            return rollout, rollout_sharding_manager
         if rollout_name == "hf":
             from verl.workers.rollout import HFRollout
             from verl.workers.sharding_manager.base import BaseShardingManager
@@ -669,9 +684,19 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         if self._is_actor:
             actor_cfg = omega_conf_to_dataclass(self.config.actor)
-            self.actor = DataParallelPPOActor(
-                config=actor_cfg, actor_module=self.actor_module_fsdp, actor_optimizer=self.actor_optimizer
-            )
+            # Inject diffusion config into actor if requested
+            if getattr(self.config.rollout, "name", "") == "diffusion":
+                # Provide scheduler path via extra for actor to init
+                scheduler_path = None
+                if "wan" in copy_to_local(self.config.model.path).lower():
+                    scheduler_path = os.path.join(copy_to_local(self.config.model.path), "scheduler")
+                elif "stable-diffusion" in copy_to_local(self.config.model.path).lower() or "stable_diffusion" in copy_to_local(self.config.model.path).lower():
+                    scheduler_path = os.path.join(copy_to_local(self.config.model.path), "scheduler")
+                if not hasattr(actor_cfg, "extra"):
+                    actor_cfg.extra = {}
+                actor_cfg.extra.update({"diffusion": True, "scheduler": scheduler_path})
+
+            self.actor = DataParallelPPOActor(config=actor_cfg, actor_module=self.actor_module_fsdp, actor_optimizer=self.actor_optimizer)
 
         if self._is_rollout:
             self.rollout, self.rollout_sharding_manager = self._build_rollout(
@@ -830,11 +855,19 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         with self.ulysses_sharding_manager:
             data = self.ulysses_sharding_manager.preprocess_data(data)
             with adapter_ctx:
-                output, entropys = self.actor.compute_log_prob(data=data, calculate_entropy=True)
-            output = DataProto.from_dict(
-                tensors={"old_log_probs": output, "entropys": entropys},
-                meta_info={"temperature": self.config.rollout.temperature},
-            )
+                # diffusion branch: compute log-prob over diffusion steps and return prev_sample_mean optionally
+                if getattr(self.config.rollout, "name", "") == "diffusion":
+                    log_probs, prev_sample_mean = self.actor.compute_log_prob_diffusion(data=data, calculate_entropy=False)
+                    tensors = {"old_log_probs": log_probs}
+                    if prev_sample_mean is not None:
+                        tensors["old_prev_sample_mean"] = prev_sample_mean
+                    output = DataProto.from_dict(tensors=tensors, meta_info={"temperature": self.config.rollout.get("temperature", 0.0)})
+                else:
+                    output, entropys = self.actor.compute_log_prob(data=data, calculate_entropy=True)
+                    output = DataProto.from_dict(
+                        tensors={"old_log_probs": output, "entropys": entropys},
+                        meta_info={"temperature": self.config.rollout.temperature},
+                    )
             output = self.ulysses_sharding_manager.postprocess_data(output)
 
         output = output.to("cpu")
@@ -873,8 +906,13 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         data.meta_info["use_dynamic_bsz"] = self.config.ref.log_prob_use_dynamic_bsz
         with self.ulysses_sharding_manager:
             data = self.ulysses_sharding_manager.preprocess_data(data)
-            output, _ = self.ref_policy.compute_log_prob(data=data, calculate_entropy=False)
-            output = DataProto.from_dict(tensors={"ref_log_prob": output})
+            if getattr(self.config.rollout, "name", "") == "diffusion":
+                # compute diffusion ref log-prob and prev_sample_mean for KL
+                ref_log_prob, ref_prev_mean = self.ref_policy.compute_log_prob_diffusion(data=data, calculate_entropy=False)
+                output = DataProto.from_dict(tensors={"ref_log_prob": ref_log_prob, "ref_prev_sample_mean": ref_prev_mean})
+            else:
+                output, _ = self.ref_policy.compute_log_prob(data=data, calculate_entropy=False)
+                output = DataProto.from_dict(tensors={"ref_log_prob": output})
             output = self.ulysses_sharding_manager.postprocess_data(output)
 
         output = output.to("cpu")
@@ -1930,7 +1968,7 @@ class ActorRolloutRefWorker_llm(Worker, DistProfilerExtension):
             # 遇到报错，actor_module在meta，fsdp在cuda:0
             actor_module = actor_module.to_empty(device=torch.device(device_name), recurse=True)
             #lm_head_sd = torch.load("/workspace/models/qwen2.5vl-lm_head.pt")
-            llm_sd = torch.load("/workspace/yym/models/qwen2.5vl-3b-llm.pt")
+            llm_sd = torch.load("/workspace/models/qwen2.5vl-3b-llm.pt")
             #actor_module.lm_head.load_state_dict(lm_head_sd)
             actor_module.language_model.load_state_dict(llm_sd)
 

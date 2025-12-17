@@ -673,3 +673,14 @@ class AsyncRolloutRequest(BaseModel):
             ..., : self.max_response_len
         ]
         self.response_loss_mask = self.loss_mask[..., self.prompt_loss_mask.shape[-1] :][..., : self.max_response_len]
+
+# Minimal shim to support diffusion rollout config typing without extra deps
+class BaseModel:
+    def __init__(self, **kwargs):
+        for k, v in kwargs.items():
+            setattr(self, k, v)
+
+def model_validator(mode="after"):
+    def decorator(fn):
+        return fn
+    return decorator

@@ -73,6 +73,16 @@ do_sample: True
 # number of responses (i.e. num sample times). > 1 for grpo
 n: 1
 
+# Diffusion-specific fields (used when name: diffusion)
+# SD3 image
+resolution: null
+num_steps: 28
+guidance_scale: 5.0
+# WAN video
+height: null
+width: null
+num_frames: null
+
 # Whether to wake up inference engine in multi-stage to reduce peak memory during training-rollout transition.
 multi_stage_wake_up: false
 
