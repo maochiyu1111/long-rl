@@ -132,6 +132,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         self._prof_active = False
         self._prof_logdir = os.getenv("PROF_LOGDIR", "/workspace/yym/RLHF/verl-disaggregate/log/trace/col")
         self._enable_prof_env = bool(int(os.getenv("ENABLE_PROFILER", "0")))
+        self.generation_config = None
 
         # build device mesh for FSDP
         world_size = torch.distributed.get_world_size()
@@ -157,6 +158,16 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         self._is_actor = self.role in ["actor", "actor_rollout", "actor_rollout_ref"]
         self._is_rollout = self.role in ["rollout", "actor_rollout", "actor_rollout_ref"]
         self._is_ref = self.role in ["ref", "actor_rollout_ref"]
+        # diffusion flag is configured via actor.extra / rollout.name / trainer.diffusion
+        actor_extra = self.config.actor.get("extra", {})
+        trainer_diffusion = getattr(self.config, "diffusion", False)
+        self.diffusion = bool(
+            trainer_diffusion
+            or getattr(self.config.rollout, "name", "") == "diffusion"
+            or getattr(self.config.ref, "diffusion", False)
+            or (actor_extra.get("diffusion", False) if isinstance(actor_extra, dict) else False)
+        )
+        self._local_model_path = None
 
         # TODO(haibin.lin):
         # As of now the type of config is DictConfig, if we assign config.profiler with ProfilerConfig,
@@ -217,6 +228,29 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             self.config.ref.log_prob_micro_batch_size //= self.device_mesh.size() // self.ulysses_sequence_parallel_size
             self.config.ref.log_prob_micro_batch_size_per_gpu = self.config.ref.log_prob_micro_batch_size
 
+    def _get_local_model_path(self):
+        """Memoized copy_to_local to avoid repeated downloads when diffusion is enabled."""
+        if self._local_model_path is None:
+            self._local_model_path = copy_to_local(
+                self.config.model.path, use_shm=self.config.model.get("use_shm", False)
+            )
+        return self._local_model_path
+
+    def _resolve_diffusion_scheduler_path(self, local_model_path: str) -> str:
+        actor_extra = self.config.actor.get("extra", {}) if hasattr(self.config, "actor") else {}
+        scheduler_path = None
+        if hasattr(actor_extra, "get"):
+            scheduler_path = actor_extra.get("diffusion_scheduler", actor_extra.get("scheduler", None))
+        if scheduler_path is None and hasattr(self.config.actor, "diffusion_scheduler"):
+            scheduler_path = getattr(self.config.actor, "diffusion_scheduler")
+        if scheduler_path is None and hasattr(self.config.ref, "scheduler"):
+            scheduler_path = getattr(self.config.ref, "scheduler")
+        if scheduler_path is None and hasattr(self.config.ref, "diffusion_scheduler"):
+            scheduler_path = getattr(self.config.ref, "diffusion_scheduler")
+        if scheduler_path is None:
+            scheduler_path = os.path.join(local_model_path, "scheduler")
+        return scheduler_path
+
     def _build_model_optimizer(
         self,
         model_path,
@@ -231,6 +265,11 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         role="actor",
         enable_activation_offload=False,
     ):
+        if self.diffusion:
+            return self._build_model_optimizer_diffusion(
+                model_path=model_path, fsdp_config=fsdp_config, optim_config=optim_config, role=role
+            )
+
         from torch import optim
         from torch.distributed.fsdp import CPUOffload, MixedPrecision
         from transformers import AutoConfig, AutoModelForCausalLM, AutoModelForVision2Seq
@@ -467,6 +506,141 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         return actor_module_fsdp, actor_optimizer, actor_lr_scheduler, actor_model_config
 
+    def _build_model_optimizer_diffusion(self, model_path, fsdp_config: FSDPEngineConfig, optim_config, role="actor"):
+        from torch import optim
+        from torch.distributed.fsdp import CPUOffload, MixedPrecision
+        from diffusers import StableDiffusion3Pipeline, WanPipeline
+
+        from verl.utils.torch_dtypes import PrecisionType
+
+        assert role in ["actor", "ref"]
+
+        log_gpu_memory_usage(f"Before init {role} diffusion transformer", logger=logger)
+        torch_dtype = fsdp_config.get("model_dtype", None)
+        if torch_dtype is None:
+            torch_dtype = torch.float32 if role == "actor" else torch.bfloat16
+        else:
+            torch_dtype = PrecisionType.to_dtype(torch_dtype)
+
+        model_path_lower = model_path.lower()
+        if "wan" in model_path_lower:
+            pipeline = WanPipeline.from_pretrained(model_path, torch_dtype=torch_dtype, low_cpu_mem_usage=True)
+        else:
+            pipeline = StableDiffusion3Pipeline.from_pretrained(
+                model_path, torch_dtype=torch_dtype, low_cpu_mem_usage=True
+            )
+        # Diffusion pipelines still expose a tokenizer/processor we can persist in checkpoints.
+        # Keep a reference before freeing the pipeline to avoid checkpoint manager assertions.
+        self.processor = getattr(pipeline, "processor", None)
+        self.tokenizer = getattr(pipeline, "tokenizer", None)
+        diffusion_module = pipeline.transformer
+        diffusion_module.to(torch_dtype)
+        if role == "ref":
+            diffusion_module.requires_grad_(False)
+        del pipeline
+        torch.distributed.barrier()
+
+        mixed_precision_config = fsdp_config.get("mixed_precision", None)
+        if mixed_precision_config is not None:
+            param_dtype = PrecisionType.to_dtype(mixed_precision_config.get("param_dtype", "bf16"))
+            reduce_dtype = PrecisionType.to_dtype(mixed_precision_config.get("reduce_dtype", "fp32"))
+            buffer_dtype = PrecisionType.to_dtype(mixed_precision_config.get("buffer_dtype", "fp32"))
+        else:
+            param_dtype = torch.bfloat16
+            reduce_dtype = torch.float32
+            buffer_dtype = torch.float32
+
+        mixed_precision = MixedPrecision(param_dtype=param_dtype, reduce_dtype=reduce_dtype, buffer_dtype=buffer_dtype)
+        auto_wrap_policy = get_fsdp_wrap_policy(
+            module=diffusion_module,
+            config=fsdp_config.get("wrap_policy", None),
+            is_lora=self.config.model.get("lora_rank", 0) > 0,
+        )
+        if self.rank == 0:
+            print(f"wrap_policy (diffusion): {auto_wrap_policy}")
+
+        fsdp_mesh = self.device_mesh
+        sharding_strategy = get_sharding_strategy(fsdp_mesh)
+        cpu_offload = None if role == "actor" else CPUOffload(offload_params=True)
+        fsdp_strategy = self.config.actor.strategy
+        if fsdp_strategy == "fsdp":
+            module_fsdp = FSDP(
+                diffusion_module,
+                cpu_offload=cpu_offload,
+                param_init_fn=init_fn,
+                auto_wrap_policy=auto_wrap_policy,
+                device_id=get_device_id(),
+                sharding_strategy=sharding_strategy,
+                mixed_precision=mixed_precision,
+                sync_module_states=True,
+                device_mesh=self.device_mesh,
+                use_orig_params=fsdp_config.get("use_orig_params", False),
+                forward_prefetch=fsdp_config.get("forward_prefetch", False),
+            )
+        elif fsdp_strategy == "fsdp2":
+            assert CPUOffloadPolicy is not None, "PyTorch version >= 2.4 is required for using fully_shard API (FSDP2)"
+            mp_policy = MixedPrecisionPolicy(
+                param_dtype=param_dtype, reduce_dtype=reduce_dtype, cast_forward_inputs=True
+            )
+            if role == "actor" and fsdp_config.offload_policy:
+                cpu_offload = CPUOffloadPolicy(pin_memory=True)
+                self._is_offload_param = False
+                self._is_offload_optimizer = False
+            else:
+                cpu_offload = None if role == "actor" else CPUOffloadPolicy(pin_memory=True)
+
+            fsdp_kwargs = {
+                "mesh": fsdp_mesh,
+                "mp_policy": mp_policy,
+                "offload_policy": cpu_offload,
+                "reshard_after_forward": fsdp_config.reshard_after_forward,
+            }
+            full_state = diffusion_module.state_dict()
+            apply_fsdp2(diffusion_module, fsdp_kwargs, fsdp_config)
+            fsdp2_load_full_state_dict(diffusion_module, full_state, fsdp_mesh, cpu_offload)
+            module_fsdp = diffusion_module
+        else:
+            raise NotImplementedError(f"not implement {fsdp_strategy}")
+
+        log_gpu_memory_usage(f"After {role} diffusion FSDP init", logger=logger)
+
+        if role == "actor" and optim_config is not None:
+            from verl.utils.torch_functional import get_constant_schedule_with_warmup, get_cosine_schedule_with_warmup
+
+            diffusion_optimizer = optim.AdamW(
+                module_fsdp.parameters(),
+                lr=optim_config.lr,
+                betas=optim_config.get("betas", (0.9, 0.999)),
+                weight_decay=optim_config.get("weight_decay", 1e-2),
+            )
+            total_steps = optim_config.get("total_training_steps", 0)
+            num_warmup_steps = int(optim_config.get("lr_warmup_steps", -1))
+            warmup_style = optim_config.get("warmup_style", "constant")
+            min_lr_ratio = optim_config.get("min_lr_ratio", 0.0)
+            num_cycles = optim_config.get("num_cycles", 0.5)
+            if num_warmup_steps < 0:
+                num_warmup_steps_ratio = optim_config.get("lr_warmup_steps_ratio", 0.0)
+                num_warmup_steps = int(num_warmup_steps_ratio * total_steps)
+            if warmup_style == "constant":
+                diffusion_lr_scheduler = get_constant_schedule_with_warmup(
+                    optimizer=diffusion_optimizer, num_warmup_steps=num_warmup_steps
+                )
+            elif warmup_style == "cosine":
+                diffusion_lr_scheduler = get_cosine_schedule_with_warmup(
+                    optimizer=diffusion_optimizer,
+                    num_warmup_steps=num_warmup_steps,
+                    num_training_steps=total_steps,
+                    min_lr_ratio=min_lr_ratio,
+                    num_cycles=num_cycles,
+                )
+            else:
+                raise NotImplementedError(f"Warmup style {warmup_style} is not supported")
+        else:
+            diffusion_optimizer = None
+            diffusion_lr_scheduler = None
+
+        return module_fsdp, diffusion_optimizer, diffusion_lr_scheduler, None
+
     def _build_rollout(self, trust_remote_code=False):
         from torch.distributed.device_mesh import init_device_mesh
 
@@ -481,20 +655,8 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         )
         rollout_name = self.config.rollout.name
         # Add diffusion rollout support based on model path patterns
-        if rollout_name == "diffusion":
-            from verl.workers.rollout import StableDiffusionRollout, WanRollout
-            from verl.workers.sharding_manager.base import BaseShardingManager
-
-            local_path = copy_to_local(self.config.model.path, use_shm=self.config.model.get("use_shm", False))
-            model_path_lower = local_path.lower()
-            if "wan" in model_path_lower:
-                rollout = WanRollout(model_path=local_path, config=omega_conf_to_dataclass(self.config.rollout))
-            elif "stable-diffusion" in model_path_lower or "stable_diffusion" in model_path_lower:
-                rollout = StableDiffusionRollout(model_path=local_path, config=omega_conf_to_dataclass(self.config.rollout))
-            else:
-                raise ValueError(f"Model {local_path} is not supported for diffusion rollout.")
-            rollout_sharding_manager = BaseShardingManager()
-            return rollout, rollout_sharding_manager
+        if self.diffusion or rollout_name == "diffusion":
+            return self._build_rollout_diffusion()
         if rollout_name == "hf":
             from verl.workers.rollout import HFRollout
             from verl.workers.sharding_manager.base import BaseShardingManager
@@ -585,6 +747,22 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         return rollout, rollout_sharding_manager
 
+    def _build_rollout_diffusion(self):
+        from verl.workers.rollout import RolloutConfig, StableDiffusionRollout, WanRollout
+        from verl.workers.sharding_manager.base import BaseShardingManager
+
+        local_path = self._get_local_model_path()
+        model_path_lower = local_path.lower()
+        rollout_config = omega_conf_to_dataclass(self.config.rollout, dataclass_type=RolloutConfig)
+        if "wan" in model_path_lower:
+            rollout = WanRollout(model_path=local_path, config=rollout_config)
+        elif "stable-diffusion" in model_path_lower or "stable_diffusion" in model_path_lower:
+            rollout = StableDiffusionRollout(model_path=local_path, config=rollout_config)
+        else:
+            raise ValueError(f"Model {local_path} is not supported for diffusion rollout.")
+        rollout_sharding_manager = BaseShardingManager()
+        return rollout, rollout_sharding_manager
+
     @register(dispatch_mode=Dispatch.ALL_TO_ALL)
     def prof_start(self, wait=3, warmup=1, active=1, repeat=1):
         if self.rank != 0:
@@ -650,7 +828,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 optim_config = None
                 fsdp_config = FSDPEngineConfig()
 
-            local_path = copy_to_local(self.config.model.path, use_shm=use_shm)
+            local_path = self._get_local_model_path()
             (
                 self.actor_module_fsdp,
                 self.actor_optimizer,
@@ -684,17 +862,15 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         if self._is_actor:
             actor_cfg = omega_conf_to_dataclass(self.config.actor)
-            # Inject diffusion config into actor if requested
-            if getattr(self.config.rollout, "name", "") == "diffusion":
-                # Provide scheduler path via extra for actor to init
-                scheduler_path = None
-                if "wan" in copy_to_local(self.config.model.path).lower():
-                    scheduler_path = os.path.join(copy_to_local(self.config.model.path), "scheduler")
-                elif "stable-diffusion" in copy_to_local(self.config.model.path).lower() or "stable_diffusion" in copy_to_local(self.config.model.path).lower():
-                    scheduler_path = os.path.join(copy_to_local(self.config.model.path), "scheduler")
-                if not hasattr(actor_cfg, "extra"):
-                    actor_cfg.extra = {}
-                actor_cfg.extra.update({"diffusion": True, "scheduler": scheduler_path})
+            if self.diffusion:
+                scheduler_path = self._resolve_diffusion_scheduler_path(self._get_local_model_path())
+                actor_cfg.diffusion = True
+                actor_cfg.diffusion_scheduler = scheduler_path
+                rollout_guidance = getattr(self.config.rollout, "guidance_scale", None)
+                if rollout_guidance is not None:
+                    actor_cfg.guidance_scale = rollout_guidance
+                if not hasattr(actor_cfg, "model"):
+                    actor_cfg.model = self.config.model
 
             self.actor = DataParallelPPOActor(config=actor_cfg, actor_module=self.actor_module_fsdp, actor_optimizer=self.actor_optimizer)
 
@@ -704,7 +880,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             )
 
         if self._is_ref:
-            local_path = copy_to_local(self.config.model.path, use_shm=use_shm)
+            local_path = self._get_local_model_path()
             self.ref_module_fsdp = self._build_model_optimizer(
                 model_path=local_path,
                 fsdp_config=omega_conf_to_dataclass(self.config.ref.fsdp_config),
@@ -718,17 +894,28 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             )[0]
             OmegaConf.set_struct(self.config.ref, True)
             with open_dict(self.config.ref):
+                if not hasattr(self.config.ref, "model"):
+                    # Ensure ref workers carry the shared model config so diffusion helpers can locate assets.
+                    self.config.ref.model = self.config.model
                 self.config.ref.use_remove_padding = use_remove_padding
                 self.config.ref.use_fused_kernels = use_fused_kernels
+                if self.diffusion:
+                    self.config.ref.diffusion = True
+                    rollout_guidance = getattr(self.config.rollout, "guidance_scale", None)
+                    if rollout_guidance is not None:
+                        self.config.ref.guidance_scale = rollout_guidance
+                    if getattr(self.config.ref, "scheduler", None) is None:
+                        self.config.ref.scheduler = self._resolve_diffusion_scheduler_path(local_path)
             self.ref_policy = DataParallelPPOActor(config=self.config.ref, actor_module=self.ref_module_fsdp)
 
         if self._is_actor:
-            self.flops_counter = FlopsCounter(self.actor_model_config)
+            self.flops_counter = None if self.diffusion else FlopsCounter(self.actor_model_config)
+            processing_class = self.processor if self.processor is not None else self.tokenizer
             self.checkpoint_manager = FSDPCheckpointManager(
                 model=self.actor_module_fsdp,
                 optimizer=self.actor.actor_optimizer,
                 lr_scheduler=self.actor_lr_scheduler,
-                processing_class=self.processor if self.processor is not None else self.tokenizer,
+                processing_class=processing_class,
                 checkpoint_config=self.config.actor.checkpoint,
             )
 
@@ -737,11 +924,12 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             # create a checkpoint manager for FSDP model to allow loading FSDP checkpoints for rollout.
 
             checkpoint_contents = OmegaConf.create({"load_contents": ["model"], "save_contents": []})
+            processing_class = self.processor if self.processor is not None else self.tokenizer
             self.checkpoint_manager = FSDPCheckpointManager(
                 model=self.actor_module_fsdp,
                 optimizer=None,
                 lr_scheduler=None,
-                processing_class=self.processor if self.processor is not None else self.tokenizer,
+                processing_class=processing_class,
                 checkpoint_config=checkpoint_contents,
             )
 
@@ -763,18 +951,20 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             with Timer(name="update_policy", logger=None) as timer:
                 metrics = self.actor.update_policy(data=data)
             delta_time = timer.last
-            global_num_tokens = data.meta_info["global_token_num"]
-            estimated_flops, promised_flops = self.flops_counter.estimate_flops(global_num_tokens, delta_time)
-            metrics["perf/mfu/actor"] = (
-                estimated_flops * self.config.actor.ppo_epochs / promised_flops / self.world_size
-            )
-            metrics["perf/max_memory_allocated_gb"] = get_torch_device().max_memory_allocated() / (1024**3)
-            metrics["perf/max_memory_reserved_gb"] = get_torch_device().max_memory_reserved() / (1024**3)
-            metrics["perf/cpu_memory_used_gb"] = psutil.virtual_memory().used / (1024**3)
+            if self.flops_counter is not None:
+                global_num_tokens = data.meta_info["global_token_num"]
+                estimated_flops, promised_flops = self.flops_counter.estimate_flops(global_num_tokens, delta_time)
+                metrics["perf/mfu/actor"] = (
+                    estimated_flops * self.config.actor.ppo_epochs / promised_flops / self.world_size
+                )
+                metrics["perf/max_memory_allocated_gb"] = get_torch_device().max_memory_allocated() / (1024**3)
+                metrics["perf/max_memory_reserved_gb"] = get_torch_device().max_memory_reserved() / (1024**3)
+                metrics["perf/cpu_memory_used_gb"] = psutil.virtual_memory().used / (1024**3)
 
-            lr = self.actor_lr_scheduler.get_last_lr()[0]
-            metrics["actor/lr"] = lr
-            self.actor_lr_scheduler.step()
+            if self.actor_lr_scheduler is not None:
+                lr = self.actor_lr_scheduler.get_last_lr()[0]
+                metrics["actor/lr"] = lr
+                self.actor_lr_scheduler.step()
 
             # TODO: here, we should return all metrics
             output = DataProto(meta_info={"metrics": metrics})
@@ -799,15 +989,17 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         assert self._is_rollout
 
-        meta_info = {
-            "eos_token_id": self.generation_config.eos_token_id
-            if self.generation_config is not None
-            else self.tokenizer.eos_token_id,
-            "pad_token_id": self.generation_config.pad_token_id
-            if self.generation_config is not None
-            else self.tokenizer.pad_token_id,
-        }
-        prompts.meta_info.update(meta_info)
+        meta_info = {}
+        if not self.diffusion:
+            meta_info = {
+                "eos_token_id": self.generation_config.eos_token_id
+                if self.generation_config is not None
+                else self.tokenizer.eos_token_id,
+                "pad_token_id": self.generation_config.pad_token_id
+                if self.generation_config is not None
+                else self.tokenizer.pad_token_id,
+            }
+            prompts.meta_info.update(meta_info)
         timing_generate = {}
         with self.rollout_sharding_manager:
             log_gpu_memory_usage("After entering rollout sharding manager", logger=logger)
@@ -856,8 +1048,8 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             data = self.ulysses_sharding_manager.preprocess_data(data)
             with adapter_ctx:
                 # diffusion branch: compute log-prob over diffusion steps and return prev_sample_mean optionally
-                if getattr(self.config.rollout, "name", "") == "diffusion":
-                    log_probs, prev_sample_mean = self.actor.compute_log_prob_diffusion(data=data, calculate_entropy=False)
+                if self.diffusion:
+                    log_probs, prev_sample_mean = self.actor.compute_log_prob(data=data)
                     tensors = {"old_log_probs": log_probs}
                     if prev_sample_mean is not None:
                         tensors["old_prev_sample_mean"] = prev_sample_mean
@@ -906,9 +1098,9 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         data.meta_info["use_dynamic_bsz"] = self.config.ref.log_prob_use_dynamic_bsz
         with self.ulysses_sharding_manager:
             data = self.ulysses_sharding_manager.preprocess_data(data)
-            if getattr(self.config.rollout, "name", "") == "diffusion":
+            if self.diffusion:
                 # compute diffusion ref log-prob and prev_sample_mean for KL
-                ref_log_prob, ref_prev_mean = self.ref_policy.compute_log_prob_diffusion(data=data, calculate_entropy=False)
+                ref_log_prob, ref_prev_mean = self.ref_policy.compute_log_prob(data=data)
                 output = DataProto.from_dict(tensors={"ref_log_prob": ref_log_prob, "ref_prev_sample_mean": ref_prev_mean})
             else:
                 output, _ = self.ref_policy.compute_log_prob(data=data, calculate_entropy=False)

@@ -168,7 +168,7 @@ def masked_sum(values, mask, axis=None):
     return (valid_values * mask).sum(axis=axis)
 
 
-def masked_mean(values, mask, axis=None):
+def masked_mean(values, mask, axis=None, eps: float = 1e-8):
     """
     Compute the mean of `values` over elements selected by `mask`.
 
@@ -177,12 +177,13 @@ def masked_mean(values, mask, axis=None):
         mask (Tensor): Boolean or numeric mask of the same shape as `values`.
         axis (int or tuple of int, optional): Dimension(s) along which to compute the mean.
             Defaults to None (over all elements).
+        eps (float): Small constant to avoid division by zero when mask sums to 0.
 
     Returns:
         Tensor: Masked mean, with shape equal to `values` reduced over `axis`.
     """
     s = masked_sum(values, mask, axis)
-    return s / (mask.sum(axis=axis) + 1e-8)
+    return s / (mask.sum(axis=axis) + eps)
 
 
 def masked_var(values, mask, unbiased=True):

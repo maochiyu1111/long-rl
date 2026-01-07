@@ -85,6 +85,10 @@ class ActorConfig(BaseConfig):
         "ppo_mini_batch_size",
         "ppo_micro_batch_size",
         "ppo_micro_batch_size_per_gpu",
+        "diffusion",
+        "guidance_scale",
+        "scheduler",
+        "diffusion_scheduler",
     }
 
     strategy: str = MISSING
@@ -96,8 +100,10 @@ class ActorConfig(BaseConfig):
     clip_ratio: float = 0.2
     clip_ratio_low: float = 0.2
     clip_ratio_high: float = 0.2
+    clip_ratio_dual: float = 3.0
     policy_loss: PolicyLossConfig = field(default_factory=PolicyLossConfig)
     clip_ratio_c: float = 3.0
+    loss_avg_mode: str = "token"
     loss_agg_mode: str = "token-mean"
     entropy_coeff: float = 0
     use_kl_loss: bool = False
@@ -109,6 +115,10 @@ class ActorConfig(BaseConfig):
     checkpoint: CheckpointConfig = field(default_factory=CheckpointConfig)
     optim: OptimizerConfig = field(default_factory=OptimizerConfig)
     use_fused_kernels: bool = False
+    diffusion: bool = False
+    guidance_scale: float = 5.0
+    scheduler: Optional[str] = None
+    diffusion_scheduler: Optional[str] = None
 
     def __post_init__(self):
         """Validate actor configuration parameters."""
@@ -134,6 +144,10 @@ class ActorConfig(BaseConfig):
         ]
         if self.loss_agg_mode not in valid_loss_agg_modes:
             raise ValueError(f"Invalid loss_agg_mode: {self.loss_agg_mode}")
+
+        valid_loss_avg_modes = ["token", "seq"]
+        if self.loss_avg_mode not in valid_loss_avg_modes:
+            raise ValueError(f"Invalid loss_avg_mode: {self.loss_avg_mode}")
 
     def validate(self, n_gpus: int, train_batch_size: int, model_config: dict = None):
         """Validate actor configuration with runtime parameters."""

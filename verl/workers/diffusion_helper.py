@@ -8,6 +8,7 @@ from diffusers.pipelines.stable_diffusion_3.pipeline_stable_diffusion_3 import r
 from diffusers.image_processor import PipelineImageInput
 from diffusers.pipelines.stable_diffusion_3 import StableDiffusion3PipelineOutput
 from diffusers.pipelines.wan.pipeline_wan import WanPipelineOutput
+from diffusers.models.transformers.transformer_wan import WanTimeTextImageEmbedding
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
 
@@ -22,6 +23,42 @@ from diffusers.schedulers.scheduling_flow_match_euler_discrete import FlowMatchE
 from diffusers.callbacks import MultiPipelineCallbacks, PipelineCallback
 from diffusers.pipelines.wan.pipeline_wan import WanTransformer3DModel
 from diffusers.pipelines.stable_diffusion_3.pipeline_stable_diffusion_3 import SD3Transformer2DModel
+
+
+def _patch_wan_time_embedder_dtype_handling() -> None:
+    """Patch WanTimeTextImageEmbedding forward to handle missing parameters safely."""
+    if getattr(WanTimeTextImageEmbedding, "_verl_patched_dtype", False):
+        return
+
+    def _forward_with_fallback(
+        self,
+        timestep: torch.Tensor,
+        encoder_hidden_states: torch.Tensor,
+        encoder_hidden_states_image: Optional[torch.Tensor] = None,
+        timestep_seq_len: Optional[int] = None,
+    ):
+        timestep = self.timesteps_proj(timestep)
+        if timestep_seq_len is not None:
+            timestep = timestep.unflatten(0, (-1, timestep_seq_len))
+
+        params = list(self.time_embedder.parameters())
+        time_embedder_dtype = params[0].dtype if params else encoder_hidden_states.dtype
+        if timestep.dtype != time_embedder_dtype and time_embedder_dtype != torch.int8:
+            timestep = timestep.to(time_embedder_dtype)
+        temb = self.time_embedder(timestep).type_as(encoder_hidden_states)
+        timestep_proj = self.time_proj(self.act_fn(temb))
+
+        encoder_hidden_states = self.text_embedder(encoder_hidden_states)
+        if encoder_hidden_states_image is not None:
+            encoder_hidden_states_image = self.image_embedder(encoder_hidden_states_image)
+
+        return temb, timestep_proj, encoder_hidden_states, encoder_hidden_states_image
+
+    WanTimeTextImageEmbedding.forward = _forward_with_fallback
+    WanTimeTextImageEmbedding._verl_patched_dtype = True
+
+
+_patch_wan_time_embedder_dtype_handling()
 
 
 def unwrap_fsdp(mod):
@@ -541,9 +578,9 @@ def sd3_pipeline_with_logprob(
     self.maybe_free_model_hooks()
 
     if not return_dict:
-        return (image, all_latents, all_log_probs, all_kl)
+        return (image, all_latents, all_log_probs, all_kl, timesteps)
 
-    return StableDiffusion3PipelineOutput(images=image), all_latents, all_log_probs, all_kl
+    return StableDiffusion3PipelineOutput(images=image), all_latents, all_log_probs, all_kl, timesteps
 
 
 def compute_log_prob_flow_grpo(transformer, scheduler, sample, j, 
@@ -933,6 +970,6 @@ def wan_pipeline_with_logprob(
     self.maybe_free_model_hooks()
 
     if not return_dict:
-        return (video, all_latents, all_log_probs, all_kl)
+        return (video, all_latents, all_log_probs, all_kl, timesteps)
 
-    return WanPipelineOutput(frames=video)
+    return WanPipelineOutput(frames=video), all_latents, all_log_probs, all_kl, timesteps

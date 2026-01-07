@@ -266,7 +266,13 @@ class FSDPCheckpointManager(BaseCheckpointManager):
             local_mkdir_safe(hf_config_tokenizer_path)
             model_config = unwrap_model.config
             generation_config = None
-            if unwrap_model.can_generate() and hasattr(model_config, "name_or_path") and model_config.name_or_path:
+            # Diffusion models (e.g., WanTransformer3DModel) may not implement `can_generate`; guard to avoid AttributeError.
+            if (
+                hasattr(unwrap_model, "can_generate")
+                and unwrap_model.can_generate()
+                and hasattr(model_config, "name_or_path")
+                and model_config.name_or_path
+            ):
                 try:
                     # Some model's name_or_path is empty if not initialized from pretrained,
                     # in this cases, we don't save generation config.
@@ -276,7 +282,16 @@ class FSDPCheckpointManager(BaseCheckpointManager):
                     # if the generation config isn't available, we don't save it
                     pass
 
-            model_config.save_pretrained(hf_config_tokenizer_path)
+            if hasattr(model_config, "save_pretrained"):
+                model_config.save_pretrained(hf_config_tokenizer_path)
+            elif hasattr(unwrap_model, "save_config"):
+                # Diffusion models expose save_config on the model rather than the config object.
+                unwrap_model.save_config(hf_config_tokenizer_path)
+            else:
+                # Best-effort fallback for plain mapping configs (e.g., FrozenDict).
+                config_path = os.path.join(hf_config_tokenizer_path, "config.json")
+                with open(config_path, "w") as f:
+                    json.dump(dict(model_config), f, indent=4)
             self.processing_class.save_pretrained(hf_config_tokenizer_path)
             log_with_rank(
                 f"Saved model config and tokenizer class to {os.path.abspath(hf_config_tokenizer_path)}",

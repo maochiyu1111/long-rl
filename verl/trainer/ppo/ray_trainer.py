@@ -603,7 +603,7 @@ class RayPPOTrainer:
                     raise ValueError(f"rollout.num_frames must be a positive integer, got {config.actor_rollout_ref.rollout.num_frames}")
             
             # Validate actor configuration for diffusion
-            if not getattr(config.actor_rollout_ref.actor.config, 'extra', {}).get('diffusion', False):
+            if not getattr(config.actor_rollout_ref.actor, 'extra', {}).get('diffusion', False):
                 raise ValueError(
                     "When trainer.diffusion=True, actor.config.extra.diffusion must be True"
                 )
@@ -1486,51 +1486,59 @@ class RayPPOTrainer:
 
                 batch: DataProto = DataProto.from_single_dict(batch_dict)
 
-                # pop those keys for generation
-                batch_keys_to_pop = ["input_ids", "attention_mask", "position_ids"]
-                non_tensor_batch_keys_to_pop = ["raw_prompt_ids"]
-                if "multi_modal_data" in batch.non_tensor_batch:
-                    non_tensor_batch_keys_to_pop.append("multi_modal_data")
-                if "raw_prompt" in batch.non_tensor_batch:
-                    non_tensor_batch_keys_to_pop.append("raw_prompt")
-                if "tools_kwargs" in batch.non_tensor_batch:
-                    non_tensor_batch_keys_to_pop.append("tools_kwargs")
-                if "interaction_kwargs" in batch.non_tensor_batch:
-                    non_tensor_batch_keys_to_pop.append("interaction_kwargs")
-                if "index" in batch.non_tensor_batch:
-                    non_tensor_batch_keys_to_pop.append("index")
-                if "agent_name" in batch.non_tensor_batch:
-                    non_tensor_batch_keys_to_pop.append("agent_name")
+                if self.diffusion:
+                    # diffusion 分支：直接使用嵌入，不做文本 token pop/重复
+                    required_batch_keys = ["prompt_embeds", "negative_prompt_embeds"]
+                    missing_required = [key for key in required_batch_keys if key not in batch.batch]
+                    if missing_required:
+                        raise KeyError(f"Diffusion batch missing required keys: {missing_required}")
 
-                if self.disaggregate_actor_rollout:
-                    modality_dict = {"multi_modal_inputs": batch.non_tensor_batch["multi_modal_inputs"]}
-                    modality_batch = DataProto.from_dict(non_tensors=modality_dict)
-                    modality_batch = modality_batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
+                    optional_batch_keys = ["pooled_prompt_embeds", "negative_pooled_prompt_embeds"]
+                    batch_keys_to_pop = required_batch_keys + [
+                        key for key in optional_batch_keys if key in batch.batch
+                    ]
+                    gen_batch = batch.pop(batch_keys=batch_keys_to_pop)
+                    gen_batch.meta_info["global_steps"] = self.global_steps
+                else:
+                    # 文本分支：pop 文本 token，按 rollout.n 重复
+                    batch_keys_to_pop = ["input_ids", "attention_mask", "position_ids"]
+                    non_tensor_batch_keys_to_pop = ["raw_prompt_ids"]
+                    if "multi_modal_data" in batch.non_tensor_batch:
+                        non_tensor_batch_keys_to_pop.append("multi_modal_data")
+                    if "raw_prompt" in batch.non_tensor_batch:
+                        non_tensor_batch_keys_to_pop.append("raw_prompt")
+                    if "tools_kwargs" in batch.non_tensor_batch:
+                        non_tensor_batch_keys_to_pop.append("tools_kwargs")
+                    if "interaction_kwargs" in batch.non_tensor_batch:
+                        non_tensor_batch_keys_to_pop.append("interaction_kwargs")
+                    if "index" in batch.non_tensor_batch:
+                        non_tensor_batch_keys_to_pop.append("index")
+                    if "agent_name" in batch.non_tensor_batch:
+                        non_tensor_batch_keys_to_pop.append("agent_name")
 
-                gen_batch = batch.pop(
-                    batch_keys=batch_keys_to_pop,
-                    non_tensor_batch_keys=non_tensor_batch_keys_to_pop,
-                )
+                    if self.disaggregate_actor_rollout:
+                        modality_dict = {"multi_modal_inputs": batch.non_tensor_batch["multi_modal_inputs"]}
+                        modality_batch = DataProto.from_dict(non_tensors=modality_dict)
+                        modality_batch = modality_batch.repeat(
+                            repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True
+                        )
 
-                # pass global_steps to trace
-                gen_batch.meta_info["global_steps"] = self.global_steps
-                gen_batch = gen_batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
+                    gen_batch = batch.pop(
+                        batch_keys=batch_keys_to_pop,
+                        non_tensor_batch_keys=non_tensor_batch_keys_to_pop,
+                    )
+
+                    # pass global_steps to trace
+                    gen_batch.meta_info["global_steps"] = self.global_steps
+                    gen_batch = gen_batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
 
                 is_last_step = self.global_steps >= self.total_training_steps
 
                 with marked_timer("step", timing_raw):
                     # # generate a batch
                     with marked_timer("gen", timing_raw, color="red"):
-                        # Prepare rollout engine for non-diffusion models
-                        if not self.diffusion:
-                            if self.disaggregate_actor_rollout:
-                                self.actor_rollout_encoder_wg.prepare_rollout_engine()
-                                self.actor_rollout_llm_wg.prepare_rollout_engine()
-                            else:
-                                self.actor_rollout_wg.prepare_rollout_engine()
-                        
                         if not self.async_rollout_mode:
-                            if self.disaggregate_actor_rollout:
+                            if self.disaggregate_actor_rollout and not self.diffusion:
                                 modality_embeddings = self.actor_rollout_encoder_wg.rollout_forward(modality_batch)
                                 gen_batch.non_tensor_batch["multi_modal_data"] = modality_embeddings.non_tensor_batch["multi_modal_data"]
                                 gen_batch_output = self.actor_rollout_llm_wg.generate_sequences(gen_batch)
@@ -1570,18 +1578,19 @@ class RayPPOTrainer:
                         batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
                     batch = batch.union(gen_batch_output)
 
-                    if "response_mask" not in batch.batch.keys():
+                    if not self.diffusion and "response_mask" not in batch.batch.keys():
                         batch.batch["response_mask"] = compute_response_mask(batch)
                     # Balance the number of valid tokens across DP ranks.
                     # NOTE: This usually changes the order of data in the `batch`,
                     # which won't affect the advantage calculation (since it's based on uid),
                     # but might affect the loss calculation (due to the change of mini-batching).
                     # TODO: Decouple the DP balancing and mini-batching.
-                    if self.config.trainer.balance_batch:
+                    if not self.diffusion and self.config.trainer.balance_batch:
                         self._balance_batch(batch, metrics=metrics)
 
-                    # compute global_valid tokens
-                    batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
+                    # compute global_valid tokens（仅文本路径需要）
+                    if not self.diffusion:
+                        batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
 
                     with marked_timer("reward", timing_raw, color="yellow"):
                         # compute reward model score
@@ -1596,32 +1605,21 @@ class RayPPOTrainer:
                             reward_tensor, reward_extra_infos_dict = compute_reward(batch, self.reward_fn)
 
                     # recompute old_log_probs
-                    with marked_timer("old_log_prob", timing_raw, color="blue"):
-                        # old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
-                        if self.disaggregate_actor_rollout:
-                            encoder_results = self.actor_rollout_encoder_wg.compute_log_prob_encoder(batch)
-                            batch = batch.union_non_tensor(encoder_results)
-                            old_log_prob = self.actor_rollout_llm_wg.compute_log_prob_llm(batch)
-                            for key in encoder_results.non_tensor_batch.keys():
-                                batch.non_tensor_batch.pop(key)
-                        else:
-                            old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
-                        
-                        # Handle entropy calculation for diffusion vs non-diffusion models
-                        if self.diffusion:
-                            # For diffusion models, entropy might not be available or in different format
-                            if "entropys" in old_log_prob.batch:
-                                entropys = old_log_prob.batch["entropys"]
-                                # For diffusion, entropy shape might be different
-                                if len(entropys.shape) == 2:  # (batch_size, num_steps)
-                                    # Aggregate entropy over diffusion steps
-                                    entropy_agg = entropys.mean(dim=1)  # Average over steps
-                                else:
-                                    entropy_agg = entropys
-                                old_log_prob_metrics = {"actor/entropy": entropy_agg.mean().detach().item()}
-                                metrics.update(old_log_prob_metrics)
-                                old_log_prob.batch.pop("entropys")
-                        else:
+                    # For diffusion rollouts, old_log_probs are already produced alongside trajectories.
+                    # Recomputing them here can diverge from the stored values (e.g., different schedulers),
+                    # which leads to union conflicts. Keep the rollout-provided log-probs intact.
+                    if not self.diffusion:
+                        with marked_timer("old_log_prob", timing_raw, color="blue"):
+                            # old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
+                            if self.disaggregate_actor_rollout:
+                                encoder_results = self.actor_rollout_encoder_wg.compute_log_prob_encoder(batch)
+                                batch = batch.union_non_tensor(encoder_results)
+                                old_log_prob = self.actor_rollout_llm_wg.compute_log_prob_llm(batch)
+                                for key in encoder_results.non_tensor_batch.keys():
+                                    batch.non_tensor_batch.pop(key)
+                            else:
+                                old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
+
                             # Original non-diffusion entropy handling
                             entropys = old_log_prob.batch["entropys"]
                             response_masks = batch.batch["response_mask"]
@@ -1630,26 +1628,14 @@ class RayPPOTrainer:
                             old_log_prob_metrics = {"actor/entropy": entropy_agg.detach().item()}
                             metrics.update(old_log_prob_metrics)
                             old_log_prob.batch.pop("entropys")
-                        
-                        batch = batch.union(old_log_prob)
 
-                        if "rollout_log_probs" in batch.batch.keys():
-                            # TODO: we may want to add diff of probs too.
-                            rollout_old_log_probs = batch.batch["rollout_log_probs"]
-                            actor_old_log_probs = batch.batch["old_log_probs"]
-                            
-                            if self.diffusion:
-                                # For diffusion models, handle different tensor structures
-                                # rollout_old_log_probs and actor_old_log_probs should have shape (batch_size, num_steps)
-                                rollout_probs = torch.exp(rollout_old_log_probs)
-                                actor_probs = torch.exp(actor_old_log_probs)
-                                rollout_probs_diff = torch.abs(rollout_probs - actor_probs)
-                                
-                                # For diffusion, we average over the diffusion steps
-                                rollout_probs_diff_max = torch.max(rollout_probs_diff.mean(dim=1))
-                                rollout_probs_diff_mean = torch.mean(rollout_probs_diff.mean(dim=1))
-                                rollout_probs_diff_std = torch.std(rollout_probs_diff.mean(dim=1))
-                            else:
+                            batch = batch.union(old_log_prob)
+
+                            if "rollout_log_probs" in batch.batch.keys():
+                                # TODO: we may want to add diff of probs too.
+                                rollout_old_log_probs = batch.batch["rollout_log_probs"]
+                                actor_old_log_probs = batch.batch["old_log_probs"]
+
                                 # Original non-diffusion logic
                                 attention_mask = batch.batch["attention_mask"]
                                 responses = batch.batch["responses"]
@@ -1663,14 +1649,14 @@ class RayPPOTrainer:
                                 rollout_probs_diff_max = torch.max(rollout_probs_diff)
                                 rollout_probs_diff_mean = torch.mean(rollout_probs_diff)
                                 rollout_probs_diff_std = torch.std(rollout_probs_diff)
-                            
-                            metrics.update(
-                                {
-                                    "training/rollout_probs_diff_max": rollout_probs_diff_max.detach().item(),
-                                    "training/rollout_probs_diff_mean": rollout_probs_diff_mean.detach().item(),
-                                    "training/rollout_probs_diff_std": rollout_probs_diff_std.detach().item(),
-                                }
-                            )
+
+                                metrics.update(
+                                    {
+                                        "training/rollout_probs_diff_max": rollout_probs_diff_max.detach().item(),
+                                        "training/rollout_probs_diff_mean": rollout_probs_diff_mean.detach().item(),
+                                        "training/rollout_probs_diff_std": rollout_probs_diff_std.detach().item(),
+                                    }
+                                )
 
                     if self.use_reference_policy:
                         # compute reference log_prob

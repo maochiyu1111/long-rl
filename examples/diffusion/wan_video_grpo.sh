@@ -7,7 +7,7 @@ export PYTHONUNBUFFERED=1
 MODEL_PATH=/workspace/models/Wan2.1-T2V-1.3B-Diffusers
 
 python3 -m verl.trainer.main_ppo \
-    --config-path=/workspace/projects/verl-disaggregate/examples/difussion \
+    --config-path=/workspace/projects/verl-disaggregate/examples/diffusion \
     --config-name=config_video_diffusion \
     hydra.job.chdir=false \
     actor_rollout_ref.model.path=${MODEL_PATH} \

@@ -20,8 +20,11 @@ Single Process Actor
 import logging
 import os
 
+import numpy as np
 import torch
 from torch import nn
+import torch.nn.functional as F
+from collections import defaultdict
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
 import verl.utils.torch_functional as verl_F
@@ -40,6 +43,8 @@ from verl.workers.config import ActorConfig
 # Diffusion support (ported from Long-RL)
 from diffusers import FlowMatchEulerDiscreteScheduler
 from verl.workers.diffusion_helper import compute_log_prob_flow_grpo
+from typing import Any, Dict, List, Optional, Tuple
+
 
 if is_cuda_available:
     from flash_attn.bert_padding import index_first_axis, pad_input, rearrange, unpad_input
@@ -51,6 +56,72 @@ __all__ = ["DataParallelPPOActor"]
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+
+
+def average_loss(values: torch.Tensor, mask: torch.Tensor, mode: str, eps: float = 1e-8) -> torch.Tensor:
+    if mode == "token":
+        return verl_F.masked_mean(values, mask, eps=eps)
+    if mode == "seq":
+        return ((values * mask).sum(-1) / (mask.sum(-1) + eps)).mean()
+    raise NotImplementedError(f"Unknown mode: {mode}.")
+
+
+def compute_policy_loss(
+    old_log_probs: torch.Tensor,
+    log_probs: torch.Tensor,
+    advantages: torch.Tensor,
+    response_mask: torch.Tensor,
+    clip_ratio_low: float,
+    clip_ratio_high: float,
+    clip_ratio_dual: float,
+    loss_avg_mode: str,
+) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+    negative_approx_kl = log_probs - old_log_probs
+    negative_approx_kl = torch.clamp(negative_approx_kl, -20.0, 20.0)
+    ratio = torch.exp(negative_approx_kl)
+    clipped_ratio = torch.exp(
+        torch.clamp(negative_approx_kl, np.log(1.0 - clip_ratio_low), np.log(1.0 + clip_ratio_high))
+    )
+
+    metrics = {"ppo_kl": -negative_approx_kl}
+    metrics["entropy_loss"] = average_loss(-log_probs, response_mask, mode=loss_avg_mode)
+
+    pg_loss = -advantages * ratio
+    pg_loss2 = -advantages * clipped_ratio
+    pg_loss3 = -advantages * clip_ratio_dual
+
+    clipped_pg_loss_higher = torch.max(pg_loss, pg_loss2)
+    metrics["pg_clipfrac_higher"] = (pg_loss < pg_loss2).float()
+    clipped_pg_loss_lower = torch.min(clipped_pg_loss_higher, pg_loss3)
+    final_pg_loss = torch.where(advantages < 0, clipped_pg_loss_lower, clipped_pg_loss_higher)
+    metrics["pg_clipfrac_lower"] = (clipped_pg_loss_higher > pg_loss3).float() * (advantages < 0).float()
+
+    final_pg_loss = average_loss(final_pg_loss, response_mask, mode=loss_avg_mode)
+    metrics = {k: verl_F.masked_mean(v, response_mask).detach().item() for k, v in metrics.items()}
+    return final_pg_loss, metrics
+
+
+def compute_kl(
+    log_probs: torch.FloatTensor,
+    ref_log_probs: torch.FloatTensor,
+    kl_penalty: str,
+) -> torch.Tensor:
+    log_probs, ref_log_probs = log_probs.float(), ref_log_probs.float()
+    if kl_penalty == "kl":
+        return log_probs - ref_log_probs
+    if kl_penalty == "abs":
+        return (log_probs - ref_log_probs).abs()
+    if kl_penalty == "mse":
+        return 0.5 * (log_probs - ref_log_probs).square()
+    if kl_penalty == "low_var_kl":
+        kl = (ref_log_probs - log_probs).clamp(-20.0, 20.0)
+        kld = (kl.exp() - kl - 1).contiguous()
+        return torch.clamp(kld, min=-10.0, max=10.0)
+    if kl_penalty == "full":
+        return F.kl_div(ref_log_probs, log_probs, log_target=True, reduction="none").sum(-1)
+    if kl_penalty == "flow_grpo":
+        return ((log_probs - ref_log_probs) ** 2).mean(dim=(1, 2, 3), keepdim=True) / 2
+    raise NotImplementedError(f"Unknown KL penalty: {kl_penalty}.")
 
 
 class DataParallelPPOActor(BasePPOActor):
@@ -93,16 +164,25 @@ class DataParallelPPOActor(BasePPOActor):
 
         # diffusion scheduler init when enabled via config.extra
         self.is_diffusion = self.config.get("diffusion", False)
-        self.diffusion_scheduler = None
         if self.is_diffusion:
-            scheduler_path = self.config.get("diffusion_scheduler", None)
+            scheduler_path = self.config.get("diffusion_scheduler", None) or self.config.get("scheduler", None)
             if scheduler_path is None:
-                scheduler_path = os.path.join(config.model.model_path, "scheduler")
-            self.diffusion_scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(scheduler_path)
+                model_cfg = self.config.get("model", None)
+                model_path = None
+                if model_cfg is not None:
+                    # handle both dataclass configs and DictConfig mappings
+                    model_path = getattr(model_cfg, "model_path", None) or getattr(model_cfg, "path", None)
+                    if model_path is None and hasattr(model_cfg, "get"):
+                        model_path = model_cfg.get("path", None)
+                if model_path is None:
+                    raise ValueError("Diffusion model path is required to locate scheduler assets.")
+                scheduler_path = os.path.join(model_path, "scheduler")
+            self.scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(scheduler_path)
 
             # route to diffusion variant
             self._forward_micro_batch = self._forward_micro_batch_diffusion
             self.update_policy = self.update_policy_diffusion
+            self.compute_log_prob = self.compute_log_prob_diffusion
 
     def _forward_micro_batch(
         self, micro_batch, temperature, calculate_entropy=False, disaggregate=False, encoder_grad=False,
@@ -441,17 +521,29 @@ class DataParallelPPOActor(BasePPOActor):
         self.actor_module.eval()
 
         temperature = 0.0
-        select_keys = ["latents", "next_latents", "timesteps", "prompt_embeds", "pooled_prompt_embeds",
-                       "negative_prompt_embeds", "negative_pooled_prompt_embeds"]
+        required_keys = ["latents", "next_latents", "timesteps", "prompt_embeds", "negative_prompt_embeds"]
+        available_keys = set(data.batch.keys()) if data.batch is not None else set()
+
+        missing_required = [key for key in required_keys if key not in available_keys]
+        if missing_required:
+            raise KeyError(f"Diffusion log-prob missing required keys: {missing_required}")
+
+        optional_keys = ["pooled_prompt_embeds", "negative_pooled_prompt_embeds"]
+        select_keys = required_keys + [key for key in optional_keys if key in available_keys]
         non_tensor_select_keys = []
 
+        micro_bs = self.config.get("ppo_micro_batch_size_per_gpu") or self.config.get("ppo_micro_batch_size")
+        if micro_bs is None:
+            micro_bs = self.config.get("log_prob_micro_batch_size_per_gpu") or self.config.get("log_prob_micro_batch_size")
+        assert micro_bs is not None, (
+            "Please set actor.ppo_micro_batch_size_per_gpu (or ppo_micro_batch_size/log_prob_micro_batch_size_per_gpu)."
+        )
+
         micro_batches = data.select(select_keys, non_tensor_select_keys).split(
-            self.config.micro_batch_size_per_device_for_experience
+            micro_bs
         )
         log_probs_lst = []
         prev_sample_mean_lst = []
-        if self.rank == 0:
-            micro_batches = tqdm(micro_batches, desc="Compute log probs", position=1)
 
         for micro_batch in micro_batches:
             model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch}
@@ -468,27 +560,36 @@ class DataParallelPPOActor(BasePPOActor):
         self.actor_module.train()
 
         temperature = 0.0
-        select_keys = ["old_log_probs", "advantages", "latents", "next_latents", "kl", "timesteps",
-                       'prompt_embeds', 'pooled_prompt_embeds', 'negative_prompt_embeds', 'negative_pooled_prompt_embeds']
-        select_keys.extend(["ref_log_probs", "ref_prev_sample_mean"])
+        required_keys = [
+            "old_log_probs",
+            "advantages",
+            "latents",
+            "next_latents",
+            "kl",
+            "timesteps",
+            "prompt_embeds",
+            "negative_prompt_embeds",
+        ]
+        available_keys = set(data.batch.keys()) if data.batch is not None else set()
+        missing_required = [key for key in required_keys if key not in available_keys]
+        if missing_required:
+            raise KeyError(f"Diffusion policy update missing required keys: {missing_required}")
+
+        optional_keys = ["pooled_prompt_embeds", "negative_pooled_prompt_embeds", "ref_log_probs", "ref_prev_sample_mean"]
+        select_keys = required_keys + [key for key in optional_keys if key in available_keys]
         non_tensor_select_keys = []
 
         # Split to make minibatch iterator for updating the actor
         # See PPO paper for details. https://arxiv.org/abs/1707.06347
-        mini_batches = data.select(select_keys, non_tensor_select_keys).split(self.config.global_batch_size_per_device)
+        mini_batches = data.select(select_keys, non_tensor_select_keys).split(self.config.ppo_mini_batch_size)
 
         metrics = defaultdict(list)
         for _ in range(self.config.ppo_epochs):
-            if self.rank == 0:
-                mini_batches = tqdm(mini_batches, desc="Train mini-batches", position=1)
-
             for mini_batch in mini_batches:
-                gradient_accumulation = (
-                    self.config.global_batch_size_per_device // self.config.micro_batch_size_per_device_for_update
-                )
-                micro_batches = mini_batch.split(self.config.micro_batch_size_per_device_for_update)
-                if self.rank == 0:
-                    micro_batches = tqdm(micro_batches, desc="Update policy", position=2)
+                micro_bs_update = self.config.ppo_micro_batch_size_per_gpu or self.config.ppo_micro_batch_size
+                assert micro_bs_update is not None, "Please set actor.ppo_micro_batch_size_per_gpu (or ppo_micro_batch_size)."
+                gradient_accumulation = self.config.ppo_mini_batch_size // micro_bs_update
+                micro_batches = mini_batch.split(micro_bs_update)
 
                 for micro_batch in micro_batches:
                     model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch}

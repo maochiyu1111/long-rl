@@ -77,6 +77,51 @@ class BatchRewardManager:
             else:
                 return data.batch["rm_scores"]
 
+        # Diffusion rollouts return images/videos instead of text responses
+        if "responses" not in data.batch.keys():
+            modality_key = None
+            if "videos" in data.batch.keys():
+                modality_key = "videos"
+            elif "images" in data.batch.keys():
+                modality_key = "images"
+            if modality_key is None:
+                raise KeyError('No valid modality found for reward computation (expected "videos" or "images").')
+
+            example_tensor = next((v for v in data.batch.values() if torch.is_tensor(v)), None)
+            device = example_tensor.device if example_tensor is not None else None
+
+            reward_tensor = torch.zeros((len(data), 1), dtype=torch.float32, device=device)
+            reward_extra_info = defaultdict(list)
+            reward_inputs = [{modality_key: data.batch[modality_key][i]} for i in range(len(data))]
+
+            try:
+                scores = self.compute_score(reward_inputs=reward_inputs, **self.reward_kwargs)
+            except TypeError:
+                scores = self.compute_score(reward_inputs, **self.reward_kwargs)
+
+            rewards = []
+            for i, score in enumerate(scores):
+                if isinstance(score, dict):
+                    reward = score.get("overall", score.get("score", None))
+                    for key, value in score.items():
+                        reward_extra_info[key].append(value)
+                else:
+                    reward = score
+
+                if reward is None:
+                    raise ValueError("Reward function must return a scalar value under 'overall' or 'score'.")
+
+                reward = float(reward)
+                reward_tensor[i, 0] = reward
+                rewards.append(reward)
+
+            data.batch["acc"] = torch.tensor(rewards, dtype=torch.float32, device=device)
+
+            if return_dict:
+                return {"reward_tensor": reward_tensor, "reward_extra_info": reward_extra_info}
+            else:
+                return reward_tensor
+
         reward_tensor = torch.zeros_like(data.batch["responses"], dtype=torch.float32)
         reward_extra_info = defaultdict(list)
         prompt_ids = data.batch["prompts"]

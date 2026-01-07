@@ -13,8 +13,9 @@
 # limitations under the License.
 
 from .base import BaseRollout
+from .config import RolloutConfig
+from .diffusion_rollout import StableDiffusionRollout, WanRollout
 from .hf_rollout import HFRollout
 from .naive import NaiveRollout
-from .diffusion_rollout import StableDiffusionRollout, WanRollout
 
-__all__ = ["BaseRollout", "NaiveRollout", "HFRollout", "StableDiffusionRollout", "WanRollout"]
+__all__ = ["RolloutConfig", "BaseRollout", "NaiveRollout", "HFRollout", "StableDiffusionRollout", "WanRollout"]

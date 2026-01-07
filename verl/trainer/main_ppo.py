@@ -122,9 +122,12 @@ class TaskRunner:
         from verl.utils import hf_processor, hf_tokenizer
 
         trust_remote_code = config.data.get("trust_remote_code", False)
-        tokenizer = hf_tokenizer(local_path, trust_remote_code=trust_remote_code)
+        diffusion_enabled = bool(config.trainer.get("diffusion", False))
+        tokenizer = hf_tokenizer(local_path, trust_remote_code=trust_remote_code, diffusion=diffusion_enabled)
         # Used for multimodal LLM, could be None
-        processor = hf_processor(local_path, trust_remote_code=trust_remote_code, use_fast=True)
+        processor = hf_processor(
+            local_path, trust_remote_code=trust_remote_code, use_fast=True, diffusion=diffusion_enabled
+        )
 
         # Define worker classes based on the actor strategy.
         if config.actor_rollout_ref.actor.strategy in {"fsdp", "fsdp2"}:

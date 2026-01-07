@@ -107,16 +107,22 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
     advantages = batch.batch["advantages"]
     returns = batch.batch["returns"]
 
-    max_response_length = batch.batch["responses"].shape[-1]
+    # Diffusion batches do not carry textual responses/attention masks.
+    has_text_response = "responses" in batch.batch and "attention_mask" in batch.batch
+    if has_text_response:
+        max_response_length = batch.batch["responses"].shape[-1]
 
-    prompt_mask = batch.batch["attention_mask"][:, :-max_response_length].bool()
-    response_mask = batch.batch["response_mask"].bool()
+        prompt_mask = batch.batch["attention_mask"][:, :-max_response_length].bool()
+        response_mask = batch.batch.get("response_mask", batch.batch["attention_mask"][:, -max_response_length:]).bool()
 
-    max_prompt_length = prompt_mask.size(-1)
+        max_prompt_length = prompt_mask.size(-1)
 
-    response_info = _compute_response_info(batch)
-    prompt_length = response_info["prompt_length"]
-    response_length = response_info["response_length"]
+        response_info = _compute_response_info(batch)
+        prompt_length = response_info["prompt_length"]
+        response_length = response_info["response_length"]
+    else:
+        # Treat the entire advantage/return tensor as valid when no textual responses exist
+        response_mask = torch.ones_like(advantages, dtype=torch.bool)
 
     valid_adv = torch.masked_select(advantages, response_mask)
     valid_returns = torch.masked_select(returns, response_mask)
@@ -156,18 +162,26 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
             if use_critic
             else {}
         ),
-        # response length
-        "response_length/mean": torch.mean(response_length).detach().item(),
-        "response_length/max": torch.max(response_length).detach().item(),
-        "response_length/min": torch.min(response_length).detach().item(),
-        "response_length/clip_ratio": torch.mean(torch.eq(response_length, max_response_length).float())
-        .detach()
-        .item(),
-        # prompt length
-        "prompt_length/mean": torch.mean(prompt_length).detach().item(),
-        "prompt_length/max": torch.max(prompt_length).detach().item(),
-        "prompt_length/min": torch.min(prompt_length).detach().item(),
-        "prompt_length/clip_ratio": torch.mean(torch.eq(prompt_length, max_prompt_length).float()).detach().item(),
+        **(
+            {
+                # response length
+                "response_length/mean": torch.mean(response_length).detach().item(),
+                "response_length/max": torch.max(response_length).detach().item(),
+                "response_length/min": torch.min(response_length).detach().item(),
+                "response_length/clip_ratio": torch.mean(torch.eq(response_length, max_response_length).float())
+                .detach()
+                .item(),
+                # prompt length
+                "prompt_length/mean": torch.mean(prompt_length).detach().item(),
+                "prompt_length/max": torch.max(prompt_length).detach().item(),
+                "prompt_length/min": torch.min(prompt_length).detach().item(),
+                "prompt_length/clip_ratio": torch.mean(torch.eq(prompt_length, max_prompt_length).float())
+                .detach()
+                .item(),
+            }
+            if has_text_response
+            else {}
+        ),
     }
 
     # multi-turn conversation
@@ -203,6 +217,10 @@ def compute_timing_metrics(batch: DataProto, timing_raw: dict[str, float]) -> di
         - Other stages ("ref", "values", "adv", "update_critic", "update_actor") use all tokens
           (prompt + response)
     """
+    if "responses" not in batch.batch or "attention_mask" not in batch.batch:
+        # Diffusion or non-text batches: return raw timings only
+        return {f"timing_s/{name}": value for name, value in timing_raw.items()}
+
     response_info = _compute_response_info(batch)
     num_prompt_tokens = torch.sum(response_info["prompt_length"]).item()
     num_response_tokens = torch.sum(response_info["response_length"]).item()
@@ -246,8 +264,13 @@ def compute_throughout_metrics(batch: DataProto, timing_raw: dict[str, float], n
         The throughput is calculated as total_tokens / (time * n_gpus) to normalize
         across different GPU counts.
     """
-    total_num_tokens = sum(batch.meta_info["global_token_num"])
     time = timing_raw["step"]
+
+    if "global_token_num" not in batch.meta_info:
+        # Diffusion batches lack token counts; report timing only
+        return {"perf/time_per_step": time}
+
+    total_num_tokens = sum(batch.meta_info["global_token_num"])
     # estimated_flops, promised_flops = flops_function.estimate_flops(num_tokens, time)
     # f'Actual TFLOPs/s/GPU​': estimated_flops/(n_gpus),
     # f'Theoretical TFLOPs/s/GPU​': promised_flops,

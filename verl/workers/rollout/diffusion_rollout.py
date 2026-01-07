@@ -31,7 +31,6 @@ from ...utils.torch_dtypes import PrecisionType
 from .base import BaseRollout
 from .config import RolloutConfig
 import torch.nn.functional as F
-from verl.utils.vila_remote_code.constants import IGNORE_INDEX
 from diffusers import StableDiffusion3Pipeline, FlowMatchEulerDiscreteScheduler, WanPipeline
 from ..diffusion_helper import sd3_pipeline_with_logprob, wan_pipeline_with_logprob
 
@@ -91,7 +90,7 @@ class StableDiffusionRollout(BaseRollout):
         # sample
         # with autocast():
         with torch.no_grad():
-            images, latents, log_probs, kls = sd3_pipeline_with_logprob(
+            images, latents, log_probs, kls, timesteps = sd3_pipeline_with_logprob(
                 self.pipeline,
                 prompt_embeds=prompt_embeds,
                 pooled_prompt_embeds=pooled_prompt_embeds,
@@ -112,9 +111,7 @@ class StableDiffusionRollout(BaseRollout):
         kls = torch.stack(kls, dim=1) 
         kl = kls.detach()
 
-        timesteps = self.pipeline.scheduler.timesteps.repeat(
-            batch_size, 1
-        )  # (batch_size, num_steps)
+        timesteps = timesteps.to(prompt_embeds.device).repeat(batch_size, 1)  # (batch_size, num_steps)
         # print("*** prompt_embeds ***", prompt_embeds.shape)
         # print("*** pooled_prompt_embeds ***", pooled_prompt_embeds.shape)
         # print("*** timesteps ***", timesteps.shape)
@@ -196,7 +193,7 @@ class WanRollout(BaseRollout):
         # sample
         # with autocast():
         with torch.no_grad():
-            videos, latents, log_probs, kls = wan_pipeline_with_logprob(
+            videos, latents, log_probs, kls, timesteps = wan_pipeline_with_logprob(
                 self.pipeline,
                 prompt_embeds=prompt_embeds,
                 negative_prompt_embeds=negative_prompt_embeds,
@@ -216,9 +213,7 @@ class WanRollout(BaseRollout):
         kls = torch.stack(kls, dim=1) 
         kl = kls.detach()
 
-        timesteps = self.pipeline.scheduler.timesteps.repeat(
-            batch_size, 1
-        )  # (batch_size, num_steps)
+        timesteps = timesteps.to(prompt_embeds.device).repeat(batch_size, 1)  # (batch_size, num_steps)
         # print("*** prompt_embeds ***", prompt_embeds.shape)
         # print("*** pooled_prompt_embeds ***", pooled_prompt_embeds.shape)
         # print("*** timesteps ***", timesteps.shape)

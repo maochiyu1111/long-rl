@@ -143,6 +143,15 @@ def get_adv_estimator_fn(name_or_enum):
     return ADV_ESTIMATOR_REGISTRY[name]
 
 
+def _normalize_indices(index: Any) -> list[int]:
+    """Convert index tensors/arrays to a flat list of Python ints for safe dict keys."""
+    if isinstance(index, torch.Tensor):
+        return index.detach().cpu().reshape(-1).tolist()
+    if isinstance(index, np.ndarray):
+        return index.reshape(-1).tolist()
+    return list(index)
+
+
 class AdaptiveKLController:
     """
     Adaptive KL controller described in the paper:
@@ -302,8 +311,10 @@ def compute_grpo_outcome_advantage(
 
     with torch.no_grad():
         bsz = scores.shape[0]
+        indices = _normalize_indices(index)
         for i in range(bsz):
-            id2score[index[i]].append(scores[i])
+            idx = indices[i]
+            id2score[idx].append(scores[i])
         for idx in id2score:
             if len(id2score[idx]) == 1:
                 id2mean[idx] = torch.tensor(0.0)
@@ -314,10 +325,11 @@ def compute_grpo_outcome_advantage(
             else:
                 raise ValueError(f"no score in prompt index: {idx}")
         for i in range(bsz):
+            idx = indices[i]
             if norm_adv_by_std_in_grpo:
-                scores[i] = (scores[i] - id2mean[index[i]]) / (id2std[index[i]] + epsilon)
+                scores[i] = (scores[i] - id2mean[idx]) / (id2std[idx] + epsilon)
             else:
-                scores[i] = scores[i] - id2mean[index[i]]
+                scores[i] = scores[i] - id2mean[idx]
         scores = scores.unsqueeze(-1) * response_mask
 
     return scores, scores
@@ -361,8 +373,9 @@ def compute_grpo_passk_outcome_advantage(
 
     with torch.no_grad():
         bsz = scores.shape[0]
+        indices = _normalize_indices(index)
         for i in range(bsz):
-            idx = index[i]
+            idx = indices[i]
             id2scores[idx].append(scores[i])
             id2indices[idx].append(i)
 
@@ -421,8 +434,9 @@ def compute_reinforce_plus_plus_baseline_outcome_advantage(
 
     with torch.no_grad():
         bsz = scores.shape[0]
+        indices = _normalize_indices(index)
         for i in range(bsz):
-            id2score[index[i]].append(scores[i])
+            id2score[indices[i]].append(scores[i])
         for idx in id2score:
             if len(id2score[idx]) == 1:
                 id2mean[idx] = torch.tensor(0.0)
@@ -431,7 +445,7 @@ def compute_reinforce_plus_plus_baseline_outcome_advantage(
             else:
                 raise ValueError(f"no score in prompt index: {idx}")
         for i in range(bsz):
-            scores[i] = scores[i] - id2mean[index[i]]
+            scores[i] = scores[i] - id2mean[indices[i]]
 
         scores = scores.unsqueeze(-1).tile([1, response_length]) * response_mask
         scores = verl_F.masked_whiten(scores, response_mask) * response_mask
@@ -471,8 +485,9 @@ def compute_rloo_outcome_advantage(
 
     with torch.no_grad():
         bsz = scores.shape[0]
+        indices = _normalize_indices(index)
         for i in range(bsz):
-            id2score[index[i]].append(scores[i])
+            id2score[indices[i]].append(scores[i])
         for idx in id2score:
             if len(id2score[idx]) == 1:
                 id2mean[idx] = torch.tensor(0.0)
@@ -481,9 +496,9 @@ def compute_rloo_outcome_advantage(
             else:
                 raise ValueError(f"no score in prompt index: {idx}")
         for i in range(bsz):
-            response_num = len(id2score[index[i]])
+            response_num = len(id2score[indices[i]])
             if response_num > 1:
-                scores[i] = scores[i] * response_num / (response_num - 1) - id2mean[index[i]] * response_num / (
+                scores[i] = scores[i] * response_num / (response_num - 1) - id2mean[indices[i]] * response_num / (
                     response_num - 1
                 )
         scores = scores.unsqueeze(-1) * response_mask
@@ -525,9 +540,11 @@ def compute_opo_outcome_advantage(
 
     with torch.no_grad():
         bsz = scores.shape[0]
+        indices = _normalize_indices(index)
         for i in range(bsz):
-            id2score[index[i]].append(scores[i])
-            id2len[index[i]].append(response_length[i])
+            idx = indices[i]
+            id2score[idx].append(scores[i])
+            id2len[idx].append(response_length[i])
 
         for idx in id2score:
             if len(id2score[idx]) == 1:
@@ -539,7 +556,7 @@ def compute_opo_outcome_advantage(
             else:
                 raise ValueError(f"no score in prompt index: {idx}")
         for i in range(bsz):
-            scores[i] = scores[i] - id2bsl[index[i]]
+            scores[i] = scores[i] - id2bsl[indices[i]]
         scores = scores.unsqueeze(-1) * response_mask
 
     return scores, scores
@@ -662,9 +679,10 @@ def compute_gpg_outcome_advantage(
         bsz = scores.shape[0]
         m = torch.count_nonzero(scores)
         alpha = bsz / m.clamp(min=1)
+        indices = _normalize_indices(index)
 
         for i in range(bsz):
-            id2score[index[i]].append(scores[i])
+            id2score[indices[i]].append(scores[i])
 
         for idx in id2score:
             if len(id2score[idx]) == 1:
@@ -676,7 +694,7 @@ def compute_gpg_outcome_advantage(
             else:
                 raise ValueError(f"no score in prompt index: {idx}")
         for i in range(bsz):
-            scores[i] = alpha * (scores[i] - id2mean[index[i]]) / (f_norm)
+            scores[i] = alpha * (scores[i] - id2mean[indices[i]]) / (f_norm)
         scores = scores.unsqueeze(-1) * response_mask
 
     return scores, scores

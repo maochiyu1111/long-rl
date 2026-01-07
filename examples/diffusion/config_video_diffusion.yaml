@@ -7,8 +7,8 @@ defaults:
   - _self_
 
 data:
-  train_files: ./examples/diffusion_data/video/data.jsonl
-  val_files: ./examples/diffusion_data/video/val_data.jsonl
+  train_files: ./examples/diffusion_data/video/data.parquet
+  val_files: ./examples/diffusion_data/video/val_data.parquet
   prompt_key: text
   image_key: images
   max_prompt_length: 2048
@@ -17,6 +17,9 @@ data:
   shuffle: true
   filter_overlong_prompts: false
   trust_remote_code: false
+  custom_cls:
+    path: verl/utils/dataset/diffusion_dataset.py
+    name: DiffusionDataset
 
 algorithm:
   adv_estimator: grpo
@@ -42,7 +45,8 @@ actor_rollout_ref:
     kl_loss_type: low_var_kl
     kl_loss_coef: 0.01
     loss_agg_mode: token-mean
-    guidance_scale: 4.5
+    extra:
+        diffusion: true
     fsdp_config:
       param_offload: true
       optimizer_offload: true
@@ -72,7 +76,6 @@ actor_rollout_ref:
   ref:
     ulysses_sequence_parallel_size: 1
     diffusion: true
-    guidance_scale: 4.5
     scheduler: "/workspace/models/Wan2.1-T2V-1.3B-Diffusers/scheduler"
     fsdp_config:
       param_offload: true
@@ -95,5 +98,5 @@ trainer:
   val_before_train: false
   val_only: false
   log_val_generations: 3
-  save_freq: 1
+  save_freq: 10000
   diffusion: true

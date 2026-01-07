@@ -12,8 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from .diffusion_dataset import DiffusionDataset
 from .rl_dataset import RLHFDataset
 from .rm_dataset import RMDataset
 from .sft_dataset import SFTDataset
+from .vision_utils import process_image, process_video
 
-__all__ = ["RLHFDataset", "RMDataset", "SFTDataset"]
+__all__ = ["DiffusionDataset", "RLHFDataset", "RMDataset", "SFTDataset", "process_image", "process_video"]
