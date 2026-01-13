@@ -10,6 +10,8 @@ from diffusers.pipelines.stable_diffusion_3 import StableDiffusion3PipelineOutpu
 from diffusers.pipelines.wan.pipeline_wan import WanPipelineOutput
 from diffusers.models.transformers.transformer_wan import WanTimeTextImageEmbedding
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+import logging
+logger = logging.getLogger(__name__)
 
 
 # Copied from https://github.com/kvablack/ddpo-pytorch/blob/main/flow_grpo/diffusers_patch/ddim_with_logprob.py
