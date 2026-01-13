@@ -1419,6 +1419,42 @@ class RayPPOTrainer:
         )
         metrics.update(global_balance_stats)
 
+    def _log_step_timing(self, timing_raw: dict[str, float], step: int, epoch: int):
+        """Print per-step timing to help debug large variance between steps."""
+        stage_order = [
+            "gen",
+            "gen_max",
+            "reward",
+            "old_log_prob",
+            "ref",
+            "values",
+            "adv",
+            "update_critic",
+            "update_actor",
+            "dump_rollout_generations",
+            "testing",
+            "save_checkpoint",
+        ]
+        step_time = timing_raw.get("step")
+        stage_msgs = [f"{name}={timing_raw[name]:.4f}s" for name in stage_order if name in timing_raw]
+        extra_names = [
+            name
+            for name in timing_raw.keys()
+            if name
+            not in set(stage_order + ["step", "start_profile", "stop_profile"])
+        ]
+        for name in sorted(extra_names):
+            stage_msgs.append(f"{name}={timing_raw[name]:.4f}s")
+
+        if step_time is not None:
+            header = f"[timing] epoch={epoch} step={step} total={step_time:.4f}s"
+        else:
+            header = f"[timing] epoch={epoch} step={step}"
+        if stage_msgs:
+            print(f"{header} | " + ", ".join(stage_msgs))
+        else:
+            print(header)
+
     def fit(self):
         """
         The training loop of PPO.
@@ -1839,6 +1875,8 @@ class RayPPOTrainer:
 
                 steps_duration = timing_raw["step"]
                 self.max_steps_duration = max(self.max_steps_duration, steps_duration)
+
+                self._log_step_timing(timing_raw=timing_raw, step=self.global_steps, epoch=epoch)
 
                 # training metrics
                 metrics.update(
