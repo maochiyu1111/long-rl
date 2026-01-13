@@ -1,0 +1,102 @@
+hydra:
+  searchpath:
+    - file://verl/trainer/config
+
+defaults:
+  - ppo_trainer
+  - _self_
+
+data:
+  train_files: ./examples/diffusion_data/video/data.parquet
+  val_files: ./examples/diffusion_data/video/val_data.parquet
+  prompt_key: text
+  image_key: images
+  max_prompt_length: 2048
+  max_response_length: 2048
+  train_batch_size: 16
+  shuffle: true
+  filter_overlong_prompts: false
+  trust_remote_code: false
+  custom_cls:
+    path: verl/utils/dataset/diffusion_dataset.py
+    name: DiffusionDataset
+
+algorithm:
+  adv_estimator: grpo
+  use_kl_in_reward: false
+  kl_penalty: flow_grpo
+  kl_ctrl:
+    kl_coef: 0.01
+  filter_groups:
+    enable: false
+
+actor_rollout_ref:
+  model:
+    path: stabilityai/stable-diffusion-3.5-medium
+    trust_remote_code: false
+    use_remove_padding: true
+    enable_gradient_checkpointing: true
+  actor:
+    strategy: fsdp
+    ppo_mini_batch_size: 8
+    ppo_micro_batch_size_per_gpu: 1
+    ulysses_sequence_parallel_size: 2
+    use_kl_loss: true
+    kl_loss_type: low_var_kl
+    kl_loss_coef: 0.01
+    loss_agg_mode: token-mean
+    extra:
+        diffusion: true
+    fsdp_config:
+      param_offload: true
+      optimizer_offload: true
+    optim:
+      lr: 1.0e-6
+      weight_decay: 1.0e-2
+      warmup_style: constant
+  rollout:
+    name: diffusion
+    n: 2
+    temperature: 1.0
+    top_p: 0.99
+    gpu_memory_utilization: 0.6
+    enforce_eager: false
+    enable_chunked_prefill: false
+    tensor_model_parallel_size: 1
+    log_prob_micro_batch_size_per_gpu: 1
+    val_kwargs:
+      temperature: 0.5
+      n: 1
+    guidance_scale: 4.5
+    resolution: 768
+    num_steps: 4
+    num_frames: 17
+    height: 256
+    width: 256
+  ref:
+    ulysses_sequence_parallel_size: 1
+    diffusion: true
+    scheduler: "/home/qzy/models/Wan2.1-T2V-1.3B-Diffusers/scheduler"
+    fsdp_config:
+      param_offload: true
+    log_prob_micro_batch_size_per_gpu: 1
+
+reward_model:
+  reward_manager: batch
+custom_reward_function:
+  path: ./examples/reward_function/diffusion.py
+  name: compute_score
+
+trainer:
+  total_epochs: 15
+  project_name: easy_r1
+  experiment_name: wan2_1_t2v_1.3b_grpo
+  logger: ["console", "wandb"]
+  nnodes: 1
+  n_gpus_per_node: 8
+  test_freq: -1
+  val_before_train: false
+  val_only: false
+  log_val_generations: 3
+  save_freq: 10000
+  diffusion: true
