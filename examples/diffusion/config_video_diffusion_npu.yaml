@@ -13,7 +13,9 @@ data:
   image_key: images
   max_prompt_length: 2048
   max_response_length: 2048
-  train_batch_size: 16
+  train_batch_size: 32
+  gen_batch_size: 8
+  val_batch_size: 1
   shuffle: true
   filter_overlong_prompts: false
   trust_remote_code: false
@@ -56,7 +58,7 @@ actor_rollout_ref:
       warmup_style: constant
   rollout:
     name: diffusion
-    n: 2
+    n: 8
     temperature: 1.0
     top_p: 0.99
     gpu_memory_utilization: 0.6
@@ -69,13 +71,14 @@ actor_rollout_ref:
       n: 1
     guidance_scale: 4.5
     resolution: 768
-    num_steps: 4
-    num_frames: 17
+    num_steps: 40
+    num_frames: 35
     height: 256
     width: 256
   ref:
     ulysses_sequence_parallel_size: 1
     diffusion: true
+    guidance_scale: 4.5
     scheduler: "/home/qzy/models/Wan2.1-T2V-1.3B-Diffusers/scheduler"
     fsdp_config:
       param_offload: true
@@ -88,7 +91,7 @@ custom_reward_function:
   name: compute_score
 
 trainer:
-  total_epochs: 15
+  total_epochs: 2
   project_name: easy_r1
   experiment_name: wan2_1_t2v_1.3b_grpo
   logger: ["console", "wandb"]

@@ -1,5 +1,5 @@
 #!/bin/bash
-LOG_FILE="examples/diffusion/wan_video_grpo.log"
+LOG_FILE="examples/diffusion/wan_video_grpo_114.log"
 exec > >(tee -a "$LOG_FILE") 2>&1
 set -x
 wandb disabled
