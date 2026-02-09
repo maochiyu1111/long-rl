@@ -207,7 +207,7 @@ def reduce_timing(timing_raw: dict[str, float]) -> dict[str, float]:
     Returns:
         Dict[str, float]: Reduced timing information.
     """
-    if not dist.is_initialized():
+    if not timing_raw or not dist.is_initialized():
         return timing_raw
 
     key_list, timing_list = [], []

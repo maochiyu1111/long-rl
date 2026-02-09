@@ -188,11 +188,41 @@ algorithm:
     # Power used for weight scaling in "pow" method
     weight_pow: 2.0
 
+  # Whether to enable online filtering
+  online_filtering: False
+
+  # Reward key used to filter samples
+  filter_key: overall
+
+  # Lower filtering threshold (exclusive)
+  filter_low: 0.01
+
+  # Upper filtering threshold (exclusive)
+  filter_high: 0.99
+
 # config for the trainer
 trainer:
 
   # Whether to balance batch sizes across distributed workers
   balance_batch: True
+
+  # Whether to enable disaggregate training loop (fit_dis)
+  disaggregate: False
+
+  # Disaggregate pool size for actor workers (GPUs per node). null means auto-split from n_gpus_per_node.
+  disaggregate_actor_n_gpus_per_node: null
+
+  # Disaggregate pool size for rollout_ref workers (GPUs per node). null means auto-split from n_gpus_per_node.
+  disaggregate_rollout_ref_n_gpus_per_node: null
+
+  # Distributed init master address for fit_dis() global process group. null means using driver node IP.
+  dist_master_addr: 192.158.0.11
+
+  # Distributed init master port for fit_dis() global process group. null means using driver-selected free port.
+  dist_master_port: 29400
+
+  # Diffusion fit_dis(): chunk size (MB) for cross-group GDR relay sync.
+  disaggregate_sync_chunk_mb: 256
 
   # Number of epochs in training
   total_epochs: 30
@@ -320,6 +350,10 @@ trainer:
 
   # Timeout (in seconds) for Ray worker to wait for registration
   ray_wait_register_center_timeout: 300
+
+  # Timeout (in seconds) for distributed setup and collectives.
+  # Can also be overridden by env VERL_DIST_TIMEOUT_SECONDS.
+  dist_timeout_s: 60
 
   # Device to run training on (e.g., "cuda", "cpu")
   device: cuda

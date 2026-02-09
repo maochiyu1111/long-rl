@@ -72,8 +72,10 @@ class DiffusionDataset(Dataset):
 
     def _read_files(self) -> None:
         dataframes = []
-        for parquet_file in self.data_files:
-            dataframe = datasets.load_dataset("parquet", data_files=parquet_file)["train"]
+        for data_file in self.data_files:
+            file_ext = os.path.splitext(data_file)[-1].lower()
+            loader = "json" if file_ext in {".json", ".jsonl"} else "parquet"
+            dataframe = datasets.load_dataset(loader, data_files=data_file)["train"]
             dataframes.append(dataframe)
         self.dataframe: datasets.Dataset = datasets.concatenate_datasets(dataframes)
 

@@ -156,11 +156,14 @@ class TaskRunner:
         from verl.trainer.ppo.ray_trainer import ResourcePoolManager, Role
 
         placement = os.getenv("TASK_PLACEMENT", "colocated")
+        fit_disaggregate = bool(getattr(config.trainer, "disaggregate", False))
 
         from verl.workers.fsdp_workers import ActorRolloutRefWorker_encoder, ActorRolloutRefWorker_llm
 
         # Define the resource pool specification.
         global_pool_id = "global_pool"
+        actor_pool_id = "actor_pool"
+        rollout_ref_pool_id = "rollout_ref_pool"
         actor_rollout_encoder_id = "actor_rollout_encoder_pool"
         actor_rollout_llm_id = "actor_rollout_llm_pool"
         ref_encoder_id = "ref_encoder_pool"
@@ -169,18 +172,76 @@ class TaskRunner:
         # Map roles to their corresponding remote worker classes.
         # Map roles to the resource pool.
         if placement == "colocated":
-            role_worker_mapping = {
-                Role.ActorRollout: ray.remote(actor_rollout_cls),
-                Role.Critic: ray.remote(CriticWorker),
-            }
-            resource_pool_spec = {
-                global_pool_id: [config.trainer.n_gpus_per_node] * config.trainer.nnodes,
-            }
-            mapping = {
-                Role.ActorRollout: global_pool_id,
-                Role.Critic: global_pool_id,
-            }
+            if fit_disaggregate:
+                # fit_dis() uses separate WorkerGroups (actor + rollout_ref). By default, split GPUs evenly.
+                total_gpus_per_node = int(config.trainer.n_gpus_per_node)
+                actor_gpus_per_node = config.trainer.get("disaggregate_actor_n_gpus_per_node", None)
+                rollout_ref_gpus_per_node = config.trainer.get("disaggregate_rollout_ref_n_gpus_per_node", None)
+
+                if actor_gpus_per_node is None and rollout_ref_gpus_per_node is None:
+                    if total_gpus_per_node < 2:
+                        raise ValueError(
+                            "trainer.disaggregate=true requires at least 2 GPUs per node by default; "
+                            "or explicitly set trainer.disaggregate_actor_n_gpus_per_node and "
+                            "trainer.disaggregate_rollout_ref_n_gpus_per_node."
+                        )
+                    actor_gpus_per_node = total_gpus_per_node // 2
+                    rollout_ref_gpus_per_node = total_gpus_per_node - actor_gpus_per_node
+                elif actor_gpus_per_node is None:
+                    rollout_ref_gpus_per_node = int(rollout_ref_gpus_per_node)
+                    actor_gpus_per_node = total_gpus_per_node - rollout_ref_gpus_per_node
+                elif rollout_ref_gpus_per_node is None:
+                    actor_gpus_per_node = int(actor_gpus_per_node)
+                    rollout_ref_gpus_per_node = total_gpus_per_node - actor_gpus_per_node
+                else:
+                    actor_gpus_per_node = int(actor_gpus_per_node)
+                    rollout_ref_gpus_per_node = int(rollout_ref_gpus_per_node)
+
+                if actor_gpus_per_node <= 0 or rollout_ref_gpus_per_node <= 0:
+                    raise ValueError(
+                        "Invalid fit_dis() GPU split: "
+                        f"{actor_gpus_per_node=}, {rollout_ref_gpus_per_node=}"
+                    )
+                if actor_gpus_per_node + rollout_ref_gpus_per_node > total_gpus_per_node:
+                    raise ValueError(
+                        "fit_dis() GPU split exceeds available GPUs per node: "
+                        f"{actor_gpus_per_node=}, {rollout_ref_gpus_per_node=}, {total_gpus_per_node=}"
+                    )
+
+                role_worker_mapping = {
+                    Role.Actor: ray.remote(actor_rollout_cls),
+                    Role.RolloutRef: ray.remote(actor_rollout_cls),
+                    Role.Critic: ray.remote(CriticWorker),
+                }
+                resource_pool_spec = {
+                    actor_pool_id: [actor_gpus_per_node] * config.trainer.nnodes,
+                    rollout_ref_pool_id: [rollout_ref_gpus_per_node] * config.trainer.nnodes,
+                }
+                mapping = {
+                    Role.Actor: actor_pool_id,
+                    Role.RolloutRef: rollout_ref_pool_id,
+                    # Critic/RM/reference are not supported yet in fit_dis() migration steps; keep mapping for
+                    # compatibility (trainer will error if they are enabled).
+                    Role.Critic: actor_pool_id,
+                }
+            else:
+                role_worker_mapping = {
+                    Role.ActorRollout: ray.remote(actor_rollout_cls),
+                    Role.Critic: ray.remote(CriticWorker),
+                }
+                resource_pool_spec = {
+                    global_pool_id: [config.trainer.n_gpus_per_node] * config.trainer.nnodes,
+                }
+                mapping = {
+                    Role.ActorRollout: global_pool_id,
+                    Role.Critic: global_pool_id,
+                }
         elif placement == "disaggregated":
+            if fit_disaggregate:
+                raise NotImplementedError(
+                    "trainer.disaggregate=true (fit_dis) is currently incompatible with TASK_PLACEMENT=disaggregated "
+                    "(encoder/llm split placement)."
+                )
             role_worker_mapping = {
                 Role.LLMActorRollout: ray.remote(ActorRolloutRefWorker_llm),
                 Role.EncoderActorRollout: ray.remote(ActorRolloutRefWorker_encoder),
@@ -205,6 +266,10 @@ class TaskRunner:
         # finally, we combine all the rewards together
         # The reward type depends on the tag of the data
         if config.reward_model.enable:
+            if fit_disaggregate:
+                raise NotImplementedError(
+                    "reward_model.enable=true is currently unsupported with trainer.disaggregate=true (fit_dis)."
+                )
             if config.reward_model.strategy in {"fsdp", "fsdp2"}:
                 from verl.workers.fsdp_workers import RewardModelWorker
             elif config.reward_model.strategy == "megatron":
@@ -215,7 +280,7 @@ class TaskRunner:
             mapping[Role.RewardModel] = global_pool_id
 
         # Add a reference policy worker if KL loss or KL reward is used.
-        if config.algorithm.use_kl_in_reward or config.actor_rollout_ref.actor.use_kl_loss:
+        if (config.algorithm.use_kl_in_reward or config.actor_rollout_ref.actor.use_kl_loss) and (not fit_disaggregate):
             if placement == "colocated":
                 role_worker_mapping[Role.RefPolicy] = ray.remote(ActorRolloutRefWorker)
                 mapping[Role.RefPolicy] = global_pool_id
@@ -256,10 +321,13 @@ class TaskRunner:
             collate_fn=collate_fn,
             train_sampler=train_sampler,
         )
-        # Initialize the workers of the trainer.
-        trainer.init_workers()
-        # Start the training process.
-        trainer.fit()
+        if fit_disaggregate:
+            trainer.fit_dis()
+        else:
+            # Initialize the workers of the trainer.
+            trainer.init_workers()
+            # Start the training process.
+            trainer.fit()
 
 
 def create_rl_dataset(data_paths, data_config, tokenizer, processor, is_train=True):

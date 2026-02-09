@@ -72,6 +72,10 @@ class AlgoConfig(BaseConfig):
         kl_ctrl (KLControlConfig): KL control configuration.
         use_pf_ppo (bool): Whether to enable preference feedback PPO.
         pf_ppo (dict[str, Any]): Preference feedback PPO settings.
+        online_filtering (bool): Whether to enable online filtering.
+        filter_key (str): Reward metric key for online filtering.
+        filter_low (float): Lower reward threshold for online filtering.
+        filter_high (float): Upper reward threshold for online filtering.
         filter_groups (Optional[FilterGroupsConfig]): Filter groups configuration, used in DAPO and Entropy
     """
 
@@ -84,4 +88,8 @@ class AlgoConfig(BaseConfig):
     kl_ctrl: KLControlConfig = field(default_factory=KLControlConfig)
     use_pf_ppo: bool = False
     pf_ppo: dict[str, Any] = field(default_factory=dict)
+    online_filtering: bool = False
+    filter_key: str = "overall"
+    filter_low: float = 0.01
+    filter_high: float = 0.99
     filter_groups: Optional[FilterGroupsConfig] = None

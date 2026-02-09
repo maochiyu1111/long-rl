@@ -19,6 +19,7 @@ import json
 import logging
 import os
 import warnings
+from datetime import timedelta
 from dataclasses import asdict
 from typing import Any
 
@@ -31,7 +32,7 @@ from codetiming import Timer
 from omegaconf import DictConfig, OmegaConf, open_dict
 from peft import LoraConfig, TaskType, get_peft_model
 from safetensors.torch import save_file
-from torch.distributed.device_mesh import init_device_mesh
+from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
 import verl.utils.torch_functional as verl_F
@@ -82,6 +83,68 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 device_name = get_device_name()
 
 
+def _get_dist_timeout() -> timedelta:
+    timeout_s = int(os.getenv("VERL_DIST_TIMEOUT_SECONDS", "60"))
+    if timeout_s <= 0:
+        timeout_s = 60
+    return timedelta(seconds=timeout_s)
+
+def _pick_iface_by_subnet(prefix: str = "192.158.0.") -> str | None:
+    import socket
+
+    for name, addrs in psutil.net_if_addrs().items():
+        for a in addrs:
+            if a.family == socket.AF_INET and a.address.startswith(prefix):
+                return name
+    return None
+
+
+def _setup_nic_env(prefix: str = "192.158.0.") -> None:
+    iface = _pick_iface_by_subnet(prefix)
+    if iface is None:
+        os.environ["NCCL_SOCKET_IFNAME"] = "^lo,docker0,flannel,cni0,veth"
+        os.environ["GLOO_SOCKET_IFNAME"] = os.environ["NCCL_SOCKET_IFNAME"]
+        logger.debug("[net] no iface with %s; use exclude list for NCCL/GLOO", prefix)
+    else:
+        os.environ["NCCL_SOCKET_IFNAME"] = iface
+        os.environ["GLOO_SOCKET_IFNAME"] = iface
+        logger.debug("[net] use iface %s for NCCL/GLOO", iface)
+
+
+def _bcast_cuda_chunks_into_(flat_tensor: torch.Tensor, *, src_group_rank: int, group, chunk_mb: int = 256) -> None:
+    """Broadcast a 1D device tensor in chunks, writing into `flat_tensor` in-place on receivers."""
+
+    if flat_tensor.device.type == "cpu":
+        raise ValueError("_bcast_cuda_chunks_into_ requires a non-CPU tensor")
+    if flat_tensor.ndim != 1:
+        raise ValueError(f"_bcast_cuda_chunks_into_ requires a 1D tensor, got shape={tuple(flat_tensor.shape)}")
+    if chunk_mb <= 0:
+        raise ValueError(f"chunk_mb must be positive, got {chunk_mb}")
+
+    numel = flat_tensor.numel()
+    bytes_per_el = flat_tensor.element_size()
+    chunk_elems = max(1, (chunk_mb * 1024 * 1024) // bytes_per_el)
+    offset = 0
+    while offset < numel:
+        end = min(offset + chunk_elems, numel)
+        dist.broadcast(flat_tensor[offset:end], src=src_group_rank, group=group)
+        offset = end
+
+
+class _NoOpProfiler:
+    def start(self, **kwargs) -> None:
+        return None
+
+    def stop(self) -> None:
+        return None
+
+    def step(self) -> None:
+        return None
+
+    def stop_and_save(self) -> None:
+        return None
+
+
 def create_device_mesh(world_size, fsdp_size):
     if fsdp_size < 0 or fsdp_size >= world_size:
         device_mesh = init_device_mesh(device_name, mesh_shape=(world_size,), mesh_dim_names=["fsdp"])
@@ -90,6 +153,41 @@ def create_device_mesh(world_size, fsdp_size):
             device_name, mesh_shape=(world_size // fsdp_size, fsdp_size), mesh_dim_names=["ddp", "fsdp"]
         )
     return device_mesh
+
+
+def create_device_mesh_from_ranks(ranks: list[int], fsdp_size: int) -> DeviceMesh:
+    world_size = len(ranks)
+    if world_size == 0:
+        raise ValueError("ranks must be non-empty")
+
+    ranks = sorted(ranks)
+    if fsdp_size < 0 or fsdp_size >= world_size:
+        mesh = ranks
+        mesh_dim_names = ("fsdp",)
+    else:
+        if world_size % fsdp_size != 0:
+            raise ValueError(f"world_size={world_size} must be divisible by fsdp_size={fsdp_size}")
+        ddp_size = world_size // fsdp_size
+        mesh = [ranks[i * fsdp_size : (i + 1) * fsdp_size] for i in range(ddp_size)]
+        mesh_dim_names = ("ddp", "fsdp")
+
+    return DeviceMesh(device_name, mesh=mesh, mesh_dim_names=mesh_dim_names)
+
+
+def create_ulysses_device_mesh_from_ranks(ranks: list[int], sp_size: int) -> DeviceMesh | None:
+    if sp_size <= 1:
+        return None
+
+    world_size = len(ranks)
+    if world_size == 0:
+        raise ValueError("ranks must be non-empty")
+    if world_size % sp_size != 0:
+        raise ValueError(f"world_size={world_size} must be divisible by sp_size={sp_size}")
+
+    ranks = sorted(ranks)
+    dp_size = world_size // sp_size
+    mesh = [ranks[i * sp_size : (i + 1) * sp_size] for i in range(dp_size)]
+    return DeviceMesh(device_name, mesh=mesh, mesh_dim_names=("dp", "sp"))
 
 
 def get_sharding_strategy(device_mesh):
@@ -110,22 +208,17 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     or a hybrid engine based on the config.rollout
     """
 
-    def __init__(self, config: DictConfig, role: str, **kwargs):
+    def __init__(self, config: DictConfig, role: str, disaggregate: bool | None = None, **kwargs):
         Worker.__init__(self)
 
         self.config = config
         self.profile_option = kwargs.get("profile_option", None)
-        import torch.distributed
+        self.role = role
+        assert self.role in ["actor", "rollout", "ref", "actor_rollout", "rollout_ref", "actor_rollout_ref"]
 
-        if not torch.distributed.is_initialized():
-            rank = int(os.environ.get("RANK", 0))
-            world_size = int(os.environ.get("WORLD_SIZE", 1))
-            torch.distributed.init_process_group(
-                backend=f"cpu:gloo,{get_device_name()}:{get_nccl_backend()}",
-                rank=rank,
-                world_size=world_size,
-                init_method=os.environ.get("DIST_INIT_METHOD", None),
-            )
+        self._is_actor = self.role in ["actor", "actor_rollout", "actor_rollout_ref"]
+        self._is_rollout = self.role in ["rollout", "actor_rollout", "rollout_ref", "actor_rollout_ref"]
+        self._is_ref = self.role in ["ref", "rollout_ref", "actor_rollout_ref"]
 
         self._prof = None
         self._prof_enabled = False
@@ -134,54 +227,68 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         self._enable_prof_env = bool(int(os.getenv("ENABLE_PROFILER", "0")))
         self.generation_config = None
 
-        # build device mesh for FSDP
-        world_size = torch.distributed.get_world_size()
-        # TODO(sgm): support FSDP hybrid shard for larger model
-        self.device_mesh = create_device_mesh(world_size=world_size, fsdp_size=self.config.actor.fsdp_config.fsdp_size)
-
-        # build device mesh for Ulysses Sequence Parallel
-        self.ulysses_device_mesh = None
         self.ulysses_sequence_parallel_size = self.config.actor.get("ulysses_sequence_parallel_size", 1)
-        dp = world_size // self.ulysses_sequence_parallel_size
-        if self.ulysses_sequence_parallel_size > 1:
-            self.ulysses_device_mesh = init_device_mesh(
-                device_name, mesh_shape=(dp, self.ulysses_sequence_parallel_size), mesh_dim_names=["dp", "sp"]
-            )
-
-        self.ulysses_sharding_manager = FSDPUlyssesShardingManager(self.ulysses_device_mesh)
         self._lora_rank = self.config.model.get("lora_rank", 0)
         self._is_lora = self._lora_rank > 0
 
-        self.role = role
-        assert self.role in ["actor", "rollout", "ref", "actor_rollout", "actor_rollout_ref"]
-
-        self._is_actor = self.role in ["actor", "actor_rollout", "actor_rollout_ref"]
-        self._is_rollout = self.role in ["rollout", "actor_rollout", "actor_rollout_ref"]
-        self._is_ref = self.role in ["ref", "actor_rollout_ref"]
         # diffusion flag is configured via actor.extra / rollout.name / trainer.diffusion
         actor_extra = self.config.actor.get("extra", {})
-        trainer_diffusion = getattr(self.config, "diffusion", False)
+        trainer_diffusion = OmegaConf.select(self.config, "trainer.diffusion")
+        if trainer_diffusion is None:
+            trainer_diffusion = getattr(self.config, "diffusion", False)
         self.diffusion = bool(
-            trainer_diffusion
+            bool(trainer_diffusion)
             or getattr(self.config.rollout, "name", "") == "diffusion"
             or getattr(self.config.ref, "diffusion", False)
             or (actor_extra.get("diffusion", False) if isinstance(actor_extra, dict) else False)
         )
+        trainer_disaggregate = OmegaConf.select(self.config, "trainer.disaggregate")
+        if trainer_disaggregate is None:
+            trainer_disaggregate = getattr(self.config, "disaggregate", False)
+        self.disaggregate = bool(trainer_disaggregate) if disaggregate is None else bool(disaggregate)
         self._local_model_path = None
 
-        # TODO(haibin.lin):
-        # As of now the type of config is DictConfig, if we assign config.profiler with ProfilerConfig,
-        # it will actually convert the ProfilerConfig dataclass back to a DictConfig.
-        # We can still use ProfilerConfig for testing purpose (tests/utils/test_nvtx_profile.py)
-        # as they provides DictConfig-like interface
-        # The benefit of creating the dataclass config is to perform validation during __post_init__
-        profiler_config = omega_conf_to_dataclass(config.get("profiler"))
-        # DistProfilerExtension.__init__(
-        #     self, DistProfiler(rank=self.rank, config=profiler_config, option=self.profile_option)
-        # )
-        DistProfilerExtension.__init__(
-            self, Profiler(config=profiler_config, task=self.role)
-        )
+        # Profiler relies on the default process group for rank discovery. In disaggregate mode we may
+        # intentionally delay process group initialization, so we install a no-op profiler first and
+        # replace it after distributed setup.
+        self._profiler_config = omega_conf_to_dataclass(config.get("profiler"))
+        DistProfilerExtension.__init__(self, _NoOpProfiler())
+
+        import torch.distributed
+
+        self._post_dist_init_done = False
+        self.device_mesh = None
+        self.ulysses_device_mesh = None
+        self.ulysses_sharding_manager = FSDPUlyssesShardingManager(self.ulysses_device_mesh)
+        self.global_rank: int | None = None
+        self.global_world_size: int | None = None
+        self.actor_group_ranks: list[int] | None = None
+        self.rollout_ref_group_ranks: list[int] | None = None
+        self.actor_pg = None
+        self.rollout_ref_pg = None
+        self._gdr_pair_ranks: tuple[int, int] | None = None
+        self._gdr_pair_pg = None
+        self._dist_mesh_ranks: list[int] | None = None
+        self._delay_default_pg_init = bool(self.diffusion and self.disaggregate and self.role in ["actor", "rollout_ref"])
+        if self._delay_default_pg_init and torch.distributed.is_initialized():
+            raise RuntimeError(
+                "disaggregate+diffusion worker requires delayed default process group initialization, but "
+                "torch.distributed is already initialized before setup_dist()."
+            )
+
+        if (not self._delay_default_pg_init) and (not torch.distributed.is_initialized()):
+            rank = int(os.environ.get("RANK", 0))
+            world_size = int(os.environ.get("WORLD_SIZE", 1))
+            torch.distributed.init_process_group(
+                backend=f"cpu:gloo,{get_device_name()}:{get_nccl_backend()}",
+                rank=rank,
+                world_size=world_size,
+                init_method=os.environ.get("DIST_INIT_METHOD", None),
+                timeout=_get_dist_timeout(),
+            )
+
+        if torch.distributed.is_initialized():
+            self._init_dist_dependent_state()
 
         self._is_offload_param = False
         self._is_offload_optimizer = False
@@ -191,6 +298,38 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         elif self._is_ref:
             # TODO: it seems that manual offload is slowly than FSDP offload
             self._is_offload_param = self.config.ref.fsdp_config.get("param_offload", False)
+
+    def _init_dist_dependent_state(self) -> None:
+        if self._post_dist_init_done:
+            return
+        if not dist.is_initialized():
+            raise RuntimeError("default process group is not initialized; call setup_dist() before using this worker.")
+
+        if isinstance(getattr(self, "profiler", None), _NoOpProfiler):
+            self.profiler = Profiler(config=self._profiler_config, task=self.role)
+
+        mesh_ranks = self._dist_mesh_ranks
+        if mesh_ranks is None:
+            world_size = dist.get_world_size()
+            self.device_mesh = create_device_mesh(
+                world_size=world_size, fsdp_size=self.config.actor.fsdp_config.fsdp_size
+            )
+            self.ulysses_device_mesh = None
+            dp = world_size // self.ulysses_sequence_parallel_size
+            if self.ulysses_sequence_parallel_size > 1:
+                self.ulysses_device_mesh = init_device_mesh(
+                    device_name, mesh_shape=(dp, self.ulysses_sequence_parallel_size), mesh_dim_names=["dp", "sp"]
+                )
+        else:
+            world_size = len(mesh_ranks)
+            self.device_mesh = create_device_mesh_from_ranks(
+                ranks=mesh_ranks, fsdp_size=self.config.actor.fsdp_config.fsdp_size
+            )
+            self.ulysses_device_mesh = create_ulysses_device_mesh_from_ranks(
+                ranks=mesh_ranks, sp_size=self.ulysses_sequence_parallel_size
+            )
+
+        self.ulysses_sharding_manager = FSDPUlyssesShardingManager(self.ulysses_device_mesh)
 
         # normalize config
         if self._is_actor:
@@ -227,6 +366,332 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         if self._is_ref and self.config.ref.log_prob_micro_batch_size is not None:
             self.config.ref.log_prob_micro_batch_size //= self.device_mesh.size() // self.ulysses_sequence_parallel_size
             self.config.ref.log_prob_micro_batch_size_per_gpu = self.config.ref.log_prob_micro_batch_size
+
+        self._post_dist_init_done = True
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def setup_dist(
+        self,
+        *,
+        rank: int,
+        world_size: int,
+        master_addr: str,
+        master_port: int,
+        local_rank: int = 0,
+        actor_group_ranks: list[int] | None = None,
+        rollout_ref_group_ranks: list[int] | None = None,
+    ) -> None:
+        # 设 env，使用 env:// rendezvous
+        _setup_nic_env("10.244.3.70.")
+        os.environ["MASTER_ADDR"] = str(master_addr)
+        os.environ["MASTER_PORT"] = str(master_port)
+        os.environ["RANK"] = str(rank)
+        os.environ["WORLD_SIZE"] = str(world_size)
+        os.environ["LOCAL_RANK"] = str(local_rank)
+
+        os.environ["NCCL_DEBUG"] = os.environ.get("NCCL_DEBUG", "INFO")
+        os.environ["NCCL_IB_DISABLE"] = "1"  # 强制禁用 RDMA
+        os.environ["NCCL_NET"] = "Socket"  # 强制走 TCP
+        os.environ["NCCL_COLLNET_ENABLE"] = "0"  # 关 SHARP/CollNet 等 IB 相关
+        os.environ["NCCL_SHARP_DISABLE"] = "1"
+        visible_gpu_count = torch.cuda.device_count()
+        target_device = 0
+        if visible_gpu_count > 1:
+            target_device = int(local_rank) % visible_gpu_count
+        torch.cuda.set_device(target_device)
+        logger.debug(
+            "[setup_dist] global_rank=%s local_rank=%s visible_gpu_count=%s cuda_visible_devices=%s target_device=%s",
+            rank,
+            local_rank,
+            visible_gpu_count,
+            os.environ.get("CUDA_VISIBLE_DEVICES", "unset"),
+            target_device,
+        )
+        if not dist.is_initialized():
+            dist.init_process_group(backend="nccl", init_method="env://", timeout=_get_dist_timeout())
+
+        # 验证：这里打印的一定是全局 rank
+        self.global_rank = rank
+        self.actor_group_ranks = actor_group_ranks
+        self.rollout_ref_group_ranks = rollout_ref_group_ranks
+        self.actor_pg = (
+            dist.new_group(ranks=actor_group_ranks) if actor_group_ranks is not None and len(actor_group_ranks) > 0 else None
+        )
+        self.rollout_ref_pg = (
+            dist.new_group(ranks=rollout_ref_group_ranks)
+            if rollout_ref_group_ranks is not None and len(rollout_ref_group_ranks) > 0
+            else None
+        )
+
+        if self._is_actor:
+            self._dist_mesh_ranks = actor_group_ranks
+        if self._is_rollout or self._is_ref:
+            self._dist_mesh_ranks = rollout_ref_group_ranks
+
+        if not self._post_dist_init_done:
+            self._init_dist_dependent_state()
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def normalize_pipeline_dtype(self, module: str = "transformer", dtype: str = "bfloat16") -> None:
+        """Normalize diffusion rollout pipeline dtype before cross-group sync.
+
+        This is a no-op unless this worker includes a rollout role and has a diffusion pipeline.
+        """
+
+        if not self._is_rollout:
+            return
+
+        rollout = getattr(self, "rollout", None)
+        pipeline = getattr(rollout, "pipeline", None)
+        if pipeline is None:
+            raise RuntimeError("normalize_pipeline_dtype() requires a rollout with a `pipeline` attribute.")
+
+        pipeline_module = getattr(pipeline, module, None)
+        if pipeline_module is None:
+            raise AttributeError(f"rollout.pipeline has no module '{module}'")
+
+        from verl.utils.torch_dtypes import PrecisionType
+
+        target_dtype = PrecisionType.to_dtype(dtype)
+
+        with torch.no_grad():
+            for param in pipeline_module.parameters(recurse=True):
+                if param is None or param.data is None:
+                    continue
+                if not param.data.is_floating_point():
+                    continue
+                if param.data.dtype != target_dtype:
+                    param.data = param.data.to(dtype=target_dtype)
+
+            for submodule in pipeline_module.modules():
+                for buffer_name, buffer in list(submodule._buffers.items()):
+                    if buffer is None:
+                        continue
+                    if not torch.is_floating_point(buffer):
+                        continue
+                    if buffer.dtype != target_dtype:
+                        submodule._buffers[buffer_name] = buffer.to(dtype=target_dtype)
+
+    @register(dispatch_mode=Dispatch.ALL_TO_ALL)
+    def sync_transformer_gdr_with_relay(self, chunk_mb: int = 256) -> None:
+        if not self.diffusion:
+            return
+
+        if self.global_rank is None or self.actor_group_ranks is None or self.rollout_ref_group_ranks is None:
+            raise RuntimeError("sync_transformer_gdr_with_relay() requires setup_dist() to be called first.")
+
+        world_rank = int(self.global_rank)
+        if not self.actor_group_ranks or not self.rollout_ref_group_ranks:
+            raise RuntimeError("sync_transformer_gdr_with_relay() requires non-empty actor/rollout_ref groups.")
+
+        actor_src_global_rank = self.actor_group_ranks[0]
+        relay_global_rank = self.rollout_ref_group_ranks[0]
+        pair_ranks = [actor_src_global_rank, relay_global_rank]
+        pair_pg = dist.new_group(ranks=pair_ranks)
+
+        pipeline_transformer = None
+        if world_rank in self.rollout_ref_group_ranks:
+            pipe = getattr(self.rollout, "pipeline", None)
+            if pipe is None or getattr(pipe, "transformer", None) is None:
+                raise RuntimeError("rollout.pipeline or pipeline.transformer doesn't exist")
+            pipeline_transformer = pipe.transformer
+
+        logger.debug(
+            "[GDR-Relay][Phase0][enter] world_rank=%s actor_src=%s relay=%s local_rank=%s cuda_device=%s pair_ranks=%s",
+            world_rank,
+            actor_src_global_rank,
+            relay_global_rank,
+            os.environ.get("LOCAL_RANK", "unset"),
+            get_device_id(),
+            tuple(pair_ranks),
+        )
+
+        target_dtype = None
+        if world_rank == relay_global_rank:
+            assert pipeline_transformer is not None, "relay has to have rollout.pipeline"
+
+            try:
+                p0 = next(pipeline_transformer.parameters())
+            except StopIteration as exc:
+                raise RuntimeError("pipeline has no parameters") from exc
+            target_dtype = p0.dtype
+            for p in pipeline_transformer.parameters():
+                if p.dtype != target_dtype:
+                    raise RuntimeError(f"pipeline has inconsistent dtype: {p.dtype} vs {target_dtype}")
+
+            dtype_token = str(target_dtype).replace("torch.", "")
+            obj = [dtype_token]
+            dist.broadcast_object_list(obj, src=relay_global_rank, group=pair_pg)
+            logger.debug("[GDR-Relay][Phase0][relay_done] world_rank=%s dtype=%s", world_rank, dtype_token)
+
+        elif world_rank == actor_src_global_rank:
+            obj = [None]
+            dist.broadcast_object_list(obj, src=relay_global_rank, group=pair_pg)
+            dtype_token = obj[0]
+            if dtype_token is None:
+                raise RuntimeError("relay did not provide dtype token")
+            try:
+                target_dtype = getattr(torch, dtype_token)
+            except AttributeError as exc:
+                raise RuntimeError(f"can't find dtype: {dtype_token}") from exc
+            logger.debug("[GDR-Relay][Phase0][actor_done] world_rank=%s dtype=%s", world_rank, dtype_token)
+
+        if world_rank in self.actor_group_ranks:
+            actor_module_fsdp = getattr(self, "actor_module_fsdp", None)
+            if actor_module_fsdp is None:
+                raise RuntimeError("sync_transformer_gdr_with_relay() requires actor_module_fsdp to be initialized.")
+
+            if self._is_offload_param:
+                load_fsdp_model_to_gpu(actor_module_fsdp)
+
+            names, src_gpu_tensors = [], []
+            try:
+                from torch.distributed.fsdp import FullStateDictConfig, StateDictType
+
+                cfg = FullStateDictConfig(offload_to_cpu=False, rank0_only=True)
+                with FSDP.state_dict_type(actor_module_fsdp, StateDictType.FULL_STATE_DICT, cfg):
+                    sd_full = actor_module_fsdp.state_dict()
+
+                dev = torch.device(get_device_name(), get_device_id())
+                for k, v in sd_full.items():
+                    if isinstance(v, torch.Tensor):
+                        if target_dtype is not None and v.dtype != target_dtype:
+                            v = v.to(dtype=target_dtype, non_blocking=True)
+                        if v.device != dev:
+                            v = v.to(dev, non_blocking=True)
+                        names.append(k)
+                        src_gpu_tensors.append(v)
+            except Exception:
+                from torch.distributed.fsdp import FullStateDictConfig, StateDictType
+
+                cfg = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
+                with FSDP.state_dict_type(actor_module_fsdp, StateDictType.FULL_STATE_DICT, cfg):
+                    sd_full = actor_module_fsdp.state_dict()
+                dev = torch.device(get_device_name(), get_device_id())
+                for k, v in sd_full.items():
+                    if isinstance(v, torch.Tensor):
+                        if target_dtype is not None:
+                            v = v.to(device=dev, dtype=target_dtype, non_blocking=True)
+                        else:
+                            v = v.to(device=dev, non_blocking=True)
+                        names.append(k)
+                        src_gpu_tensors.append(v)
+            finally:
+                if self._is_offload_param:
+                    offload_fsdp_model_to_cpu(actor_module_fsdp)
+
+            if world_rank == actor_src_global_rank:
+                obj = [len(names)]
+                dist.broadcast_object_list(obj, src=actor_src_global_rank, group=pair_pg)
+                dist.barrier(pair_pg)
+
+                for i, k in enumerate(names):
+                    meta = (k, tuple(src_gpu_tensors[i].shape))
+                    obj = [meta]
+                    dist.broadcast_object_list(obj, src=actor_src_global_rank, group=pair_pg)
+                    dist.barrier(pair_pg)
+                    flat_send = src_gpu_tensors[i].view(-1)
+                    _bcast_cuda_chunks_into_(
+                        flat_send, src_group_rank=actor_src_global_rank, group=pair_pg, chunk_mb=chunk_mb
+                    )
+                    dist.barrier(pair_pg)
+
+        elif world_rank == relay_global_rank:
+            assert pipeline_transformer is not None
+            obj = [None]
+            dist.broadcast_object_list(obj, src=actor_src_global_rank, group=pair_pg)
+            dist.barrier(pair_pg)
+            num_tensors = obj[0]
+            if num_tensors is None:
+                raise RuntimeError("relay did not receive tensor count from actor_src")
+
+            name2param = dict(pipeline_transformer.named_parameters())
+            names_in_order = []
+            for _ in range(num_tensors):
+                obj = [None]
+                dist.broadcast_object_list(obj, src=actor_src_global_rank, group=pair_pg)
+                dist.barrier(pair_pg)
+                name, shape = obj[0]
+                names_in_order.append(name)
+
+                if name not in name2param:
+                    raise RuntimeError(f"relay lacks {name}")
+                param = name2param[name]
+                if tuple(param.shape) != tuple(shape):
+                    raise RuntimeError(f"relay shape mapping error {name} recv={tuple(param.shape)} src={tuple(shape)}")
+                if not param.data.is_cuda:
+                    raise RuntimeError(f"relay params are not on cuda {name}")
+                if not param.data.is_contiguous():
+                    raise RuntimeError(f"relay params are not contiguous {name}")
+
+                flat_recv = param.data.view(-1)
+                _bcast_cuda_chunks_into_(
+                    flat_recv, src_group_rank=actor_src_global_rank, group=pair_pg, chunk_mb=chunk_mb
+                )
+                dist.barrier(pair_pg)
+
+        if world_rank in self.rollout_ref_group_ranks:
+            if self.rollout_ref_pg is None:
+                raise RuntimeError("rollout_ref_pg is not initialized; call setup_dist() before sync.")
+
+            if world_rank == relay_global_rank:
+                assert pipeline_transformer is not None
+                name2param = dict(pipeline_transformer.named_parameters())
+
+                if "names_in_order" not in locals():
+                    names_in_order = list(name2param.keys())
+
+                obj = [len(names_in_order)]
+                dist.broadcast_object_list(obj, src=relay_global_rank, group=self.rollout_ref_pg)
+                dist.barrier(self.rollout_ref_pg)
+
+                for name in names_in_order:
+                    p = name2param[name]
+                    meta = (name, tuple(p.shape))
+                    obj = [meta]
+                    dist.broadcast_object_list(obj, src=relay_global_rank, group=self.rollout_ref_pg)
+                    dist.barrier(self.rollout_ref_pg)
+                    flat_send = p.data.view(-1)
+                    _bcast_cuda_chunks_into_(
+                        flat_send, src_group_rank=relay_global_rank, group=self.rollout_ref_pg, chunk_mb=chunk_mb
+                    )
+                    dist.barrier(self.rollout_ref_pg)
+
+            else:
+                assert pipeline_transformer is not None, "rollout rank must have pipeline"
+                name2param = dict(pipeline_transformer.named_parameters())
+
+                obj = [None]
+                dist.broadcast_object_list(obj, src=relay_global_rank, group=self.rollout_ref_pg)
+                dist.barrier(self.rollout_ref_pg)
+                num_tensors = obj[0]
+                if num_tensors is None:
+                    raise RuntimeError("rollout did not receive tensor count from relay")
+                for _ in range(num_tensors):
+                    obj = [None]
+                    dist.broadcast_object_list(obj, src=relay_global_rank, group=self.rollout_ref_pg)
+                    dist.barrier(self.rollout_ref_pg)
+                    name, shape = obj[0]
+                    if name not in name2param:
+                        raise RuntimeError(f"rollout lacks {name}")
+                    param = name2param[name]
+                    if tuple(param.shape) != tuple(shape):
+                        raise RuntimeError(
+                            f"rollout shape mapping error {name} recv={tuple(param.shape)} src={tuple(shape)}"
+                        )
+                    if not param.data.is_cuda:
+                        raise RuntimeError(f"rollout params are not on cuda {name}")
+                    if not param.data.is_contiguous():
+                        raise RuntimeError(f"rollout params are not contiguous {name}")
+
+                    flat_recv = param.data.view(-1)
+                    _bcast_cuda_chunks_into_(
+                        flat_recv, src_group_rank=relay_global_rank, group=self.rollout_ref_pg, chunk_mb=chunk_mb
+                    )
+                    dist.barrier(self.rollout_ref_pg)
+
+        if world_rank == 0:
+            logger.debug("[GDR-Relay] pipeline sync finished relay=%s, chunk=%sMB", relay_global_rank, chunk_mb)
 
     def _get_local_model_path(self):
         """Memoized copy_to_local to avoid repeated downloads when diffusion is enabled."""
@@ -538,7 +1003,10 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         if role == "ref":
             diffusion_module.requires_grad_(False)
         del pipeline
-        torch.distributed.barrier()
+        if self._is_actor and self.actor_pg is not None:
+            dist.barrier(self.actor_pg)
+        if self._is_ref and self.rollout_ref_pg is not None:
+            dist.barrier(self.rollout_ref_pg)
 
         mixed_precision_config = fsdp_config.get("mixed_precision", None)
         if mixed_precision_config is not None:
@@ -563,7 +1031,19 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         sharding_strategy = get_sharding_strategy(fsdp_mesh)
         cpu_offload = None if role == "actor" else CPUOffload(offload_params=True)
         fsdp_strategy = self.config.actor.strategy
+        # Keep diffusion init behavior closer to disco_rl: only sync module states
+        # when explicitly enabled (e.g. rank0-init style flows).
+        sync_module_states = bool(fsdp_config.get("enable_rank0_init", False))
         if fsdp_strategy == "fsdp":
+            process_group = None
+            device_mesh = fsdp_mesh
+            if self.disaggregate:
+                if self._is_actor and self.actor_pg is not None:
+                    process_group = self.actor_pg
+                elif (self._is_rollout or self._is_ref) and self.rollout_ref_pg is not None:
+                    process_group = self.rollout_ref_pg
+                if process_group is not None:
+                    device_mesh = None
             module_fsdp = FSDP(
                 diffusion_module,
                 cpu_offload=cpu_offload,
@@ -572,8 +1052,9 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 device_id=get_device_id(),
                 sharding_strategy=sharding_strategy,
                 mixed_precision=mixed_precision,
-                sync_module_states=True,
-                device_mesh=self.device_mesh,
+                sync_module_states=sync_module_states,
+                device_mesh=device_mesh,
+                process_group=process_group,
                 use_orig_params=fsdp_config.get("use_orig_params", False),
                 forward_prefetch=fsdp_config.get("forward_prefetch", False),
             )
@@ -642,6 +1123,10 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         return module_fsdp, diffusion_optimizer, diffusion_lr_scheduler, None
 
     def _build_rollout(self, trust_remote_code=False):
+        rollout_name = self.config.rollout.name
+        if self.diffusion or rollout_name == "diffusion":
+            return self._build_rollout_diffusion()
+
         from torch.distributed.device_mesh import init_device_mesh
 
         # TODO(sgm): support FSDP hybrid shard for larger model
@@ -653,10 +1138,6 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         rollout_device_mesh = init_device_mesh(
             device_name, mesh_shape=(dp, infer_tp), mesh_dim_names=["dp", "infer_tp"]
         )
-        rollout_name = self.config.rollout.name
-        # Add diffusion rollout support based on model path patterns
-        if self.diffusion or rollout_name == "diffusion":
-            return self._build_rollout_diffusion()
         if rollout_name == "hf":
             from verl.workers.rollout import HFRollout
             from verl.workers.sharding_manager.base import BaseShardingManager
@@ -847,7 +1328,6 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 role="actor",
                 enable_activation_offload=self.config.model.get("enable_activation_offload", False),
             )
-
             # get the original unwrapped module
             if fsdp_version(self.actor_module_fsdp) == 1:
                 self.actor_module = self.actor_module_fsdp._fsdp_wrapped_module
@@ -1014,9 +1494,12 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         output = output.to("cpu")
         timing_generate.update(self.rollout_sharding_manager.timing)
-        # We calculate the average timing across all ranks
-        # to make sure meta_info["timing"] is the same
-        timing_generate = reduce_timing(timing_generate)
+        # Diffusion rollout may not always enter the same distributed comm path on every rank.
+        # Avoid collective timing reduce in this path to prevent NCCL init timeout.
+        reduce_timing_across_ranks = bool(int(os.getenv("VERL_REDUCE_TIMING_ACROSS_RANKS", "1"))) and not self.diffusion
+        if reduce_timing_across_ranks:
+            # We calculate the average timing across all ranks to make sure meta_info["timing"] is the same.
+            timing_generate = reduce_timing(timing_generate)
         output.meta_info["timing"] = timing_generate
 
         # clear kv cache
@@ -1216,6 +1699,7 @@ class ActorRolloutRefWorker_encoder(Worker, DistProfilerExtension):
                 rank=rank,
                 world_size=world_size,
                 init_method=os.environ.get("DIST_INIT_METHOD", None),
+                timeout=_get_dist_timeout(),
             )
 
         self._prof = None
@@ -2011,6 +2495,7 @@ class ActorRolloutRefWorker_llm(Worker, DistProfilerExtension):
                 rank=rank,
                 world_size=world_size,
                 init_method=os.environ.get("DIST_INIT_METHOD", None),
+                timeout=_get_dist_timeout(),
             )
 
         self._prof = None
@@ -2622,9 +3107,10 @@ class ActorRolloutRefWorker_llm(Worker, DistProfilerExtension):
         output = output.to("cpu")
 
         timing_generate.update(self.rollout_sharding_manager.timing)
-        # We calculate the average timing across all ranks
-        # to make sure meta_info["timing"] is the same
-        timing_generate = reduce_timing(timing_generate)
+        reduce_timing_across_ranks = bool(int(os.getenv("VERL_REDUCE_TIMING_ACROSS_RANKS", "1")))
+        if reduce_timing_across_ranks:
+            # We calculate the average timing across all ranks to make sure meta_info["timing"] is the same.
+            timing_generate = reduce_timing(timing_generate)
         output.meta_info["timing"] = timing_generate
 
         # clear kv cache
@@ -2732,7 +3218,9 @@ class CriticWorker(Worker, DistProfilerExtension):
 
         if not torch.distributed.is_initialized():
             torch.distributed.init_process_group(
-                backend=get_nccl_backend(), init_method=os.environ.get("DIST_INIT_METHOD", None)
+                backend=get_nccl_backend(),
+                init_method=os.environ.get("DIST_INIT_METHOD", None),
+                timeout=_get_dist_timeout(),
             )
         self.config: FSDPCriticConfig = config
 
@@ -3125,7 +3613,9 @@ class RewardModelWorker(Worker, DistProfilerExtension):
 
         if not torch.distributed.is_initialized():
             torch.distributed.init_process_group(
-                backend=get_nccl_backend(), init_method=os.environ.get("DIST_INIT_METHOD", None)
+                backend=get_nccl_backend(),
+                init_method=os.environ.get("DIST_INIT_METHOD", None),
+                timeout=_get_dist_timeout(),
             )
         self.config = config
 

@@ -80,6 +80,7 @@ class Role(Enum):
     EncoderActorRollout = 8
     LLMRef = 9
     LLMActorRollout = 10
+    RolloutRef = 11
 
 
 @dataclass
@@ -405,11 +406,27 @@ class RayPPOTrainer:
         self.reward_fn = reward_fn
         self.val_reward_fn = val_reward_fn
 
+        # Trainer-level switches
+        # - `diffusion` indicates whether to enable diffusion-specific codepaths.
+        # - `diffusion_disaggregate` indicates whether to use fit_dis() topology (actor + rollout_ref split).
+        self.diffusion = bool(getattr(config.trainer, "diffusion", False))
+        self.diffusion_disaggregate = bool(getattr(config.trainer, "disaggregate", False))
+
         self.hybrid_engine = config.actor_rollout_ref.hybrid_engine
         assert self.hybrid_engine, "Currently, only support hybrid engine"
 
         if self.hybrid_engine:
-            assert Role.ActorRollout in role_worker_mapping or Role.EncoderActorRollout in role_worker_mapping, f"{role_worker_mapping.keys()=}"
+            if self.diffusion_disaggregate:
+                required = {Role.Actor, Role.RolloutRef}
+                missing = required.difference(role_worker_mapping.keys())
+                assert not missing, (
+                    "fit_dis() requires role_worker_mapping to include both Role.Actor and Role.RolloutRef; "
+                    f"missing={sorted([m.name for m in missing])}, keys={list(role_worker_mapping.keys())}"
+                )
+            else:
+                assert (
+                    Role.ActorRollout in role_worker_mapping or Role.EncoderActorRollout in role_worker_mapping
+                ), f"{role_worker_mapping.keys()=}"
 
         self.role_worker_mapping = role_worker_mapping
         self.resource_pool_manager = resource_pool_manager
@@ -444,11 +461,444 @@ class RayPPOTrainer:
             )
             self.use_critic = False
 
-        # Initialize diffusion flag from config
-        self.diffusion = getattr(config.trainer, 'diffusion', False)
-
         self._validate_config()
         self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
+
+    def init_workers_dis(self):
+        """Initialize workers for fit_dis().
+        """
+        if self.disaggregate_actor_rollout or self.disaggregate_ref:
+            raise NotImplementedError(
+                "fit_dis() is currently incompatible with encoder/llm split placement "
+                "(Role.Encoder*/Role.LLM*). Please use colocated placement for Step 1."
+            )
+        if not self.diffusion_disaggregate:
+            raise ValueError("init_workers_dis() is only valid when trainer.disaggregate=true (fit_dis mode).")
+        if self.use_critic:
+            raise NotImplementedError("assumes no critic worker (GRPO). ")
+        if self.use_rm:
+            raise NotImplementedError(
+                "assumes no reward model worker. "
+            )
+        if self.use_reference_policy:
+            raise NotImplementedError(
+                "expects reference to be handled by role='rollout_ref' workers. "
+                "Do not create a separate ref worker in disaggregate mode."
+            )
+
+        self.resource_pool_manager.create_resource_pool()
+        self.resource_pool_to_cls = {pool: {} for pool in self.resource_pool_manager.resource_pool_dict.values()}
+
+        actor_pool = self.resource_pool_manager.get_resource_pool(Role.Actor)
+        rollout_ref_pool = self.resource_pool_manager.get_resource_pool(Role.RolloutRef)
+
+        actor_cls = RayClassWithInitArgs(
+            cls=self.role_worker_mapping[Role.Actor],
+            config=self.config.actor_rollout_ref,
+            role="actor",
+            disaggregate=True,
+            profile_option=self.config.trainer.npu_profile.options,
+        )
+        self.resource_pool_to_cls[actor_pool]["actor"] = actor_cls
+
+        rollout_ref_cls = RayClassWithInitArgs(
+            cls=self.role_worker_mapping[Role.RolloutRef],
+            config=self.config.actor_rollout_ref,
+            role="rollout_ref",
+            disaggregate=True,
+            profile_option=self.config.trainer.npu_profile.options,
+        )
+        self.resource_pool_to_cls[rollout_ref_pool]["rollout_ref"] = rollout_ref_cls
+
+        wg_kwargs: dict[str, Any] = {}
+        if OmegaConf.select(self.config.trainer, "ray_wait_register_center_timeout") is not None:
+            wg_kwargs["ray_wait_register_center_timeout"] = self.config.trainer.ray_wait_register_center_timeout
+        if OmegaConf.select(self.config.trainer, "profile_steps") is not None:
+            wg_kwargs["profile_steps"] = OmegaConf.select(self.config.trainer, "profile_steps")
+            assert OmegaConf.select(self.config.trainer, "worker_nsight_options") is not None, (
+                "worker_nsight_options must be set when profile_steps is set"
+            )
+            wg_kwargs["worker_nsight_options"] = OmegaConf.to_container(
+                OmegaConf.select(self.config.trainer, "worker_nsight_options")
+            )
+        wg_kwargs["device_name"] = self.device_name
+
+        all_wg: dict[str, RayWorkerGroup] = {}
+        for resource_pool, class_dict in self.resource_pool_to_cls.items():
+            if not class_dict:
+                continue
+            worker_dict_cls = create_colocated_worker_cls(class_dict=class_dict)
+            wg_dict = self.ray_worker_group_cls(
+                resource_pool=resource_pool,
+                ray_cls_with_init=worker_dict_cls,
+                **wg_kwargs,
+            )
+            spawn_wg = wg_dict.spawn(prefix_set=class_dict.keys())
+            all_wg.update(spawn_wg)
+
+        self.rollout_ref_wg = all_wg["rollout_ref"]
+        self.actor_wg = all_wg["actor"]
+
+        # Compatibility: existing colocated fit() codepaths still reference actor_rollout_wg.
+        # In fit_dis(), rollout-related calls are expected to target rollout_ref_wg.
+        self.actor_rollout_wg = self.rollout_ref_wg
+
+        # `setup_dist()` uses torch.distributed rendezvous via MASTER_ADDR/MASTER_PORT.
+        #
+        # IMPORTANT:
+        # - In multi-node Ray, the driver/head node IP may not be reachable by GPU workers (or head may have no GPUs),
+        #   which can cause `dist.init_process_group(init_method="env://")` to hang indefinitely.
+        # - Prefer using the worker-group rank-0 node ip + a free port picked by that worker (RayWorkerGroup does this
+        #   internally via the register center actor).
+        #
+        # Allow explicit override via trainer.dist_master_addr/dist_master_port when the user has a known-good
+        # rendezvous endpoint.
+        dist_master_addr = OmegaConf.select(self.config.trainer, "dist_master_addr")
+        dist_master_port = OmegaConf.select(self.config.trainer, "dist_master_port")
+
+        master_addr = dist_master_addr or self.actor_wg.master_address
+        master_port_raw = dist_master_port or self.actor_wg.master_port
+        if not master_addr or master_port_raw is None:
+            raise ValueError(
+                "Failed to determine torch.distributed rendezvous endpoint. "
+                "Set `trainer.dist_master_addr` and `trainer.dist_master_port` explicitly, or ensure the RayWorkerGroup "
+                "has a valid `master_address/master_port`."
+            )
+        master_port = int(master_port_raw)
+
+        n_actor = int(self.actor_wg.world_size)
+        n_rollout_ref = int(self.rollout_ref_wg.world_size)
+        world_size = n_actor + n_rollout_ref
+        if world_size <= 0 or n_actor <= 0 or n_rollout_ref <= 0:
+            raise ValueError(f"Invalid disaggregate world sizes: n_actor={n_actor}, n_rollout_ref={n_rollout_ref}")
+
+        actor_ranks = list(range(0, n_actor))
+        rollout_ref_ranks = list(range(n_actor, n_actor + n_rollout_ref))
+
+        dist_timeout_s = int(OmegaConf.select(self.config.trainer, "dist_timeout_s") or 60)
+
+        gpu_num_per_node = int(self.config.trainer.n_gpus_per_node)
+        # Keep local rank assignment consistent with disco_rl migration baseline.
+        actor_local = [idx % gpu_num_per_node for idx in range(n_actor)]
+        roll_local = [idx % gpu_num_per_node for idx in range(n_rollout_ref)]
+
+        refs: list[ray.ObjectRef] = []
+        for idx, w in enumerate(self.actor_wg.workers):
+            rank = actor_ranks[idx]
+            ref = (
+                w.actor_setup_dist.remote(
+                    rank=rank,
+                    world_size=world_size,
+                    master_addr=master_addr,
+                    master_port=master_port,
+                    local_rank=actor_local[idx],
+                    actor_group_ranks=actor_ranks,
+                    rollout_ref_group_ranks=rollout_ref_ranks,
+                )
+            )
+            refs.append(ref)
+        for idx, w in enumerate(self.rollout_ref_wg.workers):
+            rank = rollout_ref_ranks[idx]
+            ref = (
+                w.rollout_ref_setup_dist.remote(
+                    rank=rank,
+                    world_size=world_size,
+                    master_addr=master_addr,
+                    master_port=master_port,
+                    local_rank=roll_local[idx],
+                    actor_group_ranks=actor_ranks,
+                    rollout_ref_group_ranks=rollout_ref_ranks,
+                )
+            )
+            refs.append(ref)
+        ray.get(refs, timeout=dist_timeout_s)
+
+        # init_model() must happen after setup_dist() in diffusion+disaggregate mode.
+        self.rollout_ref_wg.init_model()
+
+        self.actor_wg.init_model()
+
+
+    def fit_dis(self):
+        """Disaggregate training entry (diffusion path)."""
+        self.init_workers_dis()
+        if self.diffusion:
+            pipeline_dtype = OmegaConf.select(
+                self.config, "actor_rollout_ref.actor.fsdp_config.model_dtype"
+            ) or "bfloat16"
+            self.rollout_ref_wg.normalize_pipeline_dtype(dtype=str(pipeline_dtype))
+
+        self.global_steps = 0
+
+        # load checkpoint before doing anything
+        self._load_checkpoint()
+
+        # perform validation before training
+        if self.val_reward_fn is not None and self.config.trainer.val_before_train:
+            val_metrics = self._validate()
+            pprint(f"Initial validation metrics: {val_metrics}")
+            if self.config.trainer.val_only:
+                return
+
+        progress_bar = tqdm(total=self.total_training_steps, initial=self.global_steps, desc="Training Progress")
+        self.data_iterator = iter(self.train_dataloader)
+        fit_dis_epoch = 0
+
+        # self._prof_start()
+        while self.global_steps < self.total_training_steps:
+            self.global_steps += 1
+            metrics: dict[str, Any] = {}
+            timing_raw: dict[str, float] = {}
+            reward_result = None
+
+            with marked_timer("step", timing_raw):
+                with marked_timer("gen", timing_raw, color="red"):
+                    if self.diffusion:
+                        chunk_mb = int(OmegaConf.select(self.config, "trainer.disaggregate_sync_chunk_mb") or 256)
+                        refs: list[ray.ObjectRef] = []
+                        refs += self.rollout_ref_wg.execute_all_async(
+                            "rollout_ref_sync_transformer_gdr_with_relay", chunk_mb=chunk_mb
+                        )
+                        refs += self.actor_wg.execute_all_async(
+                            "actor_sync_transformer_gdr_with_relay", chunk_mb=chunk_mb
+                        )
+                        ray.get(refs)
+                        batch = self._make_batch_data_dis(metrics=metrics)
+
+                if not self.diffusion:
+                    self._balance_batch(batch, metrics=metrics)
+                    batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
+
+                if "token_level_scores" not in batch.batch:
+                    with marked_timer("reward", timing_raw, color="yellow"):
+                        reward_result = compute_reward(batch, self.reward_fn)
+
+                if not self.diffusion:
+                    with marked_timer("old_log_prob", timing_raw, color="blue"):
+                        old_log_probs = self.actor_wg.compute_log_prob(batch)
+                        if "entropys" in old_log_probs.batch:
+                            old_log_probs.batch.pop("entropys")
+                        batch = batch.union(old_log_probs)
+
+                if self._need_ref_log_prob() or self.use_reference_policy:
+                    with marked_timer("ref", timing_raw, color="olive"):
+                        ref_log_probs = self.rollout_ref_wg.compute_ref_log_prob(batch)
+                        batch = batch.union(ref_log_probs)
+
+                if self.use_critic:
+                    with marked_timer("values", timing_raw, color="cyan"):
+                        values = self.critic_wg.compute_values(batch)
+                        batch = batch.union(values)
+
+                with marked_timer("adv", timing_raw, color="brown"):
+                    if "token_level_scores" not in batch.batch:
+                        reward_tensor, reward_metrics = reward_result
+                        batch.batch["token_level_scores"] = reward_tensor
+                        reward_metrics = {f"reward/{k}": v for k, v in reduce_metrics(reward_metrics).items()}
+                        metrics.update(reward_metrics)
+
+                    if self.config.algorithm.use_kl_in_reward:
+                        batch, kl_metrics = apply_kl_penalty(
+                            batch,
+                            kl_ctrl=self.kl_ctrl_in_reward,
+                            kl_penalty=self.config.algorithm.kl_penalty,
+                            diffusion=self.diffusion,
+                        )
+                        metrics.update(kl_metrics)
+                    else:
+                        batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
+
+                    if self.diffusion:
+                        batch = compute_advantage_diffusion(
+                            batch,
+                            adv_estimator=self.config.algorithm.adv_estimator,
+                            gamma=self.config.algorithm.gamma,
+                            lam=self.config.algorithm.lam,
+                        )
+                    else:
+                        batch = compute_advantage(
+                            batch,
+                            adv_estimator=self.config.algorithm.adv_estimator,
+                            gamma=self.config.algorithm.gamma,
+                            lam=self.config.algorithm.lam,
+                            num_repeat=self.config.actor_rollout_ref.rollout.n,
+                            norm_adv_by_std_in_grpo=self.config.algorithm.get(
+                                "norm_adv_by_std_in_grpo", True
+                            ),
+                            config=self.config.algorithm,
+                        )
+
+                if self.use_critic:
+                    with marked_timer("update_critic", timing_raw, color="pink"):
+                        critic_output = self.critic_wg.update_critic(batch)
+                    critic_metrics = reduce_metrics(critic_output.meta_info["metrics"])
+                    metrics.update(critic_metrics)
+
+                if self.config.trainer.critic_warmup <= self.global_steps:
+                    with marked_timer("update_actor", timing_raw, color="red"):
+                        batch.meta_info["multi_turn"] = self.config.actor_rollout_ref.rollout.multi_turn.enable
+                        actor_output = self.actor_wg.update_actor(batch)
+                    actor_metrics = reduce_metrics(actor_output.meta_info["metrics"])
+                    metrics.update(actor_metrics)
+
+                if (
+                    self.val_reward_fn is not None
+                    and self.config.trainer.val_freq > 0
+                    and self.global_steps % self.config.trainer.val_freq == 0
+                ):
+                    with marked_timer("validation", timing_raw, color="green"):
+                        val_metrics = self._validate()
+                    metrics.update(val_metrics)
+
+                if self.config.trainer.save_freq > 0 and self.global_steps % self.config.trainer.save_freq == 0:
+                    with marked_timer("save_checkpoint", timing_raw, color="green"):
+                        self._save_checkpoint()
+
+            self._prof_step()
+            self._log_step_timing(timing_raw=timing_raw, step=self.global_steps, epoch=fit_dis_epoch)
+            n_gpus = self.resource_pool_manager.get_n_gpus()
+            metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
+            metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
+            metrics.update(compute_throughout_metrics(batch=batch, timing_raw=timing_raw, n_gpus=n_gpus))
+
+            progress_bar.update(1)
+
+        self._prof_stop()
+        progress_bar.close()
+
+        if self.val_reward_fn is not None:
+            if self.config.trainer.val_freq <= 0 or self.global_steps % self.config.trainer.val_freq != 0:
+                val_metrics = self._validate()
+                pprint(f"Final validation metrics: {val_metrics}")
+
+        if self.config.trainer.save_freq <= 0 or self.global_steps % self.config.trainer.save_freq != 0:
+            self._save_checkpoint()
+
+    def _make_batch_data_dis(self, metrics: dict[str, Any]) -> DataProto:
+        batch = None
+        all_metrics = defaultdict(list)
+        num_try_make_batch = 0
+        print("Start generating batch...")
+        while True:
+            num_try_make_batch += 1
+            try:
+                batch_dict = next(self.data_iterator)
+            except StopIteration:
+                self.data_iterator = iter(self.train_dataloader)
+                batch_dict = next(self.data_iterator)
+
+            meta_info = {
+                "min_pixels": OmegaConf.select(self.config, "data.min_pixels"),
+                "max_pixels": OmegaConf.select(self.config, "data.max_pixels"),
+            }
+            new_batch: DataProto = DataProto.from_single_dict(batch_dict, meta_info=meta_info)
+            if self.diffusion:
+                required_keys = ["prompt_embeds", "negative_prompt_embeds"]
+                missing_required = [k for k in required_keys if k not in new_batch.batch.keys()]
+                if missing_required:
+                    raise KeyError(
+                        f"Diffusion batch missing required keys {missing_required}. "
+                        f"available={list(new_batch.batch.keys())}"
+                    )
+
+                batch_keys = list(required_keys)
+                for optional_key in ["pooled_prompt_embeds", "negative_pooled_prompt_embeds"]:
+                    if optional_key in new_batch.batch.keys():
+                        batch_keys.append(optional_key)
+                gen_batch = new_batch.pop(batch_keys=batch_keys)
+            else:
+                gen_batch = new_batch.pop(
+                    batch_keys=["input_ids", "attention_mask", "position_ids"],
+                    non_tensor_batch_keys=["raw_prompt_ids", "multi_modal_data", "ground_truth"],
+                    meta_info_keys=["min_pixels", "max_pixels"],
+                )
+
+            gen_batch_output = self.rollout_ref_wg.generate_sequences(gen_batch)
+
+            if self.config.algorithm.adv_estimator == "remax":
+                gen_baseline_batch = deepcopy(gen_batch)
+                gen_baseline_batch.meta_info["temperature"] = 0
+                gen_baseline_batch.meta_info["n"] = 1
+                gen_baseline_output = self.rollout_ref_wg.generate_sequences(gen_baseline_batch)
+
+                new_batch = new_batch.union(gen_baseline_output)
+                reward_baseline_tensor, _ = compute_reward(new_batch, self.reward_fn)
+                reward_baseline_tensor = reward_baseline_tensor.sum(dim=-1)
+
+                new_batch.pop(batch_keys=list(gen_baseline_output.batch.keys()))
+                new_batch.batch["reward_baselines"] = reward_baseline_tensor
+                del gen_baseline_batch, gen_baseline_output
+
+            new_batch.non_tensor_batch["uid"] = np.array(
+                [str(uuid.uuid4()) for _ in range(len(new_batch.batch))], dtype=object
+            )
+            if not self.diffusion:
+                new_batch = new_batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
+            new_batch = new_batch.union(gen_batch_output)
+
+            if self.config.algorithm.online_filtering:
+                reward_tensor, reward_metrics = compute_reward(new_batch, self.reward_fn)
+                new_batch.batch["token_level_scores"] = reward_tensor
+                for k, v in reward_metrics.items():
+                    all_metrics[k].extend(v)
+
+                filter_scores = reward_metrics[self.config.algorithm.filter_key]
+                uids = new_batch.non_tensor_batch["uid"]
+                uid2scores = defaultdict(list)
+                for uid, score in zip(uids, filter_scores):
+                    uid2scores[uid].append(score)
+
+                uid2mean = {uid: np.mean(scores) for uid, scores in uid2scores.items()}
+                kept_uids = [
+                    uid
+                    for uid, avg_score in uid2mean.items()
+                    if avg_score > self.config.algorithm.filter_low and avg_score < self.config.algorithm.filter_high
+                ]
+                kept_sample_idxs = [idx for idx, uid in enumerate(uids) if uid in kept_uids]
+                if len(kept_sample_idxs) > 0:
+                    new_batch = new_batch[kept_sample_idxs]
+
+            batch = DataProto.concat([batch, new_batch]) if batch is not None else new_batch
+            rollout_repeat = 1 if self.diffusion else self.config.actor_rollout_ref.rollout.n
+            current_batch_size = len(batch) // rollout_repeat
+            rollout_batch_size = self.config.data.train_batch_size
+            if current_batch_size < rollout_batch_size:
+                print(f"{current_batch_size=} < {rollout_batch_size=}")
+                max_try_make_batch = self.config.trainer.max_try_make_batch
+                if max_try_make_batch <= 0 or num_try_make_batch < max_try_make_batch:
+                    print(f"{num_try_make_batch=}. Continue generating...")
+                else:
+                    raise ValueError(
+                        f"{num_try_make_batch=} >= {max_try_make_batch=}. Generated too many. Please check your data."
+                    )
+            else:
+                print(f"{current_batch_size=} >= {rollout_batch_size=}. Finish generating.")
+                if self.config.algorithm.online_filtering:
+                    metrics.update({f"reward/{k}": v for k, v in reduce_metrics(all_metrics).items()})
+
+                return batch[: self.config.data.train_batch_size * rollout_repeat]
+
+    def _need_ref_log_prob(self) -> bool:
+        return bool(self.config.algorithm.use_kl_in_reward or self.config.actor_rollout_ref.actor.use_kl_loss)
+
+    def _sync_diffusion_disaggregate_before_rollout(self) -> None:
+        """Sync actor->rollout_ref diffusion transformer weights via GDR relay.
+
+        IMPORTANT: `sync_transformer_gdr_with_relay` is a global-collective method (Dispatch.ALL_TO_ALL) and must be
+        scheduled on *both* WorkerGroups (actor + rollout_ref) before waiting, otherwise it can deadlock.
+        """
+
+        if not (self.diffusion and self.diffusion_disaggregate):
+            return
+
+        if not hasattr(self, "actor_wg") or not hasattr(self, "rollout_ref_wg"):
+            raise RuntimeError("fit_dis() diffusion sync requires init_workers_dis() to be called first.")
+
+        chunk_mb = int(OmegaConf.select(self.config, "trainer.disaggregate_sync_chunk_mb") or 256)
+        refs: list[ray.ObjectRef] = []
+        refs += self.rollout_ref_wg.execute_all_async("sync_transformer_gdr_with_relay", chunk_mb=chunk_mb)
+        refs += self.actor_wg.execute_all_async("sync_transformer_gdr_with_relay", chunk_mb=chunk_mb)
+        ray.get(refs)
 
     def _validate_config(self):
         config = self.config
@@ -646,7 +1096,7 @@ class RayPPOTrainer:
 
         self.train_dataloader = StatefulDataLoader(
             dataset=self.train_dataset,
-            batch_size=self.config.data.get("gen_batch_size", self.config.data.train_batch_size),
+            batch_size=self.config.data.gen_batch_size,
             num_workers=num_workers,
             drop_last=True,
             collate_fn=collate_fn,
@@ -781,11 +1231,19 @@ class RayPPOTrainer:
             sample_inputs.extend(input_texts)
 
             if self.diffusion:
-                # For diffusion models, pop embedding-related keys
-                test_gen_batch = test_batch.pop(
-                    batch_keys=["prompt_embeds", "pooled_prompt_embeds", "negative_prompt_embeds",
-                               "negative_pooled_prompt_embeds"]
-                )
+                required_keys = ["prompt_embeds", "negative_prompt_embeds"]
+                missing_required = [k for k in required_keys if k not in test_batch.batch.keys()]
+                if missing_required:
+                    raise KeyError(
+                        f"Diffusion val batch missing required keys {missing_required}. "
+                        f"available={list(test_batch.batch.keys())}"
+                    )
+
+                batch_keys = list(required_keys)
+                for optional_key in ["pooled_prompt_embeds", "negative_pooled_prompt_embeds"]:
+                    if optional_key in test_batch.batch.keys():
+                        batch_keys.append(optional_key)
+                test_gen_batch = test_batch.pop(batch_keys=batch_keys)
                 test_gen_batch.meta_info = self.config.actor_rollout_ref.rollout.val_kwargs
             else:
                 batch_keys_to_pop = ["input_ids", "attention_mask", "position_ids"]
@@ -945,11 +1403,26 @@ class RayPPOTrainer:
                 self.data_iterator = iter(self.train_dataloader)
                 batch_dict = next(self.data_iterator)
 
-            meta_info = {"min_pixels": self.config.data.min_pixels, "max_pixels": self.config.data.max_pixels}
+            meta_info = {
+                "min_pixels": OmegaConf.select(self.config, "data.min_pixels"),
+                "max_pixels": OmegaConf.select(self.config, "data.max_pixels"),
+            }
             new_batch: DataProto = DataProto.from_single_dict(batch_dict, meta_info=meta_info)
             
             if self.diffusion:
-                gen_batch = new_batch.pop(batch_keys=["prompt_embeds", "pooled_prompt_embeds", "negative_prompt_embeds", "negative_pooled_prompt_embeds"])
+                required_keys = ["prompt_embeds", "negative_prompt_embeds"]
+                missing_required = [k for k in required_keys if k not in new_batch.batch.keys()]
+                if missing_required:
+                    raise KeyError(
+                        f"Diffusion batch missing required keys {missing_required}. "
+                        f"available={list(new_batch.batch.keys())}"
+                    )
+
+                batch_keys = list(required_keys)
+                for optional_key in ["pooled_prompt_embeds", "negative_pooled_prompt_embeds"]:
+                    if optional_key in new_batch.batch.keys():
+                        batch_keys.append(optional_key)
+                gen_batch = new_batch.pop(batch_keys=batch_keys)
             else:
                 # pop those keys for generation
                 gen_batch = new_batch.pop(
@@ -1007,8 +1480,9 @@ class RayPPOTrainer:
                     new_batch = new_batch[kept_sample_idxs]
 
             batch = DataProto.concat([batch, new_batch]) if batch is not None else new_batch
-            current_batch_size = len(batch) // self.config.worker.rollout.n
-            rollout_batch_size = self.config.data.rollout_batch_size
+            rollout_repeat = 1 if self.diffusion else self.config.worker.rollout.n
+            current_batch_size = len(batch) // rollout_repeat
+            rollout_batch_size = self.config.data.train_batch_size
             if current_batch_size < rollout_batch_size:
                 print(f"{current_batch_size=} < {rollout_batch_size=}")
                 max_try_make_batch = self.config.trainer.max_try_make_batch
@@ -1023,7 +1497,7 @@ class RayPPOTrainer:
                 if self.config.algorithm.online_filtering:
                     metrics.update({f"reward/{k}": v for k, v in reduce_metrics(all_metrics).items()})
 
-                return batch[: self.config.data.rollout_batch_size * self.config.worker.rollout.n]
+                return batch[: self.config.data.train_batch_size * rollout_repeat]
 
     def init_workers(self):
         """Initialize distributed training workers using Ray backend.
@@ -1062,6 +1536,7 @@ class RayPPOTrainer:
                     cls=self.role_worker_mapping[Role.ActorRollout],
                     config=self.config.actor_rollout_ref,
                     role="actor_rollout",
+                    disaggregate=getattr(self, "diffusion_disaggregate", False),
                     profile_option=self.config.trainer.npu_profile.options,
                 )
                 self.resource_pool_to_cls[resource_pool]["actor_rollout"] = actor_rollout_cls
@@ -1091,6 +1566,7 @@ class RayPPOTrainer:
                     self.role_worker_mapping[Role.RefPolicy],
                     config=self.config.actor_rollout_ref,
                     role="ref",
+                    disaggregate=getattr(self, "diffusion_disaggregate", False),
                     profile_option=self.config.trainer.npu_profile.options,
                 )
                 self.resource_pool_to_cls[resource_pool]["ref"] = ref_policy_cls
@@ -1200,7 +1676,8 @@ class RayPPOTrainer:
             self.config.trainer.get("max_critic_ckpt_to_keep", None) if not remove_previous_ckpt_in_save else 1
         )
 
-        self.actor_rollout_wg.save_checkpoint(
+        actor_ckpt_wg = self.actor_wg if getattr(self, "diffusion_disaggregate", False) else self.actor_rollout_wg
+        actor_ckpt_wg.save_checkpoint(
             actor_local_path, actor_remote_path, self.global_steps, max_ckpt_to_keep=max_actor_ckpt_to_keep
         )
 
@@ -1267,7 +1744,8 @@ class RayPPOTrainer:
         actor_path = os.path.join(global_step_folder, "actor")
         critic_path = os.path.join(global_step_folder, "critic")
         # load actor
-        self.actor_rollout_wg.load_checkpoint(
+        actor_ckpt_wg = self.actor_wg if getattr(self, "diffusion_disaggregate", False) else self.actor_rollout_wg
+        actor_ckpt_wg.load_checkpoint(
             actor_path, del_local_after_load=self.config.trainer.del_local_ckpt_after_load
         )
         # load critic
@@ -1288,7 +1766,13 @@ class RayPPOTrainer:
     def _start_profiling(self, do_profile: bool) -> None:
         """Start profiling for all worker groups if profiling is enabled."""
         if do_profile:
-            if self.disaggregate_actor_rollout:
+            if getattr(self, "diffusion_disaggregate", False):
+                if self.rollout_ref_wg is self.actor_wg:
+                    self.rollout_ref_wg.prof_start()
+                else:
+                    self.rollout_ref_wg.prof_start()
+                    self.actor_wg.prof_start()
+            elif self.disaggregate_actor_rollout:
                 self.actor_rollout_encoder_wg.start_profile()
                 self.actor_rollout_llm_wg.start_profile()
             else:
@@ -1309,7 +1793,13 @@ class RayPPOTrainer:
     def _stop_profiling(self, do_profile: bool) -> None:
         """Stop profiling for all worker groups if profiling is enabled."""
         if do_profile:
-            if self.disaggregate_actor_rollout:
+            if getattr(self, "diffusion_disaggregate", False):
+                if self.rollout_ref_wg is self.actor_wg:
+                    self.rollout_ref_wg.prof_stop()
+                else:
+                    self.rollout_ref_wg.prof_stop()
+                    self.actor_wg.prof_stop()
+            elif self.disaggregate_actor_rollout:
                 self.actor_rollout_encoder_wg.stop_profile()
                 self.actor_rollout_llm_wg.stop_profile()
             else:
@@ -1328,7 +1818,13 @@ class RayPPOTrainer:
 
     def _step_profiling(self, do_profile: bool) -> None:
         if do_profile:
-            if self.disaggregate_actor_rollout:
+            if getattr(self, "diffusion_disaggregate", False):
+                if self.rollout_ref_wg is self.actor_wg:
+                    self.rollout_ref_wg.prof_step()
+                else:
+                    self.rollout_ref_wg.prof_step()
+                    self.actor_wg.prof_step()
+            elif self.disaggregate_actor_rollout:
                 self.actor_rollout_encoder_wg.step_profile()
                 self.actor_rollout_llm_wg.step_profile()
             else:
@@ -1464,14 +1960,14 @@ class RayPPOTrainer:
         """
         from omegaconf import OmegaConf
 
-        from verl.utils.tracking import Tracking
+        # from verl.utils.tracking import Tracking
 
-        logger = Tracking(
-            project_name=self.config.trainer.project_name,
-            experiment_name=self.config.trainer.experiment_name,
-            default_backend=self.config.trainer.logger,
-            config=OmegaConf.to_container(self.config, resolve=True),
-        )
+        # logger = Tracking(
+        #     project_name=self.config.trainer.project_name,
+        #     experiment_name=self.config.trainer.experiment_name,
+        #     default_backend=self.config.trainer.logger,
+        #     config=OmegaConf.to_container(self.config, resolve=True),
+        # )
 
         self.global_steps = 0
 
@@ -1694,7 +2190,7 @@ class RayPPOTrainer:
                                     }
                                 )
 
-                    if self.use_reference_policy:
+                    if self._need_ref_log_prob():
                         # compute reference log_prob
                         with marked_timer("ref", timing_raw, color="olive"):
                             if not self.ref_in_actor:
@@ -1897,7 +2393,7 @@ class RayPPOTrainer:
                     self.train_dataloader.sampler.update(batch=batch)
 
                 # TODO: make a canonical logger that supports various backend
-                logger.log(data=metrics, step=self.global_steps)
+                # logger.log(data=metrics, step=self.global_steps)
 
                 progress_bar.update(1)
                 self.global_steps += 1
