@@ -15,24 +15,78 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import os
-from contextlib import contextmanager
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, Optional, Union
 
-import numpy as np
 import torch
 import torch.distributed
 from tensordict import TensorDict
-from transformers import PreTrainedTokenizer, ProcessorMixin
 
 from ...protocol import DataProto
-from ...utils import torch_functional as VF
-from ...utils.dataset import process_image
-from ...utils.torch_dtypes import PrecisionType
 from .base import BaseRollout
 from .config import RolloutConfig
-import torch.nn.functional as F
-from diffusers import StableDiffusion3Pipeline, FlowMatchEulerDiscreteScheduler, WanPipeline
+from diffusers import StableDiffusion3Pipeline, WanPipeline
 from ..diffusion_helper import sd3_pipeline_with_logprob, wan_pipeline_with_logprob
+
+
+def _repeat_if_group(tensor: torch.Tensor, repeat_times: int, enabled: bool) -> torch.Tensor:
+    if not enabled:
+        return tensor
+    return torch.repeat_interleave(tensor, repeat_times, dim=0)
+
+
+def _is_dance_mode(prompts: DataProto) -> bool:
+    return prompts.meta_info.get("diffusion_algo") == "dancegrpo"
+
+
+def _should_repeat_for_group(config: RolloutConfig, prompts: DataProto) -> bool:
+    if not _is_dance_mode(prompts):
+        return False
+    if not config.use_group:
+        return False
+
+    # Keep disco_rl parity:
+    # - sync: repeat when use_group is enabled
+    # - async: repeat only when use_group and gen_seed=True
+    rollout_mode = str(getattr(config, "mode", "sync")).lower()
+    use_seed = bool(prompts.meta_info.get("use_seed", False))
+    gen_seed = not use_seed
+    if rollout_mode == "sync":
+        return True
+    return gen_seed
+
+
+def _build_seed_generators(device: torch.device, seeds: torch.Tensor) -> list[torch.Generator]:
+    generators: list[torch.Generator] = []
+    for seed in seeds.detach().to(torch.long).reshape(-1):
+        gen = torch.Generator(device=device)
+        gen.manual_seed(int(seed.item()))
+        generators.append(gen)
+    return generators
+
+
+def _make_placeholder_rewards(batch_size: int, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
+    vq_rewards = torch.full((batch_size,), -1.0, dtype=torch.float32, device=device)
+    mq_rewards = torch.full((batch_size,), -1.0, dtype=torch.float32, device=device)
+    return vq_rewards, mq_rewards
+
+
+def _align_trajectory_tensors(
+    latents: torch.Tensor,
+    log_probs: torch.Tensor,
+    kls: torch.Tensor,
+    timesteps: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int]:
+    train_steps = min(timesteps.size(1), max(latents.size(1) - 1, 0), log_probs.size(1), kls.size(1))
+    if train_steps <= 0:
+        raise ValueError(
+            "Invalid rollout trajectory with non-positive train steps: "
+            f"timesteps={timesteps.size(1)}, latents={latents.size(1)}, log_probs={log_probs.size(1)}, kls={kls.size(1)}"
+        )
+    timesteps = timesteps[:, :train_steps]
+    latents = latents[:, : train_steps + 1]
+    log_probs = log_probs[:, :train_steps]
+    kls = kls[:, :train_steps]
+    return latents, log_probs, kls, timesteps, train_steps
 
 
 class StableDiffusionRollout(BaseRollout):
@@ -81,14 +135,51 @@ class StableDiffusionRollout(BaseRollout):
 
     @torch.no_grad()
     def generate_sequences(self, prompts: DataProto) -> DataProto:
-        prompt_embeds = prompts.batch["prompt_embeds"].squeeze(1)
-        pooled_prompt_embeds = prompts.batch["pooled_prompt_embeds"].squeeze(1)
-        negative_prompt_embeds = prompts.batch["negative_prompt_embeds"].squeeze(1)
-        negative_pooled_prompt_embeds = prompts.batch["negative_pooled_prompt_embeds"].squeeze(1)
+        should_repeat = _should_repeat_for_group(self.config, prompts)
+        prompt_embeds = _repeat_if_group(prompts.batch["prompt_embeds"], self.config.num_generations, should_repeat).squeeze(1)
+        pooled_prompt_embeds = _repeat_if_group(
+            prompts.batch["pooled_prompt_embeds"], self.config.num_generations, should_repeat
+        ).squeeze(1)
+        negative_prompt_embeds = _repeat_if_group(
+            prompts.batch["negative_prompt_embeds"], self.config.num_generations, should_repeat
+        ).squeeze(1)
+        negative_pooled_prompt_embeds = _repeat_if_group(
+            prompts.batch["negative_pooled_prompt_embeds"], self.config.num_generations, should_repeat
+        ).squeeze(1)
         batch_size = prompt_embeds.size(0)
-        # print("*** rollout prompt_embeds ***", prompt_embeds.shape)
-        # sample
-        # with autocast():
+
+        use_seed = bool(prompts.meta_info.get("use_seed", False))
+        seed_tensor = prompts.batch["seed"] if "seed" in prompts.batch.keys() else None
+        if should_repeat and use_seed and seed_tensor is not None:
+            seed_tensor = _repeat_if_group(seed_tensor, self.config.num_generations, True)
+
+        sampling_kwargs: dict[str, Any] = {}
+        if _is_dance_mode(prompts):
+            if self.config.use_same_noise:
+                base_seed = int(seed_tensor.reshape(-1)[0].item()) if (use_seed and seed_tensor is not None) else 42
+                generator = torch.Generator(device=prompt_embeds.device)
+                generator.manual_seed(base_seed)
+                num_channels_latents = self.pipeline.transformer.config.in_channels
+                base_latents = self.pipeline.prepare_latents(
+                    1,
+                    num_channels_latents,
+                    self.config.resolution,
+                    self.config.resolution,
+                    prompt_embeds.dtype,
+                    prompt_embeds.device,
+                    generator,
+                    None,
+                )
+                repeat_shape = (batch_size,) + (1,) * (base_latents.ndim - 1)
+                sampling_kwargs["latents"] = base_latents.repeat(*repeat_shape)
+            elif use_seed and seed_tensor is not None:
+                if seed_tensor.numel() != batch_size:
+                    raise ValueError(f"seed size {seed_tensor.numel()} does not match batch size {batch_size}")
+                sampling_kwargs["generator"] = _build_seed_generators(prompt_embeds.device, seed_tensor)
+            else:
+                auto_seeds = torch.arange(42, 42 + batch_size, dtype=torch.long, device=prompt_embeds.device)
+                sampling_kwargs["generator"] = _build_seed_generators(prompt_embeds.device, auto_seeds)
+
         with torch.no_grad():
             images, latents, log_probs, kls, timesteps = sd3_pipeline_with_logprob(
                 self.pipeline,
@@ -101,41 +192,34 @@ class StableDiffusionRollout(BaseRollout):
                 output_type="pt",
                 return_dict=False,
                 height=self.config.resolution,
-                width=self.config.resolution, 
-        )
-            
-        latents = torch.stack(
-            latents, dim=1
-        )  # (batch_size, num_steps + 1, 16, 96, 96)
-        log_probs = torch.stack(log_probs, dim=1)  # shape after stack (batch_size, num_steps)
-        kls = torch.stack(kls, dim=1) 
+                width=self.config.resolution,
+                **sampling_kwargs,
+            )
+
+        latents = torch.stack(latents, dim=1)  # (batch_size, num_steps + 1, ...)
+        log_probs = torch.stack(log_probs, dim=1)  # (batch_size, num_steps)
+        kls = torch.stack(kls, dim=1)
         kl = kls.detach()
 
         timesteps = timesteps.to(prompt_embeds.device).repeat(batch_size, 1)  # (batch_size, num_steps)
-        # print("*** prompt_embeds ***", prompt_embeds.shape)
-        # print("*** pooled_prompt_embeds ***", pooled_prompt_embeds.shape)
-        # print("*** timesteps ***", timesteps.shape)
-        # print("*** images ***", images.shape)
-        # print("*** latents ***", latents.shape)
-        # print("*** log_probs ***", log_probs.shape)
-        # print("*** kl ***", kl.shape)
+        latents, log_probs, kl, timesteps, train_steps = _align_trajectory_tensors(latents, log_probs, kl, timesteps)
+        vq_rewards, mq_rewards = _make_placeholder_rewards(batch_size=batch_size, device=prompt_embeds.device)
+
         batch = TensorDict(
             {
                 "prompt_embeds": prompt_embeds,
                 "pooled_prompt_embeds": pooled_prompt_embeds,
                 "negative_prompt_embeds": negative_prompt_embeds,
                 "negative_pooled_prompt_embeds": negative_pooled_prompt_embeds,
-                "timesteps": timesteps.to(prompt_embeds.device),
+                "timesteps": timesteps,
                 "images": images,
-                "latents": latents[
-                    :, :-1
-                ],  # each entry is the latent before timestep t
-                "next_latents": latents[
-                    :, 1:
-                ],  # each entry is the latent after timestep t
+                "latents": latents[:, :train_steps],  # latent before timestep t
+                "next_latents": latents[:, 1 : train_steps + 1],  # latent after timestep t
+                "log_probs": log_probs,
                 "old_log_probs": log_probs,
                 "kl": kl,
-                # "rewards": rewards,
+                "vq_rewards": vq_rewards,
+                "mq_rewards": mq_rewards,
             },
             batch_size=batch_size,
         )
@@ -186,12 +270,46 @@ class WanRollout(BaseRollout):
 
     @torch.no_grad()
     def generate_sequences(self, prompts: DataProto) -> DataProto:
-        prompt_embeds = prompts.batch["prompt_embeds"].squeeze(1)
-        negative_prompt_embeds = prompts.batch["negative_prompt_embeds"].squeeze(1)
+        should_repeat = _should_repeat_for_group(self.config, prompts)
+        prompt_embeds = _repeat_if_group(prompts.batch["prompt_embeds"], self.config.num_generations, should_repeat).squeeze(1)
+        negative_prompt_embeds = _repeat_if_group(
+            prompts.batch["negative_prompt_embeds"], self.config.num_generations, should_repeat
+        ).squeeze(1)
         batch_size = prompt_embeds.size(0)
-        # print("*** rollout prompt_embeds ***", prompt_embeds.shape)
-        # sample
-        # with autocast():
+
+        use_seed = bool(prompts.meta_info.get("use_seed", False))
+        seed_tensor = prompts.batch["seed"] if "seed" in prompts.batch.keys() else None
+        if should_repeat and use_seed and seed_tensor is not None:
+            seed_tensor = _repeat_if_group(seed_tensor, self.config.num_generations, True)
+
+        sampling_kwargs: dict[str, Any] = {}
+        if _is_dance_mode(prompts):
+            if self.config.use_same_noise:
+                base_seed = int(seed_tensor.reshape(-1)[0].item()) if (use_seed and seed_tensor is not None) else 42
+                generator = torch.Generator(device=prompt_embeds.device)
+                generator.manual_seed(base_seed)
+                num_channels_latents = self.pipeline.transformer.config.in_channels
+                base_latents = self.pipeline.prepare_latents(
+                    1,
+                    num_channels_latents,
+                    self.config.height,
+                    self.config.width,
+                    self.config.num_frames,
+                    torch.float32,
+                    prompt_embeds.device,
+                    generator,
+                    None,
+                )
+                repeat_shape = (batch_size,) + (1,) * (base_latents.ndim - 1)
+                sampling_kwargs["latents"] = base_latents.repeat(*repeat_shape)
+            elif use_seed and seed_tensor is not None:
+                if seed_tensor.numel() != batch_size:
+                    raise ValueError(f"seed size {seed_tensor.numel()} does not match batch size {batch_size}")
+                sampling_kwargs["generator"] = _build_seed_generators(prompt_embeds.device, seed_tensor)
+            else:
+                auto_seeds = torch.arange(42, 42 + batch_size, dtype=torch.long, device=prompt_embeds.device)
+                sampling_kwargs["generator"] = _build_seed_generators(prompt_embeds.device, auto_seeds)
+
         with torch.no_grad():
             videos, latents, log_probs, kls, timesteps = wan_pipeline_with_logprob(
                 self.pipeline,
@@ -202,40 +320,33 @@ class WanRollout(BaseRollout):
                 output_type="pt",
                 return_dict=False,
                 height=self.config.height,
-                width=self.config.width, 
+                width=self.config.width,
                 num_frames=self.config.num_frames,
-        )
-            
-        latents = torch.stack(
-            latents, dim=1
-        )  # (batch_size, num_steps + 1, 16, 96, 96)
-        log_probs = torch.stack(log_probs, dim=1)  # shape after stack (batch_size, num_steps)
-        kls = torch.stack(kls, dim=1) 
+                **sampling_kwargs,
+            )
+
+        latents = torch.stack(latents, dim=1)  # (batch_size, num_steps + 1, ...)
+        log_probs = torch.stack(log_probs, dim=1)  # (batch_size, num_steps)
+        kls = torch.stack(kls, dim=1)
         kl = kls.detach()
 
         timesteps = timesteps.to(prompt_embeds.device).repeat(batch_size, 1)  # (batch_size, num_steps)
-        # print("*** prompt_embeds ***", prompt_embeds.shape)
-        # print("*** pooled_prompt_embeds ***", pooled_prompt_embeds.shape)
-        # print("*** timesteps ***", timesteps.shape)
-        # print("*** images ***", images.shape)
-        # print("*** latents ***", latents.shape)
-        # print("*** log_probs ***", log_probs.shape)
-        # print("*** kl ***", kl.shape)
+        latents, log_probs, kl, timesteps, train_steps = _align_trajectory_tensors(latents, log_probs, kl, timesteps)
+        vq_rewards, mq_rewards = _make_placeholder_rewards(batch_size=batch_size, device=prompt_embeds.device)
+
         batch = TensorDict(
             {
                 "prompt_embeds": prompt_embeds,
                 "negative_prompt_embeds": negative_prompt_embeds,
-                "timesteps": timesteps.to(prompt_embeds.device),
+                "timesteps": timesteps,
                 "videos": videos,
-                "latents": latents[
-                    :, :-1
-                ],  # each entry is the latent before timestep t
-                "next_latents": latents[
-                    :, 1:
-                ],  # each entry is the latent after timestep t
+                "latents": latents[:, :train_steps],  # latent before timestep t
+                "next_latents": latents[:, 1 : train_steps + 1],  # latent after timestep t
+                "log_probs": log_probs,
                 "old_log_probs": log_probs,
                 "kl": kl,
-                # "rewards": rewards,
+                "vq_rewards": vq_rewards,
+                "mq_rewards": mq_rewards,
             },
             batch_size=batch_size,
         )

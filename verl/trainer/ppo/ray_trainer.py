@@ -854,7 +854,12 @@ class RayPPOTrainer:
                 for optional_key in ["pooled_prompt_embeds", "negative_pooled_prompt_embeds"]:
                     if optional_key in new_batch.batch.keys():
                         batch_keys.append(optional_key)
+                if self.diffusion_algo == "dancegrpo" and "seed" in new_batch.batch.keys():
+                    batch_keys.append("seed")
                 gen_batch = new_batch.pop(batch_keys=batch_keys)
+                if self.diffusion_algo == "dancegrpo":
+                    gen_batch.meta_info["use_seed"] = "seed" in gen_batch.batch.keys()
+                gen_batch.meta_info["diffusion_algo"] = self.diffusion_algo
             else:
                 gen_batch = new_batch.pop(
                     batch_keys=["input_ids", "attention_mask", "position_ids"],
@@ -1495,7 +1500,12 @@ class RayPPOTrainer:
                 for optional_key in ["pooled_prompt_embeds", "negative_pooled_prompt_embeds"]:
                     if optional_key in new_batch.batch.keys():
                         batch_keys.append(optional_key)
+                if self.diffusion_algo == "dancegrpo" and "seed" in new_batch.batch.keys():
+                    batch_keys.append("seed")
                 gen_batch = new_batch.pop(batch_keys=batch_keys)
+                if self.diffusion_algo == "dancegrpo":
+                    gen_batch.meta_info["use_seed"] = "seed" in gen_batch.batch.keys()
+                gen_batch.meta_info["diffusion_algo"] = self.diffusion_algo
             else:
                 # pop those keys for generation
                 gen_batch = new_batch.pop(
