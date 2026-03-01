@@ -151,6 +151,8 @@ def compute_reward(data: DataProto, reward_fn):
         reward_result = reward_fn(data, return_dict=True)
         reward_tensor = reward_result["reward_tensor"]
         reward_extra_infos_dict = reward_result.get("reward_extra_info", {})
+        if reward_extra_infos_dict is None:
+            reward_extra_infos_dict = {}
     except Exception as e:
         print(f"Error in reward_fn: {e}")
         reward_tensor = reward_fn(data)

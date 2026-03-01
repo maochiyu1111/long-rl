@@ -102,14 +102,16 @@ class BatchRewardManager:
             rewards = []
             for i, score in enumerate(scores):
                 if isinstance(score, dict):
-                    reward = score.get("overall", score.get("score", None))
+                    reward = score.get("overall", score.get("score", score.get("overall_reward", None)))
                     for key, value in score.items():
                         reward_extra_info[key].append(value)
                 else:
                     reward = score
 
                 if reward is None:
-                    raise ValueError("Reward function must return a scalar value under 'overall' or 'score'.")
+                    raise ValueError(
+                        "Reward function must return a scalar value under 'overall', 'score', or 'overall_reward'."
+                    )
 
                 reward = float(reward)
                 reward_tensor[i, 0] = reward
@@ -139,11 +141,14 @@ class BatchRewardManager:
             score = scores[i]
 
             if isinstance(score, dict):
-                reward = score["score"]
+                reward = score.get("score", score.get("overall", score.get("overall_reward", None)))
                 for key, value in score.items():
                     reward_extra_info[key].append(value)
             else:
                 reward = score
+
+            if reward is None:
+                raise ValueError("Reward function must return a scalar value under 'score', 'overall', or 'overall_reward'.")
 
             rewards.append(reward)
             reward_tensor[i, length - 1] = reward

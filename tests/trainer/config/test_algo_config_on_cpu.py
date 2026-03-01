@@ -52,6 +52,9 @@ class TestAlgoConfig(unittest.TestCase):
             },
             "use_pf_ppo": True,
             "pf_ppo": {"reweight_method": "max_min", "weight_pow": 3.0},
+            "dual_reward_missing_strategy": "fill",
+            "dual_reward_fill_value": -1.0,
+            "dual_adv_mode_default": "group",
         }
         self.omega_config = OmegaConf.create(self.config_dict)
 
@@ -67,6 +70,9 @@ class TestAlgoConfig(unittest.TestCase):
         self.assertTrue(config.use_kl_in_reward)
         self.assertEqual(config.kl_penalty, "kl")
         self.assertTrue(config.use_pf_ppo)
+        self.assertEqual(config.dual_reward_missing_strategy, "fill")
+        self.assertEqual(config.dual_reward_fill_value, -1.0)
+        self.assertEqual(config.dual_adv_mode_default, "group")
 
     def test_dataclass_creation_from_omega_config(self):
         """Test creating AlgoConfig from OmegaConf DictConfig."""
@@ -103,6 +109,9 @@ class TestAlgoConfig(unittest.TestCase):
         self.assertFalse(config.use_kl_in_reward)  # default value
         self.assertEqual(config.kl_penalty, "kl")  # default value
         self.assertFalse(config.use_pf_ppo)  # default value
+        self.assertEqual(config.dual_reward_missing_strategy, "error")
+        self.assertEqual(config.dual_reward_fill_value, 0.0)
+        self.assertEqual(config.dual_adv_mode_default, "group")
 
     def test_get_method_backward_compatibility(self):
         """Test the get method for backward compatibility."""
@@ -137,6 +146,9 @@ class TestAlgoConfig(unittest.TestCase):
         from verl.trainer.config import AlgoConfig
 
         assert isinstance(algo_config, AlgoConfig)
+        assert algo_config.dual_reward_missing_strategy == "error"
+        assert algo_config.dual_reward_fill_value == 0.0
+        assert algo_config.dual_adv_mode_default == "group"
 
 
 class TestDanceGRPOConfigValidation(unittest.TestCase):
@@ -198,6 +210,21 @@ class TestDanceGRPOConfigValidation(unittest.TestCase):
         cfg = self._compose_cfg("dancegrpo", ["actor_rollout_ref.rollout.mq_coef=-0.2"])
         with self.assertRaisesRegex(ValueError, "mq_coef"):
             self._run_validate(cfg)
+
+    def test_dual_reward_config_values_are_validated(self):
+        cfg = self._compose_cfg("dancegrpo", ["algorithm.dual_reward_missing_strategy=unknown"])
+        with self.assertRaisesRegex(ValueError, "dual_reward_missing_strategy"):
+            self._run_validate(cfg)
+
+        cfg = self._compose_cfg("dancegrpo", ["algorithm.dual_adv_mode_default=unknown"])
+        with self.assertRaisesRegex(ValueError, "dual_adv_mode_default"):
+            self._run_validate(cfg)
+
+        cfg = self._compose_cfg(
+            "dancegrpo",
+            ["algorithm.dual_reward_missing_strategy=fill", "algorithm.dual_adv_mode_default=batch"],
+        )
+        self._run_validate(cfg)
 
     def test_flow_grpo_default_path_ignores_dance_constraints(self):
         cfg = self._compose_cfg(

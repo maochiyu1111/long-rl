@@ -200,6 +200,15 @@ algorithm:
   # Upper filtering threshold (exclusive)
   filter_high: 0.99
 
+  # Missing dual-reward handling strategy: "error", "skip", or "fill"
+  dual_reward_missing_strategy: error
+
+  # Fill value used when dual_reward_missing_strategy is "fill"
+  dual_reward_fill_value: 0.0
+
+  # Default dual-advantage normalization mode: "group" or "batch"
+  dual_adv_mode_default: group
+
 # config for the trainer
 trainer:
 

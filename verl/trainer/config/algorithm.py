@@ -93,3 +93,6 @@ class AlgoConfig(BaseConfig):
     filter_low: float = 0.01
     filter_high: float = 0.99
     filter_groups: Optional[FilterGroupsConfig] = None
+    dual_reward_missing_strategy: str = "error"
+    dual_reward_fill_value: float = 0.0
+    dual_adv_mode_default: str = "group"

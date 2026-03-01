@@ -324,7 +324,15 @@ def compute_advantage(
     return data
 
 
-def compute_advantage_diffusion(data: DataProto, adv_estimator: AdvantageEstimator, gamma: float = 1.0, lam: float = 1.0) -> DataProto:
+def compute_advantage_diffusion(
+    data: DataProto,
+    adv_estimator: AdvantageEstimator,
+    gamma: float = 1.0,
+    lam: float = 1.0,
+    config: Optional[AlgoConfig] = None,
+    diffusion_algo: str = "flow_grpo",
+    num_generations: int = 1,
+) -> DataProto:
     """Compute advantage estimates for diffusion models using GRPO estimator.
     
     This function is specifically designed for diffusion models and uses the GRPO (Group Relative Policy Optimization)
@@ -339,17 +347,105 @@ def compute_advantage_diffusion(data: DataProto, adv_estimator: AdvantageEstimat
     Returns:
         DataProto: The updated data with computed advantages and returns.
     """
+    _ = gamma, lam
     token_level_rewards = data.batch["token_level_rewards"]  # (batch_size, 1)
     if adv_estimator == AdvantageEstimator.GRPO:
         batch_size = token_level_rewards.shape[0]
-        response_mask = torch.ones((batch_size, 1), dtype=torch.bool)
-        index = torch.zeros((batch_size), dtype=torch.long)
+        response_mask = torch.ones((batch_size, 1), dtype=torch.bool, device=token_level_rewards.device)
+        index = torch.zeros((batch_size), dtype=torch.long, device=token_level_rewards.device)
         advantages, returns = core_algos.compute_grpo_outcome_advantage(token_level_rewards, response_mask, index)
     else:
         raise NotImplementedError
 
     data.batch["advantages"] = advantages
     data.batch["returns"] = returns
+
+    if diffusion_algo != "dancegrpo":
+        return data
+
+    missing_strategy = str((config.get("dual_reward_missing_strategy", "error") if config else "error")).lower()
+    if missing_strategy not in {"error", "skip", "fill"}:
+        raise ValueError(f"algorithm.dual_reward_missing_strategy must be one of ['error', 'fill', 'skip'], got {missing_strategy}")
+    fill_value = float(config.get("dual_reward_fill_value", 0.0) if config else 0.0)
+
+    def _as_reward_vector(name: str) -> Optional[torch.Tensor]:
+        if name not in data.batch.keys():
+            if missing_strategy == "skip":
+                return None
+            if missing_strategy == "fill":
+                return torch.full((batch_size,), fill_value, dtype=torch.float32, device=token_level_rewards.device)
+            raise ValueError(
+                f"{name} is required for dancegrpo dual advantage. "
+                "Configure algorithm.dual_reward_missing_strategy to 'skip' or 'fill' to override."
+            )
+        tensor = data.batch[name].to(dtype=torch.float32, device=token_level_rewards.device)
+        if tensor.ndim == 2 and tensor.shape[1] == 1:
+            tensor = tensor[:, 0]
+        elif tensor.ndim != 1:
+            raise ValueError(f"{name} must be shape (batch,) or (batch, 1), got {tuple(tensor.shape)}")
+        if tensor.shape[0] != batch_size:
+            raise ValueError(f"{name} length mismatch: expected {batch_size}, got {tensor.shape[0]}")
+
+        invalid = ~torch.isfinite(tensor)
+        if torch.any(invalid):
+            if missing_strategy == "error":
+                invalid_count = int(invalid.sum().item())
+                raise ValueError(f"{name} has {invalid_count} invalid values; configure missing strategy to 'skip' or 'fill'.")
+            if missing_strategy == "skip":
+                return None
+            tensor = tensor.clone()
+            tensor[invalid] = fill_value
+        return tensor
+
+    vq_rewards = _as_reward_vector("vq_rewards")
+    mq_rewards = _as_reward_vector("mq_rewards")
+    if vq_rewards is None or mq_rewards is None:
+        return data
+
+    raw_mode = config.get("dual_adv_mode_default", "group") if config else "group"
+    if "dual_adv_mode" in data.meta_info:
+        raw_mode = data.meta_info["dual_adv_mode"]
+    mode = str(raw_mode).lower()
+    if mode not in {"group", "batch"}:
+        raise ValueError(f"dual advantage mode must be one of ['group', 'batch'], got {mode}")
+
+    if mode == "group":
+        if num_generations <= 0:
+            raise ValueError(f"num_generations must be > 0 in group mode, got {num_generations}")
+        if batch_size % num_generations != 0:
+            raise ValueError(
+                f"group mode requires batch size divisible by num_generations, got batch_size={batch_size}, "
+                f"num_generations={num_generations}"
+            )
+        dual_index = torch.arange(batch_size, device=token_level_rewards.device, dtype=torch.long) // num_generations
+    else:
+        single_group_marker = data.meta_info.get("dual_adv_single_group", None)
+        if single_group_marker is None:
+            single_group_marker = data.meta_info.get("single_prompt_group", None)
+        if single_group_marker is None:
+            raise ValueError(
+                "batch mode requires explicit single-group marker in meta_info: "
+                "set dual_adv_single_group=true (or single_prompt_group=true)."
+            )
+        if isinstance(single_group_marker, np.ndarray):
+            if single_group_marker.size != 1:
+                raise ValueError("batch mode single-group marker must be a scalar value.")
+            single_group_marker = single_group_marker.reshape(-1)[0]
+        if isinstance(single_group_marker, (np.generic,)):
+            single_group_marker = single_group_marker.item()
+        if isinstance(single_group_marker, str):
+            single_group_marker = single_group_marker.lower() in {"1", "true", "yes"}
+        if not isinstance(single_group_marker, bool):
+            raise ValueError("batch mode single-group marker must be a boolean value.")
+        if not single_group_marker:
+            raise ValueError("batch mode requires dual_adv_single_group=true (or single_prompt_group=true).")
+        dual_index = torch.zeros((batch_size,), dtype=torch.long, device=token_level_rewards.device)
+
+    vq_advantages, _ = core_algos.compute_grpo_outcome_advantage(vq_rewards.unsqueeze(-1), response_mask, dual_index)
+    mq_advantages, _ = core_algos.compute_grpo_outcome_advantage(mq_rewards.unsqueeze(-1), response_mask, dual_index)
+    data.batch["vq_advantages"] = vq_advantages
+    data.batch["mq_advantages"] = mq_advantages
+
     return data
 
 
@@ -501,6 +597,132 @@ class RayPPOTrainer:
             f"shift={getattr(rollout_config, 'shift', None)}, "
             f"eta={getattr(rollout_config, 'eta', None)}"
         )
+
+    @staticmethod
+    def _infer_batch_device(batch: DataProto) -> torch.device:
+        for value in batch.batch.values():
+            if torch.is_tensor(value):
+                return value.device
+        return torch.device("cpu")
+
+    @staticmethod
+    def _coerce_reward_vector(raw_value: Any, key_name: str, batch_size: int, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
+        if torch.is_tensor(raw_value):
+            tensor = raw_value.to(dtype=torch.float32, device=device)
+            if tensor.ndim == 2 and tensor.shape[1] == 1:
+                tensor = tensor[:, 0]
+            elif tensor.ndim != 1:
+                raise ValueError(f"{key_name} must be shape (batch,) or (batch, 1), got {tuple(tensor.shape)}")
+            if tensor.shape[0] != batch_size:
+                raise ValueError(f"{key_name} length mismatch: expected {batch_size}, got {tensor.shape[0]}")
+            invalid_mask = ~torch.isfinite(tensor)
+            return tensor, invalid_mask
+
+        arr = np.asarray(raw_value, dtype=object).reshape(-1)
+        if arr.shape[0] != batch_size:
+            raise ValueError(f"{key_name} length mismatch: expected {batch_size}, got {arr.shape[0]}")
+
+        values = torch.empty((batch_size,), dtype=torch.float32, device=device)
+        invalid_mask = torch.zeros((batch_size,), dtype=torch.bool, device=device)
+        for idx, item in enumerate(arr):
+            try:
+                value = float(item)
+            except (TypeError, ValueError):
+                invalid_mask[idx] = True
+                values[idx] = 0.0
+                continue
+            if not np.isfinite(value):
+                invalid_mask[idx] = True
+                values[idx] = 0.0
+                continue
+            values[idx] = value
+        return values, invalid_mask
+
+    def _resolve_dual_reward_tensor(
+        self,
+        batch: DataProto,
+        reward_extra_infos_dict: Optional[dict[str, list]],
+        target_key: str,
+        aliases: tuple[str, ...],
+    ) -> Optional[torch.Tensor]:
+        strategy = str(self.config.algorithm.get("dual_reward_missing_strategy", "error")).lower()
+        fill_value = float(self.config.algorithm.get("dual_reward_fill_value", 0.0))
+        batch_size = len(batch)
+        device = self._infer_batch_device(batch)
+
+        source_value = None
+        source_key = target_key
+        if target_key in batch.batch.keys():
+            source_value = batch.batch[target_key]
+        else:
+            for key in (target_key, *aliases):
+                if key in batch.non_tensor_batch:
+                    source_value = batch.non_tensor_batch[key]
+                    source_key = key
+                    break
+                if reward_extra_infos_dict and key in reward_extra_infos_dict:
+                    source_value = reward_extra_infos_dict[key]
+                    source_key = key
+                    break
+
+        if source_value is None:
+            if strategy == "skip":
+                return None
+            if strategy == "fill":
+                tensor = torch.full((batch_size,), fill_value, dtype=torch.float32, device=device)
+                batch.batch[target_key] = tensor
+                return tensor
+            raise ValueError(
+                f"{target_key} is required for dancegrpo dual reward path. "
+                "Provide it in rollout batch/reward extra info or configure missing strategy to 'skip' or 'fill'."
+            )
+
+        tensor, invalid_mask = self._coerce_reward_vector(source_value, source_key, batch_size, device)
+        if torch.any(invalid_mask):
+            if strategy == "skip":
+                return None
+            if strategy == "fill":
+                tensor = tensor.clone()
+                tensor[invalid_mask] = fill_value
+            else:
+                invalid_count = int(invalid_mask.sum().item())
+                raise ValueError(
+                    f"{source_key} has {invalid_count} invalid values. "
+                    "Set algorithm.dual_reward_missing_strategy to 'skip' or 'fill' to continue."
+                )
+
+        batch.batch[target_key] = tensor
+        return tensor
+
+    def _inject_dual_rewards_from_sources(
+        self, batch: DataProto, reward_extra_infos_dict: Optional[dict[str, list]]
+    ) -> bool:
+        if not (self.diffusion and self.diffusion_algo == "dancegrpo"):
+            return False
+        vq_tensor = self._resolve_dual_reward_tensor(batch, reward_extra_infos_dict, "vq_rewards", ("vq_reward", "VQ"))
+        mq_tensor = self._resolve_dual_reward_tensor(batch, reward_extra_infos_dict, "mq_rewards", ("mq_reward", "MQ"))
+        return (vq_tensor is not None) and (mq_tensor is not None)
+
+    @staticmethod
+    def _build_dual_adv_metrics(batch: DataProto) -> dict[str, float]:
+        metrics: dict[str, float] = {}
+
+        def _append_stats(prefix: str, tensor: torch.Tensor) -> None:
+            flat = tensor.detach().float().reshape(-1)
+            metrics[f"{prefix}_mean"] = float(flat.mean().item())
+            metrics[f"{prefix}_var"] = float(flat.var(unbiased=False).item())
+            metrics[f"{prefix}_std"] = float(flat.std(unbiased=False).item())
+
+        if "vq_rewards" in batch.batch.keys():
+            _append_stats("reward/vq_reward", batch.batch["vq_rewards"])
+        if "mq_rewards" in batch.batch.keys():
+            _append_stats("reward/mq_reward", batch.batch["mq_rewards"])
+        if "vq_advantages" in batch.batch.keys():
+            _append_stats("reward/vq_advantage", batch.batch["vq_advantages"])
+        if "mq_advantages" in batch.batch.keys():
+            _append_stats("reward/mq_advantage", batch.batch["mq_advantages"])
+
+        return metrics
 
     def init_workers_dis(self):
         """Initialize workers for fit_dis().
@@ -733,11 +955,14 @@ class RayPPOTrainer:
                         batch = batch.union(values)
 
                 with marked_timer("adv", timing_raw, color="brown"):
+                    reward_extra_infos_dict: dict[str, list] = {}
                     if "token_level_scores" not in batch.batch:
-                        reward_tensor, reward_metrics = reward_result
+                        reward_tensor, reward_extra_infos_dict = reward_result
                         batch.batch["token_level_scores"] = reward_tensor
-                        reward_metrics = {f"reward/{k}": v for k, v in reduce_metrics(reward_metrics).items()}
-                        metrics.update(reward_metrics)
+                        reduced_reward_metrics = {
+                            f"reward/{k}": v for k, v in reduce_metrics(reward_extra_infos_dict).items()
+                        }
+                        metrics.update(reduced_reward_metrics)
 
                     if self.config.algorithm.use_kl_in_reward:
                         batch, kl_metrics = apply_kl_penalty(
@@ -751,12 +976,19 @@ class RayPPOTrainer:
                         batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
 
                     if self.diffusion:
+                        if self.diffusion_algo == "dancegrpo":
+                            self._inject_dual_rewards_from_sources(batch, reward_extra_infos_dict)
                         batch = compute_advantage_diffusion(
                             batch,
                             adv_estimator=self.config.algorithm.adv_estimator,
                             gamma=self.config.algorithm.gamma,
                             lam=self.config.algorithm.lam,
+                            config=self.config.algorithm,
+                            diffusion_algo=self.diffusion_algo,
+                            num_generations=self.config.actor_rollout_ref.rollout.num_generations,
                         )
+                        if self.diffusion_algo == "dancegrpo":
+                            metrics.update(self._build_dual_adv_metrics(batch))
                     else:
                         batch = compute_advantage(
                             batch,
@@ -960,6 +1192,20 @@ class RayPPOTrainer:
         if self.diffusion_algo not in valid_diffusion_algos:
             raise ValueError(
                 f"trainer.diffusion_algo must be one of {sorted(valid_diffusion_algos)}, got {self.diffusion_algo}"
+            )
+        dual_reward_missing_strategy = str(config.algorithm.get("dual_reward_missing_strategy", "error")).lower()
+        valid_missing_strategies = {"error", "skip", "fill"}
+        if dual_reward_missing_strategy not in valid_missing_strategies:
+            raise ValueError(
+                "algorithm.dual_reward_missing_strategy must be one of "
+                f"{sorted(valid_missing_strategies)}, got {dual_reward_missing_strategy}"
+            )
+        dual_adv_mode_default = str(config.algorithm.get("dual_adv_mode_default", "group")).lower()
+        valid_dual_adv_modes = {"group", "batch"}
+        if dual_adv_mode_default not in valid_dual_adv_modes:
+            raise ValueError(
+                f"algorithm.dual_adv_mode_default must be one of {sorted(valid_dual_adv_modes)}, "
+                f"got {dual_adv_mode_default}"
             )
 
         # number of GPUs total
@@ -2344,12 +2590,19 @@ class RayPPOTrainer:
 
                         # Use diffusion-specific advantage computation if enabled
                         if self.diffusion:
+                            if self.diffusion_algo == "dancegrpo":
+                                self._inject_dual_rewards_from_sources(batch, reward_extra_infos_dict)
                             batch = compute_advantage_diffusion(
                                 batch,
                                 adv_estimator=self.config.algorithm.adv_estimator,
                                 gamma=self.config.algorithm.gamma,
                                 lam=self.config.algorithm.lam,
+                                config=self.config.algorithm,
+                                diffusion_algo=self.diffusion_algo,
+                                num_generations=self.config.actor_rollout_ref.rollout.num_generations,
                             )
+                            if self.diffusion_algo == "dancegrpo":
+                                metrics.update(self._build_dual_adv_metrics(batch))
                         else:
                             batch = compute_advantage(
                                 batch,

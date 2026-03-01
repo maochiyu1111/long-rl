@@ -88,12 +88,17 @@ class NaiveRewardManager:
             )
 
             if isinstance(score, dict):
-                reward = score["score"]
+                reward = score.get("score", score.get("overall", score.get("overall_reward", None)))
                 # Store the information including original reward
                 for key, value in score.items():
                     reward_extra_info[key].append(value)
             else:
                 reward = score
+
+            if reward is None:
+                raise ValueError(
+                    "Reward function must return a scalar value under 'score', 'overall', or 'overall_reward'."
+                )
 
             reward_tensor[i, valid_response_length - 1] = reward
 
