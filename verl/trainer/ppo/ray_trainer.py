@@ -411,6 +411,7 @@ class RayPPOTrainer:
         # - `diffusion_disaggregate` indicates whether to use fit_dis() topology (actor + rollout_ref split).
         self.diffusion = bool(getattr(config.trainer, "diffusion", False))
         self.diffusion_disaggregate = bool(getattr(config.trainer, "disaggregate", False))
+        self.diffusion_algo = str(getattr(config.trainer, "diffusion_algo", "flow_grpo"))
 
         self.hybrid_engine = config.actor_rollout_ref.hybrid_engine
         assert self.hybrid_engine, "Currently, only support hybrid engine"
@@ -463,6 +464,43 @@ class RayPPOTrainer:
 
         self._validate_config()
         self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
+        self._log_diffusion_algo_config()
+
+    def _build_diffusion_algo_metrics(self) -> dict[str, Any]:
+        rollout_config = self.config.actor_rollout_ref.rollout
+        actor_config = self.config.actor_rollout_ref.actor
+        return {
+            "training/diffusion_algo": self.diffusion_algo,
+            "training/dual_reward_enabled": int(self.diffusion_algo == "dancegrpo"),
+            "training/dance/use_group": int(getattr(rollout_config, "use_group", False)),
+            "training/dance/use_same_noise": int(getattr(rollout_config, "use_same_noise", False)),
+            "training/dance/num_generations": int(getattr(rollout_config, "num_generations", 0)),
+            "training/dance/bestofn": int(getattr(rollout_config, "bestofn", 0)),
+            "training/dance/vq_coef": float(getattr(rollout_config, "vq_coef", 0.0)),
+            "training/dance/mq_coef": float(getattr(rollout_config, "mq_coef", 0.0)),
+            "training/dance/timestep_fraction": float(getattr(actor_config, "timestep_fraction", 0.0)),
+            "training/dance/sampling_steps": int(getattr(rollout_config, "sampling_steps", 0)),
+            "training/dance/shift": int(getattr(rollout_config, "shift", 0)),
+            "training/dance/eta": float(getattr(rollout_config, "eta", 0.0)),
+        }
+
+    def _log_diffusion_algo_config(self) -> None:
+        rollout_config = self.config.actor_rollout_ref.rollout
+        actor_config = self.config.actor_rollout_ref.actor
+        print(
+            "[trainer] diffusion_algo="
+            f"{self.diffusion_algo}, "
+            f"dual_reward_enabled={self.diffusion_algo == 'dancegrpo'}, "
+            f"use_group={getattr(rollout_config, 'use_group', None)}, "
+            f"num_generations={getattr(rollout_config, 'num_generations', None)}, "
+            f"bestofn={getattr(rollout_config, 'bestofn', None)}, "
+            f"vq_coef={getattr(rollout_config, 'vq_coef', None)}, "
+            f"mq_coef={getattr(rollout_config, 'mq_coef', None)}, "
+            f"timestep_fraction={getattr(actor_config, 'timestep_fraction', None)}, "
+            f"sampling_steps={getattr(rollout_config, 'sampling_steps', None)}, "
+            f"shift={getattr(rollout_config, 'shift', None)}, "
+            f"eta={getattr(rollout_config, 'eta', None)}"
+        )
 
     def init_workers_dis(self):
         """Initialize workers for fit_dis().
@@ -621,6 +659,10 @@ class RayPPOTrainer:
 
     def fit_dis(self):
         """Disaggregate training entry (diffusion path)."""
+        if self.diffusion_algo == "dancegrpo":
+            print("[fit_dis] diffusion_algo=dancegrpo (stage A skeleton): reuse existing fit_dis path.")
+        else:
+            print("[fit_dis] diffusion_algo=flow_grpo: using existing fit_dis path.")
         self.init_workers_dis()
         if self.diffusion:
             pipeline_dtype = OmegaConf.select(
@@ -757,6 +799,13 @@ class RayPPOTrainer:
             self._prof_step()
             self._log_step_timing(timing_raw=timing_raw, step=self.global_steps, epoch=fit_dis_epoch)
             n_gpus = self.resource_pool_manager.get_n_gpus()
+            metrics.update(
+                {
+                    "training/global_step": self.global_steps,
+                    "training/epoch": fit_dis_epoch,
+                }
+            )
+            metrics.update(self._build_diffusion_algo_metrics())
             metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
             metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
             metrics.update(compute_throughout_metrics(batch=batch, timing_raw=timing_raw, n_gpus=n_gpus))
@@ -902,6 +951,12 @@ class RayPPOTrainer:
 
     def _validate_config(self):
         config = self.config
+        valid_diffusion_algos = {"flow_grpo", "dancegrpo"}
+        if self.diffusion_algo not in valid_diffusion_algos:
+            raise ValueError(
+                f"trainer.diffusion_algo must be one of {sorted(valid_diffusion_algos)}, got {self.diffusion_algo}"
+            )
+
         # number of GPUs total
         n_gpus = config.trainer.n_gpus_per_node * config.trainer.nnodes
         if config.actor_rollout_ref.actor.strategy == "megatron":
@@ -1012,6 +1067,24 @@ class RayPPOTrainer:
             assert config.actor_rollout_ref.rollout.temperature > 0, (
                 "validation gen temperature should be greater than 0 when enabling do_sample"
             )
+
+        if self.diffusion_algo == "dancegrpo":
+            if config.actor_rollout_ref.rollout.bestofn > config.actor_rollout_ref.rollout.num_generations:
+                raise ValueError(
+                    f"rollout.bestofn ({config.actor_rollout_ref.rollout.bestofn}) must be <= "
+                    f"rollout.num_generations ({config.actor_rollout_ref.rollout.num_generations})"
+                )
+            if config.actor_rollout_ref.rollout.bestofn % 2 != 0:
+                raise ValueError(f"rollout.bestofn must be even, got {config.actor_rollout_ref.rollout.bestofn}")
+            if not (0 < config.actor_rollout_ref.actor.timestep_fraction <= 1):
+                raise ValueError(
+                    f"actor.timestep_fraction must satisfy 0 < x <= 1, got "
+                    f"{config.actor_rollout_ref.actor.timestep_fraction}"
+                )
+            if config.actor_rollout_ref.rollout.vq_coef < 0:
+                raise ValueError(f"rollout.vq_coef must be >= 0, got {config.actor_rollout_ref.rollout.vq_coef}")
+            if config.actor_rollout_ref.rollout.mq_coef < 0:
+                raise ValueError(f"rollout.mq_coef must be >= 0, got {config.actor_rollout_ref.rollout.mq_coef}")
 
         # Diffusion-specific validation
         if self.diffusion:
@@ -1958,6 +2031,10 @@ class RayPPOTrainer:
         to construct the PPO dataflow.
         The light-weight advantage computation is done on the driver process.
         """
+        if self.diffusion_algo == "dancegrpo":
+            print("[fit] diffusion_algo=dancegrpo (stage A skeleton): reuse existing fit path.")
+        else:
+            print("[fit] diffusion_algo=flow_grpo: using existing fit path.")
         from omegaconf import OmegaConf
 
         # from verl.utils.tracking import Tracking
@@ -2381,6 +2458,7 @@ class RayPPOTrainer:
                         "training/epoch": epoch,
                     }
                 )
+                metrics.update(self._build_diffusion_algo_metrics())
                 # collect metrics
                 metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
                 metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))

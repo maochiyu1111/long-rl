@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import unittest
+from typing import List, Optional
 
 import numpy as np
 import torch
@@ -24,6 +25,7 @@ from verl.trainer.ppo.core_algos import (
     compute_grpo_outcome_advantage,
     get_adv_estimator_fn,
 )
+from verl.trainer.ppo.ray_trainer import RayPPOTrainer
 from verl.utils.config import omega_conf_to_dataclass
 
 
@@ -135,6 +137,83 @@ class TestAlgoConfig(unittest.TestCase):
         from verl.trainer.config import AlgoConfig
 
         assert isinstance(algo_config, AlgoConfig)
+
+
+class TestDanceGRPOConfigValidation(unittest.TestCase):
+    """Test stage-A dancegrpo config gate in RayPPOTrainer._validate_config."""
+
+    @staticmethod
+    def _compose_cfg(diffusion_algo: str = "dancegrpo", extra_overrides: Optional[List[str]] = None):
+        import os
+
+        from hydra import compose, initialize_config_dir
+
+        overrides = [
+            f"trainer.diffusion_algo={diffusion_algo}",
+            "trainer.nnodes=1",
+            "trainer.n_gpus_per_node=1",
+            "actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1",
+            "actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=1",
+            "critic.enable=false",
+            "reward_model.enable=false",
+        ]
+        if extra_overrides:
+            overrides.extend(extra_overrides)
+        with initialize_config_dir(config_dir=os.path.abspath("verl/trainer/config")):
+            return compose(config_name="ppo_trainer", overrides=overrides)
+
+    @staticmethod
+    def _run_validate(cfg):
+        trainer = RayPPOTrainer.__new__(RayPPOTrainer)
+        trainer.config = cfg
+        trainer.diffusion = False
+        trainer.diffusion_algo = cfg.trainer.diffusion_algo
+        trainer.use_reference_policy = False
+        trainer.use_critic = False
+        RayPPOTrainer._validate_config(trainer)
+
+    def test_dancegrpo_valid_config_passes(self):
+        cfg = self._compose_cfg("dancegrpo")
+        self._run_validate(cfg)
+
+    def test_dancegrpo_bestofn_must_not_exceed_num_generations(self):
+        cfg = self._compose_cfg("dancegrpo", ["actor_rollout_ref.rollout.bestofn=26"])
+        with self.assertRaisesRegex(ValueError, "bestofn"):
+            self._run_validate(cfg)
+
+    def test_dancegrpo_bestofn_must_be_even(self):
+        cfg = self._compose_cfg("dancegrpo", ["actor_rollout_ref.rollout.bestofn=7"])
+        with self.assertRaisesRegex(ValueError, "must be even"):
+            self._run_validate(cfg)
+
+    def test_dancegrpo_timestep_fraction_range(self):
+        cfg = self._compose_cfg("dancegrpo", ["actor_rollout_ref.actor.timestep_fraction=1.5"])
+        with self.assertRaisesRegex(ValueError, "timestep_fraction"):
+            self._run_validate(cfg)
+
+    def test_dancegrpo_non_negative_coeff(self):
+        cfg = self._compose_cfg("dancegrpo", ["actor_rollout_ref.rollout.vq_coef=-0.1"])
+        with self.assertRaisesRegex(ValueError, "vq_coef"):
+            self._run_validate(cfg)
+        cfg = self._compose_cfg("dancegrpo", ["actor_rollout_ref.rollout.mq_coef=-0.2"])
+        with self.assertRaisesRegex(ValueError, "mq_coef"):
+            self._run_validate(cfg)
+
+    def test_flow_grpo_default_path_ignores_dance_constraints(self):
+        cfg = self._compose_cfg(
+            "flow_grpo",
+            [
+                "actor_rollout_ref.rollout.bestofn=7",
+                "actor_rollout_ref.actor.timestep_fraction=2.0",
+                "actor_rollout_ref.rollout.vq_coef=-1.0",
+            ],
+        )
+        self._run_validate(cfg)
+
+    def test_diffusion_algo_enum_validation(self):
+        cfg = self._compose_cfg("unknown_algo")
+        with self.assertRaisesRegex(ValueError, "diffusion_algo"):
+            self._run_validate(cfg)
 
 
 class TestAlgoCompute(unittest.TestCase):

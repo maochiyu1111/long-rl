@@ -87,6 +87,7 @@ class ActorConfig(BaseConfig):
         "ppo_micro_batch_size_per_gpu",
         "diffusion",
         "guidance_scale",
+        "timestep_fraction",
         "scheduler",
         "diffusion_scheduler",
     }
@@ -117,6 +118,7 @@ class ActorConfig(BaseConfig):
     use_fused_kernels: bool = False
     diffusion: bool = False
     guidance_scale: float = 5.0
+    timestep_fraction: float = 0.6
     scheduler: Optional[str] = None
     diffusion_scheduler: Optional[str] = None
 

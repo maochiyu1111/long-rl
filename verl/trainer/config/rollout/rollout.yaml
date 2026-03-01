@@ -83,6 +83,33 @@ height: null
 width: null
 num_frames: null
 
+# DanceGRPO rollout config skeleton (stage A only)
+use_group: True
+
+# Reuse the same base noise when generating grouped samples
+use_same_noise: True
+
+# Number of grouped generations per prompt
+num_generations: 24
+
+# Best-of-N selector count (must be <= num_generations and even in dancegrpo mode)
+bestofn: 8
+
+# VQ reward coefficient for combined score and loss weighting
+vq_coef: 1.0
+
+# MQ reward coefficient for combined score and loss weighting
+mq_coef: 0.0
+
+# Number of diffusion sampling steps used by dance rollout path
+sampling_steps: 20
+
+# Time-shift factor used to build sigma schedule
+shift: 5
+
+# SDE eta for sampling/update
+eta: 0.25
+
 # Whether to wake up inference engine in multi-stage to reduce peak memory during training-rollout transition.
 multi_stage_wake_up: false
 

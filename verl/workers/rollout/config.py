@@ -54,6 +54,15 @@ class RolloutConfig:
     height: Optional[int] = None
     width: Optional[int] = None
     num_frames: Optional[int] = None
+    use_group: bool = True
+    use_same_noise: bool = True
+    num_generations: int = 24
+    bestofn: int = 8
+    vq_coef: float = 1.0
+    mq_coef: float = 0.0
+    sampling_steps: int = 20
+    shift: int = 5
+    eta: float = 0.25
     multi_stage_wake_up: bool = False
     enable_chunked_prefill: bool = False
     engine_kwargs: Dict[str, Any] = field(

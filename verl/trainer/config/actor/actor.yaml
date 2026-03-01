@@ -128,3 +128,6 @@ optim:
 
 # Whether to use custom fused kernels (e.g., FlashAttention, fused MLP)
 use_fused_kernels: ${oc.select:actor_rollout_ref.model.use_fused_kernels,false}
+
+# Fraction of diffusion timesteps used for actor training in dancegrpo mode
+timestep_fraction: 0.6

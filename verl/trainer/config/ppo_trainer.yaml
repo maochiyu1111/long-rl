@@ -206,6 +206,9 @@ trainer:
   # Whether to balance batch sizes across distributed workers
   balance_batch: True
 
+  # Diffusion algorithm mode: "flow_grpo" (default) or "dancegrpo"
+  diffusion_algo: flow_grpo
+
   # Whether to enable disaggregate training loop (fit_dis)
   disaggregate: False
 

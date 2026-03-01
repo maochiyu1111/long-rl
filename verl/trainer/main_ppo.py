@@ -111,6 +111,24 @@ class TaskRunner:
         print(f"TaskRunner hostname: {socket.gethostname()}, PID: {os.getpid()}")
         pprint(OmegaConf.to_container(config, resolve=True))
         OmegaConf.resolve(config)
+        diffusion_algo = str(config.trainer.get("diffusion_algo", "flow_grpo"))
+        dance_rollout = config.actor_rollout_ref.rollout
+        dance_actor = config.actor_rollout_ref.actor
+        print(
+            "[main_ppo] training/diffusion_algo="
+            f"{diffusion_algo}, "
+            f"training/dual_reward_enabled={diffusion_algo == 'dancegrpo'}, "
+            f"training/dance/use_group={dance_rollout.get('use_group', None)}, "
+            f"training/dance/use_same_noise={dance_rollout.get('use_same_noise', None)}, "
+            f"training/dance/num_generations={dance_rollout.get('num_generations', None)}, "
+            f"training/dance/bestofn={dance_rollout.get('bestofn', None)}, "
+            f"training/dance/vq_coef={dance_rollout.get('vq_coef', None)}, "
+            f"training/dance/mq_coef={dance_rollout.get('mq_coef', None)}, "
+            f"training/dance/timestep_fraction={dance_actor.get('timestep_fraction', None)}, "
+            f"training/dance/sampling_steps={dance_rollout.get('sampling_steps', None)}, "
+            f"training/dance/shift={dance_rollout.get('shift', None)}, "
+            f"training/dance/eta={dance_rollout.get('eta', None)}"
+        )
 
         # Download the checkpoint from HDFS to the local machine.
         # `use_shm` determines whether to use shared memory, which could lead to faster model loading if turned on
