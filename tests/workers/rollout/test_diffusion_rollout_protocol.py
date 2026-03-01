@@ -202,6 +202,24 @@ def test_sd_rollout_use_same_noise(monkeypatch):
     assert torch.equal(first_step, expected)
 
 
+def test_sd_rollout_use_same_noise_ignores_seed_value(monkeypatch):
+    monkeypatch.setattr(diffusion_rollout_mod, "sd3_pipeline_with_logprob", _fake_sd3_pipeline_with_logprob)
+    rollout = _make_sd_rollout(mode="async", use_group=True, num_generations=4, use_same_noise=True, num_steps=3)
+
+    prompts_a = _make_sd_prompts(batch_size=2, use_seed=True)
+    prompts_b = _make_sd_prompts(batch_size=2, use_seed=True)
+    prompts_b.batch["seed"] = torch.tensor([101, 202], dtype=torch.long)
+
+    torch.manual_seed(1234)
+    out_a = rollout.generate_sequences(prompts_a)
+    torch.manual_seed(1234)
+    out_b = rollout.generate_sequences(prompts_b)
+
+    assert torch.equal(out_a.batch["latents"], out_b.batch["latents"])
+    assert torch.equal(out_a.batch["next_latents"], out_b.batch["next_latents"])
+    assert torch.equal(out_a.batch["log_probs"], out_b.batch["log_probs"])
+
+
 def test_wan_rollout_protocol_group_repeat(monkeypatch):
     monkeypatch.setattr(diffusion_rollout_mod, "wan_pipeline_with_logprob", _fake_wan_pipeline_with_logprob)
     rollout = _make_wan_rollout(mode="sync", use_group=True, num_generations=2, use_same_noise=False, num_steps=4)

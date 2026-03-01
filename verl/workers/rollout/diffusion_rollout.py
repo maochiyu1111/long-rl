@@ -55,6 +55,10 @@ def _should_repeat_for_group(config: RolloutConfig, prompts: DataProto) -> bool:
     return gen_seed
 
 
+def _is_sync_mode(config: RolloutConfig) -> bool:
+    return str(getattr(config, "mode", "sync")).lower() == "sync"
+
+
 def _build_seed_generators(device: torch.device, seeds: torch.Tensor) -> list[torch.Generator]:
     generators: list[torch.Generator] = []
     for seed in seeds.detach().to(torch.long).reshape(-1):
@@ -156,9 +160,6 @@ class StableDiffusionRollout(BaseRollout):
         sampling_kwargs: dict[str, Any] = {}
         if _is_dance_mode(prompts):
             if self.config.use_same_noise:
-                base_seed = int(seed_tensor.reshape(-1)[0].item()) if (use_seed and seed_tensor is not None) else 42
-                generator = torch.Generator(device=prompt_embeds.device)
-                generator.manual_seed(base_seed)
                 num_channels_latents = self.pipeline.transformer.config.in_channels
                 base_latents = self.pipeline.prepare_latents(
                     1,
@@ -167,7 +168,7 @@ class StableDiffusionRollout(BaseRollout):
                     self.config.resolution,
                     prompt_embeds.dtype,
                     prompt_embeds.device,
-                    generator,
+                    None,
                     None,
                 )
                 repeat_shape = (batch_size,) + (1,) * (base_latents.ndim - 1)
@@ -177,7 +178,10 @@ class StableDiffusionRollout(BaseRollout):
                     raise ValueError(f"seed size {seed_tensor.numel()} does not match batch size {batch_size}")
                 sampling_kwargs["generator"] = _build_seed_generators(prompt_embeds.device, seed_tensor)
             else:
-                auto_seeds = torch.arange(42, 42 + batch_size, dtype=torch.long, device=prompt_embeds.device)
+                if _is_sync_mode(self.config):
+                    auto_seeds = torch.full((batch_size,), 42, dtype=torch.long, device=prompt_embeds.device)
+                else:
+                    auto_seeds = torch.arange(42, 42 + batch_size, dtype=torch.long, device=prompt_embeds.device)
                 sampling_kwargs["generator"] = _build_seed_generators(prompt_embeds.device, auto_seeds)
 
         with torch.no_grad():
@@ -285,9 +289,6 @@ class WanRollout(BaseRollout):
         sampling_kwargs: dict[str, Any] = {}
         if _is_dance_mode(prompts):
             if self.config.use_same_noise:
-                base_seed = int(seed_tensor.reshape(-1)[0].item()) if (use_seed and seed_tensor is not None) else 42
-                generator = torch.Generator(device=prompt_embeds.device)
-                generator.manual_seed(base_seed)
                 num_channels_latents = self.pipeline.transformer.config.in_channels
                 base_latents = self.pipeline.prepare_latents(
                     1,
@@ -297,7 +298,7 @@ class WanRollout(BaseRollout):
                     self.config.num_frames,
                     torch.float32,
                     prompt_embeds.device,
-                    generator,
+                    None,
                     None,
                 )
                 repeat_shape = (batch_size,) + (1,) * (base_latents.ndim - 1)
@@ -307,7 +308,10 @@ class WanRollout(BaseRollout):
                     raise ValueError(f"seed size {seed_tensor.numel()} does not match batch size {batch_size}")
                 sampling_kwargs["generator"] = _build_seed_generators(prompt_embeds.device, seed_tensor)
             else:
-                auto_seeds = torch.arange(42, 42 + batch_size, dtype=torch.long, device=prompt_embeds.device)
+                if _is_sync_mode(self.config):
+                    auto_seeds = torch.full((batch_size,), 42, dtype=torch.long, device=prompt_embeds.device)
+                else:
+                    auto_seeds = torch.arange(42, 42 + batch_size, dtype=torch.long, device=prompt_embeds.device)
                 sampling_kwargs["generator"] = _build_seed_generators(prompt_embeds.device, auto_seeds)
 
         with torch.no_grad():
