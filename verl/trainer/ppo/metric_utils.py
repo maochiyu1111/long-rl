@@ -267,8 +267,17 @@ def compute_throughout_metrics(batch: DataProto, timing_raw: dict[str, float], n
     time = timing_raw["step"]
 
     if "global_token_num" not in batch.meta_info:
-        # Diffusion batches lack token counts; report timing only
-        return {"perf/time_per_step": time}
+        # Diffusion batches lack token counts; report sample-level throughput baseline.
+        metrics = {"perf/time_per_step": time}
+        batch_size = len(batch)
+        if batch_size > 0:
+            metrics["perf/num_samples"] = batch_size
+            metrics["perf/samples_per_second"] = batch_size / time
+        if "timesteps" in batch.batch.keys():
+            step_tokens = int(batch.batch["timesteps"].numel())
+            metrics["perf/total_num_tokens"] = step_tokens
+            metrics["perf/throughput"] = step_tokens / (time * n_gpus)
+        return metrics
 
     total_num_tokens = sum(batch.meta_info["global_token_num"])
     # estimated_flops, promised_flops = flops_function.estimate_flops(num_tokens, time)

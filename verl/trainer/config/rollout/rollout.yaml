@@ -110,6 +110,12 @@ shift: 5
 # SDE eta for sampling/update
 eta: 0.25
 
+# FPS used for diffusion video export/reward-side expectations
+fps: 8
+
+# Whether to offload diffusion rollout modules between async rounds
+offloading: false
+
 # Whether to wake up inference engine in multi-stage to reduce peak memory during training-rollout transition.
 multi_stage_wake_up: false
 

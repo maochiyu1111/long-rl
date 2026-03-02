@@ -38,6 +38,13 @@ def _is_dance_mode(prompts: DataProto) -> bool:
     return prompts.meta_info.get("diffusion_algo") == "dancegrpo"
 
 
+def _is_async_rollout_request(config: RolloutConfig, prompts: DataProto) -> bool:
+    meta_info = prompts.meta_info or {}
+    if bool(meta_info.get("async_rollout", False)):
+        return True
+    return str(getattr(config, "mode", "sync")).lower() == "async"
+
+
 def _should_repeat_for_group(config: RolloutConfig, prompts: DataProto) -> bool:
     if not _is_dance_mode(prompts):
         return False
@@ -47,12 +54,11 @@ def _should_repeat_for_group(config: RolloutConfig, prompts: DataProto) -> bool:
     # Keep disco_rl parity:
     # - sync: repeat when use_group is enabled
     # - async: repeat only when use_group and gen_seed=True
-    rollout_mode = str(getattr(config, "mode", "sync")).lower()
-    use_seed = bool(prompts.meta_info.get("use_seed", False))
+    use_seed = bool((prompts.meta_info or {}).get("use_seed", False))
     gen_seed = not use_seed
-    if rollout_mode == "sync":
-        return True
-    return gen_seed
+    if _is_async_rollout_request(config, prompts):
+        return gen_seed
+    return True
 
 
 def _is_sync_mode(config: RolloutConfig) -> bool:

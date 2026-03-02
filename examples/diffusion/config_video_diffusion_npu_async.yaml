@@ -1,0 +1,14 @@
+hydra:
+  searchpath:
+    - file://verl/trainer/config
+
+defaults:
+  - config_video_diffusion_npu
+  - _self_
+
+actor_rollout_ref:
+  actor:
+    disco: false
+
+trainer:
+  pipelined_micro_batch: true

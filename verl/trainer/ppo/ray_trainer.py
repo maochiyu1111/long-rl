@@ -20,6 +20,7 @@ This trainer supports model-agonistic model initialization with huggingface
 
 import json
 import os
+import time
 import uuid
 import warnings
 from collections import defaultdict
@@ -563,6 +564,9 @@ class RayPPOTrainer:
         self.diffusion = bool(getattr(config.trainer, "diffusion", False))
         self.diffusion_disaggregate = bool(getattr(config.trainer, "disaggregate", False))
         self.diffusion_algo = str(getattr(config.trainer, "diffusion_algo", "flow_grpo"))
+        self.disco = bool(getattr(config.actor_rollout_ref.actor, "disco", False))
+        self.pipelined_micro_batch = bool(getattr(config.trainer, "pipelined_micro_batch", False))
+        self._workers_dis_initialized = False
 
         self.hybrid_engine = config.actor_rollout_ref.hybrid_engine
         assert self.hybrid_engine, "Currently, only support hybrid engine"
@@ -707,14 +711,20 @@ class RayPPOTrainer:
 
         source_value = None
         source_key = target_key
-        if target_key in batch.batch.keys():
-            source_value = batch.batch[target_key]
-        else:
+        # Prefer reward manager outputs over rollout placeholders (-1/-1) when both exist.
+        for key in (target_key, *aliases):
+            if reward_extra_infos_dict and key in reward_extra_infos_dict:
+                source_value = reward_extra_infos_dict[key]
+                source_key = key
+                break
+        if source_value is None:
             for key in (target_key, *aliases):
-                if reward_extra_infos_dict and key in reward_extra_infos_dict:
-                    source_value = reward_extra_infos_dict[key]
+                if key in batch.batch.keys():
+                    source_value = batch.batch[key]
                     source_key = key
                     break
+        if source_value is None:
+            for key in (target_key, *aliases):
                 if key in batch.non_tensor_batch:
                     source_value = batch.non_tensor_batch[key]
                     source_key = key
@@ -813,6 +823,9 @@ class RayPPOTrainer:
     def init_workers_dis(self):
         """Initialize workers for fit_dis().
         """
+        if getattr(self, "_workers_dis_initialized", False):
+            return
+
         if self.disaggregate_actor_rollout or self.disaggregate_ref:
             raise NotImplementedError(
                 "fit_dis() is currently incompatible with encoder/llm split placement "
@@ -963,6 +976,7 @@ class RayPPOTrainer:
         self.rollout_ref_wg.init_model()
 
         self.actor_wg.init_model()
+        self._workers_dis_initialized = True
 
 
     def fit_dis(self):
@@ -971,7 +985,8 @@ class RayPPOTrainer:
             print("[fit_dis] diffusion_algo=dancegrpo (stage A skeleton): reuse existing fit_dis path.")
         else:
             print("[fit_dis] diffusion_algo=flow_grpo: using existing fit_dis path.")
-        self.init_workers_dis()
+        if not getattr(self, "_workers_dis_initialized", False):
+            self.init_workers_dis()
         if self.diffusion:
             pipeline_dtype = OmegaConf.select(
                 self.config, "actor_rollout_ref.actor.fsdp_config.model_dtype"
@@ -1155,6 +1170,313 @@ class RayPPOTrainer:
         if self.config.trainer.save_freq <= 0 or self.global_steps % self.config.trainer.save_freq != 0:
             self._save_checkpoint()
 
+    def fit_disco_pipelined(
+        self,
+        *,
+        chunk_samples: int = 1,
+        global_update_samples: int = 32,
+        do_gdr_sync: bool = False,
+    ):
+        _ = chunk_samples, global_update_samples
+        if not self.diffusion:
+            raise ValueError("fit_disco_pipelined() only supports trainer.diffusion=true.")
+        if not self.diffusion_disaggregate:
+            raise ValueError("fit_disco_pipelined() requires trainer.disaggregate=true.")
+        if self.diffusion_algo != "dancegrpo":
+            raise ValueError(
+                "fit_disco_pipelined() only supports trainer.diffusion_algo='dancegrpo' to avoid flow_grpo behavior drift."
+            )
+        if not getattr(self, "_workers_dis_initialized", False):
+            self.init_workers_dis()
+
+        pipeline_dtype = OmegaConf.select(self.config, "actor_rollout_ref.actor.fsdp_config.model_dtype") or "bfloat16"
+        self.rollout_ref_wg.normalize_pipeline_dtype(dtype=str(pipeline_dtype))
+
+        self.global_steps = 0
+        self._load_checkpoint()
+        if self.val_reward_fn is not None and self.config.trainer.val_before_train:
+            val_metrics = self._validate()
+            pprint(f"Initial validation metrics: {val_metrics}")
+            if self.config.trainer.val_only:
+                return
+
+        self.data_iterator = iter(self.train_dataloader)
+        progress_bar = tqdm(total=self.total_training_steps, initial=self.global_steps, desc="Training Progress")
+
+        @ray.remote
+        def _get_datapro(data):
+            return data.get()
+
+        def _make_batch_prompts():
+            raw_batch = None
+            target_batch_size = int(self.config.data.train_batch_size)
+            while raw_batch is None or len(raw_batch) < target_batch_size:
+                try:
+                    batch_dict = next(self.data_iterator)
+                except StopIteration:
+                    self.data_iterator = iter(self.train_dataloader)
+                    batch_dict = next(self.data_iterator)
+                meta_info = {
+                    "min_pixels": OmegaConf.select(self.config, "data.min_pixels"),
+                    "max_pixels": OmegaConf.select(self.config, "data.max_pixels"),
+                }
+                next_batch = DataProto.from_single_dict(batch_dict, meta_info=meta_info)
+                raw_batch = DataProto.concat([raw_batch, next_batch]) if raw_batch is not None else next_batch
+
+            raw_batch = raw_batch[:target_batch_size]
+            required_keys = ["prompt_embeds", "negative_prompt_embeds"]
+            optional_keys = [k for k in ["pooled_prompt_embeds", "negative_pooled_prompt_embeds"] if k in raw_batch.batch.keys()]
+            missing_required = [k for k in required_keys if k not in raw_batch.batch.keys()]
+            if missing_required:
+                raise KeyError(
+                    f"Diffusion batch missing required keys {missing_required}. available={list(raw_batch.batch.keys())}"
+                )
+
+            train_batches: list[DataProto] = []
+            num_generations = int(self.config.actor_rollout_ref.rollout.num_generations)
+            rollout_world_size = int(self.rollout_ref_wg.world_size)
+            if num_generations % rollout_world_size != 0:
+                if target_batch_size % rollout_world_size != 0:
+                    raise ValueError(
+                        "fit_disco_pipelined cannot split prompts for async dance fallback: "
+                        f"num_generations={num_generations}, rollout_world_size={rollout_world_size}, "
+                        f"train_batch_size={target_batch_size}"
+                    )
+                batch_num = target_batch_size // rollout_world_size
+                for i in range(batch_num):
+                    sample = raw_batch[i * rollout_world_size : (i + 1) * rollout_world_size]
+                    base_tensors = {key: sample.batch[key] for key in required_keys + optional_keys}
+                    gen_batch = DataProto.from_dict(tensors=base_tensors)
+                    gen_batch.meta_info["use_seed"] = False
+                    gen_batch.meta_info["global_step"] = self.global_steps
+                    gen_batch.meta_info["diffusion_algo"] = self.diffusion_algo
+                    train_batches.append(gen_batch)
+                return train_batches
+
+            for i in range(target_batch_size):
+                sample = raw_batch[i : i + 1]
+                base_tensors = {}
+                for key in required_keys + optional_keys:
+                    tensor = sample.batch[key]
+                    repeat_shape = [num_generations] + [1] * (tensor.ndim - 1)
+                    base_tensors[key] = tensor.repeat(*repeat_shape)
+                seed_device = base_tensors["prompt_embeds"].device
+                base_tensors["seed"] = torch.arange(42, 42 + num_generations, dtype=torch.long, device=seed_device)
+                gen_batch = DataProto.from_dict(tensors=base_tensors)
+                gen_batch.meta_info["use_seed"] = True
+                gen_batch.meta_info["global_step"] = self.global_steps
+                gen_batch.meta_info["diffusion_algo"] = self.diffusion_algo
+                train_batches.append(gen_batch)
+
+            return train_batches
+
+        actor_batch_num = 2
+        accum_steps = max(1, int(getattr(self.config.actor_rollout_ref.actor, "gradient_accumulation_steps", 1)))
+        bestofn = int(self.config.actor_rollout_ref.rollout.bestofn)
+        num_generations = int(self.config.actor_rollout_ref.rollout.num_generations)
+        vq_coef = float(self.config.actor_rollout_ref.rollout.vq_coef)
+        mq_coef = float(self.config.actor_rollout_ref.rollout.mq_coef)
+
+        while self.global_steps < self.total_training_steps:
+            self.global_steps += 1
+            step_start_time = time.time()
+
+            if do_gdr_sync:
+                chunk_mb = int(OmegaConf.select(self.config, "trainer.disaggregate_sync_chunk_mb") or 256)
+                sync_refs: list[ray.ObjectRef] = []
+                sync_refs += self.rollout_ref_wg.execute_all_async(
+                    "rollout_ref_sync_transformer_gdr_with_relay", chunk_mb=chunk_mb
+                )
+                sync_refs += self.actor_wg.execute_all_async(
+                    "actor_sync_transformer_gdr_with_relay", chunk_mb=chunk_mb
+                )
+                ray.get(sync_refs)
+
+            rollout_futs: list[ray.ObjectRef] = []
+            accum_futs = []
+            batches_wait: list[DataProto] = []
+            metrics_batches: list[DataProto] = []
+            reward_latencies: list[float] = []
+            peak_allocations: list[float] = []
+            peak_reserved: list[float] = []
+            actor_metric_lists: dict[str, list] = defaultdict(list)
+
+            prompt_batches = _make_batch_prompts()
+            actor_batch_num = min(max(actor_batch_num, 1), len(prompt_batches))
+            rollout_batch_num = max(0, len(prompt_batches) - actor_batch_num)
+
+            def _submit_one_rollout(src: str, gen_in: DataProto):
+                if gen_in.meta_info is None:
+                    gen_in.meta_info = {}
+                gen_in.meta_info["async_rollout"] = True
+                if src == "actor":
+                    gen_in.meta_info["role"] = "actor"
+                    return self.actor_wg.generate_sequences_asyn_dance(gen_in)
+                gen_in.meta_info["role"] = "rollout_ref"
+                return self.rollout_ref_wg.generate_sequences_asyn_dance(gen_in)
+
+            for i in range(actor_batch_num):
+                prompt_batches[i].meta_info["round"] = i
+                rollout_fut = _submit_one_rollout("actor", prompt_batches[i])
+                rollout_futs.append(_get_datapro.remote(rollout_fut))
+            for i in range(rollout_batch_num):
+                prompt_batches[i + actor_batch_num].meta_info["round"] = i + actor_batch_num
+                rollout_fut = _submit_one_rollout("rollout_ref", prompt_batches[i + actor_batch_num])
+                rollout_futs.append(_get_datapro.remote(rollout_fut))
+
+            pending = list(rollout_futs)
+            accum_count = 0
+            while pending:
+                done, pending = ray.wait(pending, num_returns=1)
+                samples = ray.get(done[0])
+
+                if samples.meta_info is None:
+                    samples.meta_info = {}
+
+                reward_extra_infos_dict: dict[str, list] = {}
+                if "token_level_scores" not in samples.batch.keys():
+                    if self.reward_fn is None:
+                        raise ValueError("fit_disco_pipelined requires reward_fn for diffusion training.")
+                    reward_start = time.time()
+                    reward_tensor, reward_extra_infos_dict = compute_reward(samples, self.reward_fn)
+                    samples.meta_info["timing/reward_s"] = float(time.time() - reward_start)
+                    samples.batch["token_level_scores"] = reward_tensor
+                    samples.batch["token_level_rewards"] = reward_tensor
+                else:
+                    samples.meta_info.setdefault("timing/reward_s", 0.0)
+
+                if self.diffusion_algo == "dancegrpo":
+                    self._inject_dual_rewards_from_sources(samples, reward_extra_infos_dict)
+
+                if "vq_rewards" not in samples.batch.keys() or "mq_rewards" not in samples.batch.keys():
+                    raise KeyError(
+                        f"asyn dance batch requires vq_rewards/mq_rewards, available={list(samples.batch.keys())}"
+                    )
+
+                vq_rewards = samples.batch["vq_rewards"].to(torch.float32)
+                mq_rewards = samples.batch["mq_rewards"].to(torch.float32)
+                vq_advantages = (vq_rewards - vq_rewards.mean()) / (vq_rewards.std() + 1e-8)
+                mq_advantages = (mq_rewards - mq_rewards.mean()) / (mq_rewards.std() + 1e-8)
+                samples.batch["vq_advantages"] = vq_advantages
+                samples.batch["mq_advantages"] = mq_advantages
+
+                total_scores = vq_coef * vq_advantages + mq_coef * mq_advantages
+                sorted_indices = torch.argsort(total_scores)
+                top_indices = sorted_indices[-bestofn // 2 :]
+                bottom_indices = sorted_indices[: bestofn // 2]
+                selected_indices = torch.cat([top_indices, bottom_indices], dim=0)
+                shuffled_order = torch.randperm(selected_indices.shape[0], device=selected_indices.device)
+                selected_indices = selected_indices[shuffled_order]
+
+                if num_generations != bestofn:
+                    samples = samples[selected_indices.detach().cpu().tolist()]
+                batch_size = len(samples)
+                if batch_size <= 0:
+                    continue
+
+                if "timing/reward_s" in samples.meta_info:
+                    reward_latencies.append(float(samples.meta_info["timing/reward_s"]))
+                if "perf/max_memory_allocated_gb" in samples.meta_info:
+                    peak_allocations.append(float(samples.meta_info["perf/max_memory_allocated_gb"]))
+                if "perf/max_memory_reserved_gb" in samples.meta_info:
+                    peak_reserved.append(float(samples.meta_info["perf/max_memory_reserved_gb"]))
+
+                metrics_batches.append(samples)
+                if batch_size <= self.actor_wg.world_size:
+                    batches_wait.append(samples)
+                    if self.actor_wg.world_size % batch_size != 0:
+                        raise ValueError(
+                            f"the best of n is not right: actor_world_size={self.actor_wg.world_size}, batch_size={batch_size}"
+                        )
+                if batch_size <= self.actor_wg.world_size and len(batches_wait) == self.actor_wg.world_size // batch_size:
+                    merged_samples = DataProto.concat(batches_wait)
+                    batches_wait.clear()
+
+                    accum_count += 1
+                    merged_samples.meta_info["diffusion_algo"] = self.diffusion_algo
+                    merged_samples.meta_info["dance_bestofn"] = bestofn
+                    # Best-of-N has already been applied in this path. Keep actor-side update in passthrough mode.
+                    merged_samples.meta_info["dance_num_generations"] = bestofn
+                    merged_samples.meta_info["dance_vq_coef"] = vq_coef
+                    merged_samples.meta_info["dance_mq_coef"] = mq_coef
+                    merged_samples.meta_info["step_weight"] = accum_count == accum_steps
+                    accum_futs.append(self.actor_wg.update_actor_asyn(merged_samples))
+                    if accum_count == accum_steps:
+                        accum_count = 0
+
+            if batches_wait:
+                merged_samples = DataProto.concat(batches_wait)
+                merged_samples.meta_info["diffusion_algo"] = self.diffusion_algo
+                merged_samples.meta_info["dance_bestofn"] = bestofn
+                merged_samples.meta_info["dance_num_generations"] = bestofn
+                merged_samples.meta_info["dance_vq_coef"] = vq_coef
+                merged_samples.meta_info["dance_mq_coef"] = mq_coef
+                merged_samples.meta_info["step_weight"] = True
+                accum_futs.append(self.actor_wg.update_actor_asyn(merged_samples))
+
+            for fut in accum_futs:
+                output = fut.get()
+                if "metrics" not in output.meta_info:
+                    continue
+                for key, value in output.meta_info["metrics"].items():
+                    actor_metric_lists[key].append(value)
+
+            one_step_time = time.time() - step_start_time
+            timing_raw = {"step": one_step_time}
+            metrics: dict[str, Any] = {
+                "training/global_step": self.global_steps,
+                "perf/time_per_step": one_step_time,
+            }
+            metrics.update(self._build_diffusion_algo_metrics())
+
+            if metrics_batches:
+                metrics_batch = DataProto.concat(metrics_batches)
+                n_gpus = self.resource_pool_manager.get_n_gpus()
+                metrics.update(compute_throughout_metrics(batch=metrics_batch, timing_raw=timing_raw, n_gpus=n_gpus))
+                metrics["perf/samples_per_second"] = float(len(metrics_batch) / max(one_step_time, 1e-8))
+                if "timesteps" in metrics_batch.batch.keys():
+                    metrics["perf/tokens_per_second"] = float(
+                        metrics_batch.batch["timesteps"].numel() / max(one_step_time, 1e-8) / max(n_gpus, 1)
+                    )
+
+            if actor_metric_lists:
+                metrics.update({k: float(np.mean(v)) for k, v in actor_metric_lists.items()})
+            if reward_latencies:
+                metrics["perf/reward_latency_s"] = float(np.mean(reward_latencies))
+            if peak_allocations:
+                metrics["perf/max_memory_allocated_gb"] = float(np.max(peak_allocations))
+            if peak_reserved:
+                metrics["perf/max_memory_reserved_gb"] = float(np.max(peak_reserved))
+
+            if (
+                self.val_reward_fn is not None
+                and self.config.trainer.val_freq > 0
+                and self.global_steps % self.config.trainer.val_freq == 0
+            ):
+                val_metrics = self._validate()
+                metrics.update(val_metrics)
+
+            if self.config.trainer.save_freq > 0 and self.global_steps % self.config.trainer.save_freq == 0:
+                self._save_checkpoint()
+
+            print(
+                "[fit_disco_pipelined] "
+                f"step={self.global_steps}, time_per_step={metrics['perf/time_per_step']:.4f}, "
+                f"samples_per_second={metrics.get('perf/samples_per_second', 0.0):.4f}"
+            )
+            progress_bar.update(1)
+
+        progress_bar.close()
+
+        if self.val_reward_fn is not None and (
+            self.config.trainer.val_freq <= 0 or self.global_steps % self.config.trainer.val_freq != 0
+        ):
+            val_metrics = self._validate()
+            pprint(f"Final validation metrics: {val_metrics}")
+
+        if self.config.trainer.save_freq <= 0 or self.global_steps % self.config.trainer.save_freq != 0:
+            self._save_checkpoint()
+
     def _make_batch_data_dis(self, metrics: dict[str, Any]) -> DataProto:
         batch = None
         all_metrics = defaultdict(list)
@@ -1306,6 +1628,12 @@ class RayPPOTrainer:
             raise ValueError(
                 f"algorithm.dual_adv_mode_default must be one of {sorted(valid_dual_adv_modes)}, "
                 f"got {dual_adv_mode_default}"
+            )
+        if self.disco and self.pipelined_micro_batch:
+            raise ValueError("disco and pipelined_micro_batch cannot be both true.")
+        if (self.disco or self.pipelined_micro_batch) and self.diffusion_algo != "dancegrpo":
+            raise ValueError(
+                "actor.disco or trainer.pipelined_micro_batch requires trainer.diffusion_algo='dancegrpo'."
             )
 
         # number of GPUs total

@@ -209,6 +209,21 @@ class TestComputeThroughputMetrics(unittest.TestCase):
         self.assertEqual(metrics["perf/time_per_step"], 2.0)
         self.assertEqual(metrics["perf/throughput"], 600 / (2.0 * 2))  # 150 tokens/sec/GPU
 
+    def test_compute_throughout_metrics_diffusion_without_global_token_num(self):
+        batch = MagicMock()
+        batch.meta_info = {}
+        batch.batch = {"timesteps": torch.ones((3, 4), dtype=torch.long)}
+        batch.__len__.return_value = 3
+
+        timing_raw = {"step": 2.0}
+        metrics = compute_throughout_metrics(batch, timing_raw, n_gpus=2)
+
+        self.assertEqual(metrics["perf/time_per_step"], 2.0)
+        self.assertEqual(metrics["perf/num_samples"], 3)
+        self.assertEqual(metrics["perf/total_num_tokens"], 12)
+        self.assertAlmostEqual(metrics["perf/samples_per_second"], 1.5)
+        self.assertAlmostEqual(metrics["perf/throughput"], 3.0)
+
 
 class TestBootstrapMetric(unittest.TestCase):
     """Tests for the bootstrap_metric function."""

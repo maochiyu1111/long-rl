@@ -43,6 +43,8 @@ actor_rollout_ref:
     enable_gradient_checkpointing: true
   actor:
     strategy: fsdp
+    disco: false
+    gradient_accumulation_steps: 4
     ppo_mini_batch_size: 4
     ppo_micro_batch_size_per_gpu: 1
     ulysses_sequence_parallel_size: 2
@@ -104,6 +106,7 @@ custom_reward_function:
 
 trainer:
   total_epochs: 2
+  diffusion_algo: dancegrpo
   project_name: easy_r1
   experiment_name: wan2_1_t2v_1.3b_grpo
   logger: ["console", "wandb"]
@@ -118,6 +121,7 @@ trainer:
   save_freq: 10000
   diffusion: true
   disaggregate: true
+  pipelined_micro_batch: false
   disaggregate_actor_n_gpus_per_node: 4
   disaggregate_rollout_ref_n_gpus_per_node: 4
   dist_master_addr: 192.158.0.11

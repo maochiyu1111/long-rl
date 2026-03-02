@@ -129,5 +129,11 @@ optim:
 # Whether to use custom fused kernels (e.g., FlashAttention, fused MLP)
 use_fused_kernels: ${oc.select:actor_rollout_ref.model.use_fused_kernels,false}
 
+# Whether to use disco-style asynchronous dance pipeline
+disco: false
+
+# Number of asynchronous micro-batches before applying one optimizer step
+gradient_accumulation_steps: 4
+
 # Fraction of diffusion timesteps used for actor training in dancegrpo mode
 timestep_fraction: 0.6

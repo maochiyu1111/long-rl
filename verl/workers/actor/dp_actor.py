@@ -670,6 +670,8 @@ class DataParallelPPOActor(BasePPOActor):
         dance_num_generations = int(data.meta_info.get("dance_num_generations", 0))
         dance_vq_coef = float(data.meta_info.get("dance_vq_coef", 0.0))
         dance_mq_coef = float(data.meta_info.get("dance_mq_coef", 0.0))
+        asyn_step_control = "step_weight" in data.meta_info
+        step_weight = bool(data.meta_info.get("step_weight", True))
 
         if dance_bestofn <= 0:
             raise ValueError(f"dance_bestofn must be > 0, got {dance_bestofn}")
@@ -803,9 +805,19 @@ class DataParallelPPOActor(BasePPOActor):
                     }
                     append_to_dict(metrics, dance_batch_metrics)
 
+                if not asyn_step_control:
+                    grad_norm = self._optimizer_step()
+                    self.actor_optimizer.zero_grad()
+                    append_to_dict(metrics, {"actor/grad_norm": grad_norm.detach().item()})
+
+        if asyn_step_control:
+            if step_weight:
                 grad_norm = self._optimizer_step()
                 self.actor_optimizer.zero_grad()
                 append_to_dict(metrics, {"actor/grad_norm": grad_norm.detach().item()})
+                append_to_dict(metrics, {"actor/dance/optimizer_step_applied": 1.0})
+            else:
+                append_to_dict(metrics, {"actor/dance/optimizer_step_applied": 0.0})
 
         return metrics
 

@@ -85,6 +85,8 @@ class ActorConfig(BaseConfig):
         "ppo_mini_batch_size",
         "ppo_micro_batch_size",
         "ppo_micro_batch_size_per_gpu",
+        "disco",
+        "gradient_accumulation_steps",
         "diffusion",
         "guidance_scale",
         "timestep_fraction",
@@ -116,8 +118,10 @@ class ActorConfig(BaseConfig):
     checkpoint: CheckpointConfig = field(default_factory=CheckpointConfig)
     optim: OptimizerConfig = field(default_factory=OptimizerConfig)
     use_fused_kernels: bool = False
+    disco: bool = False
     diffusion: bool = False
     guidance_scale: float = 5.0
+    gradient_accumulation_steps: int = 4
     timestep_fraction: float = 0.6
     scheduler: Optional[str] = None
     diffusion_scheduler: Optional[str] = None

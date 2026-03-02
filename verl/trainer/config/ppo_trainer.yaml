@@ -221,6 +221,9 @@ trainer:
   # Whether to enable disaggregate training loop (fit_dis)
   disaggregate: False
 
+  # Whether to enable disco-style pipelined micro-batch loop in disaggregate mode
+  pipelined_micro_batch: False
+
   # Disaggregate pool size for actor workers (GPUs per node). null means auto-split from n_gpus_per_node.
   disaggregate_actor_n_gpus_per_node: null
 

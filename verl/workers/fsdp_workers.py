@@ -1444,7 +1444,9 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             if self.actor_lr_scheduler is not None:
                 lr = self.actor_lr_scheduler.get_last_lr()[0]
                 metrics["actor/lr"] = lr
-                self.actor_lr_scheduler.step()
+                step_weight = bool(data.meta_info.get("step_weight", True))
+                if step_weight:
+                    self.actor_lr_scheduler.step()
 
             # TODO: here, we should return all metrics
             output = DataProto(meta_info={"metrics": metrics})
@@ -1505,6 +1507,26 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         # clear kv cache
         get_torch_device().empty_cache()
         return output
+
+    @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO, blocking=False)
+    def generate_sequences_asyn_dance(self, prompts: DataProto):
+        start_time = time.time()
+        output = self.generate_sequences(prompts)
+        elapsed = time.time() - start_time
+        if output.meta_info is None:
+            output.meta_info = {}
+        output.meta_info["timing/generate_s"] = float(elapsed)
+        if is_cuda_available() or is_npu_available():
+            output.meta_info["perf/max_memory_allocated_gb"] = float(get_torch_device().max_memory_allocated() / (1024**3))
+            output.meta_info["perf/max_memory_reserved_gb"] = float(get_torch_device().max_memory_reserved() / (1024**3))
+        else:
+            output.meta_info["perf/max_memory_allocated_gb"] = 0.0
+            output.meta_info["perf/max_memory_reserved_gb"] = 0.0
+        return output
+
+    @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO, blocking=False)
+    def update_actor_asyn(self, data: DataProto):
+        return self.update_actor(data)
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     #@DistProfiler.annotate(color="blue", role="actor_compute_log_prob")
@@ -1598,6 +1620,18 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             self.ref_policy.actor_module._handle.reshard(True)
 
         return output
+
+    @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO, blocking=False)
+    def compute_ref_log_probs_asyn(self, data: DataProto):
+        start_time = time.time()
+        output = self.compute_ref_log_prob(data)
+        if isinstance(output, list):
+            output = DataProto.concat(output)
+        data = data.union(output)
+        if data.meta_info is None:
+            data.meta_info = {}
+        data.meta_info["timing/ref_s"] = float(time.time() - start_time)
+        return data
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def save_checkpoint(self, local_path, hdfs_path=None, global_step=0, max_ckpt_to_keep=None):

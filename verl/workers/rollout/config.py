@@ -63,6 +63,8 @@ class RolloutConfig:
     sampling_steps: int = 20
     shift: int = 5
     eta: float = 0.25
+    fps: int = 8
+    offloading: bool = False
     multi_stage_wake_up: bool = False
     enable_chunked_prefill: bool = False
     engine_kwargs: Dict[str, Any] = field(

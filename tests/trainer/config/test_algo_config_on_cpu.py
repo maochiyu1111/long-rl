@@ -180,6 +180,8 @@ class TestDanceGRPOConfigValidation(unittest.TestCase):
         trainer.config = cfg
         trainer.diffusion = False
         trainer.diffusion_algo = cfg.trainer.diffusion_algo
+        trainer.disco = bool(getattr(cfg.actor_rollout_ref.actor, "disco", False))
+        trainer.pipelined_micro_batch = bool(getattr(cfg.trainer, "pipelined_micro_batch", False))
         trainer.use_reference_policy = False
         trainer.use_critic = False
         RayPPOTrainer._validate_config(trainer)
@@ -240,6 +242,34 @@ class TestDanceGRPOConfigValidation(unittest.TestCase):
     def test_diffusion_algo_enum_validation(self):
         cfg = self._compose_cfg("unknown_algo")
         with self.assertRaisesRegex(ValueError, "diffusion_algo"):
+            self._run_validate(cfg)
+
+    def test_disco_and_pipelined_micro_batch_mutually_exclusive(self):
+        cfg = self._compose_cfg(
+            "dancegrpo",
+            [
+                "actor_rollout_ref.actor.disco=true",
+                "trainer.pipelined_micro_batch=true",
+            ],
+        )
+        with self.assertRaisesRegex(ValueError, "disco and pipelined_micro_batch"):
+            self._run_validate(cfg)
+
+    def test_disco_or_pipelined_micro_batch_alone_is_valid(self):
+        cfg = self._compose_cfg("dancegrpo", ["actor_rollout_ref.actor.disco=true"])
+        self._run_validate(cfg)
+
+        cfg = self._compose_cfg("dancegrpo", ["trainer.pipelined_micro_batch=true"])
+        self._run_validate(cfg)
+
+    def test_pipelined_micro_batch_requires_dancegrpo(self):
+        cfg = self._compose_cfg("flow_grpo", ["trainer.pipelined_micro_batch=true"])
+        with self.assertRaisesRegex(ValueError, "requires trainer.diffusion_algo='dancegrpo'"):
+            self._run_validate(cfg)
+
+    def test_disco_requires_dancegrpo(self):
+        cfg = self._compose_cfg("flow_grpo", ["actor_rollout_ref.actor.disco=true"])
+        with self.assertRaisesRegex(ValueError, "requires trainer.diffusion_algo='dancegrpo'"):
             self._run_validate(cfg)
 
 

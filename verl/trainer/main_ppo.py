@@ -175,6 +175,13 @@ class TaskRunner:
 
         placement = os.getenv("TASK_PLACEMENT", "colocated")
         fit_disaggregate = bool(getattr(config.trainer, "disaggregate", False))
+        actor_disco = bool(getattr(config.actor_rollout_ref.actor, "disco", False))
+        pipelined_micro_batch = bool(getattr(config.trainer, "pipelined_micro_batch", False))
+
+        if actor_disco:
+            assert not pipelined_micro_batch, "disco and pipelined_micro_batch cannot be both true."
+        if pipelined_micro_batch:
+            assert not actor_disco, "disco and pipelined_micro_batch cannot be both true."
 
         from verl.workers.fsdp_workers import ActorRolloutRefWorker_encoder, ActorRolloutRefWorker_llm
 
@@ -340,7 +347,11 @@ class TaskRunner:
             train_sampler=train_sampler,
         )
         if fit_disaggregate:
-            trainer.fit_dis()
+            trainer.init_workers_dis()
+            if actor_disco or pipelined_micro_batch:
+                trainer.fit_disco_pipelined()
+            else:
+                trainer.fit_dis()
         else:
             # Initialize the workers of the trainer.
             trainer.init_workers()
