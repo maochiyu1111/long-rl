@@ -151,3 +151,27 @@ class TestDiffusionDanceActorOnCPU(unittest.TestCase):
         hit_rate = _metric_scalar(metrics, "actor/dance/bestofn_hit_rate")
         self.assertTrue(torch.isfinite(torch.tensor(final_loss)).item())
         self.assertAlmostEqual(hit_rate, 0.5, places=6)
+
+    def test_dance_bestofn_applies_before_micro_split(self):
+        actor = _build_actor(timestep_fraction=0.5)
+        actor.config.ppo_micro_batch_size_per_gpu = 2
+        batch = _build_dance_batch(include_log_probs=False, bestofn=2, num_generations=4, total_steps=6)
+        call_shapes = []
+
+        def _fake_forward(model_inputs, temperature, step_idx=0):
+            _ = temperature
+            call_shapes.append((model_inputs["log_probs"].shape[0], step_idx))
+            bias = actor.actor_module.logit_bias
+            new_log_probs = model_inputs["log_probs"][:, step_idx] + bias
+            prev_sample_mean = torch.zeros((new_log_probs.shape[0], 1), dtype=new_log_probs.dtype)
+            return new_log_probs, prev_sample_mean
+
+        actor._forward_micro_batch = _fake_forward
+        metrics = actor.update_policy_diffusion(batch)
+
+        # Best-of-N happens on mini-batch first: selected batch size is 2, then split by micro=2 => 1 micro batch.
+        self.assertEqual(len(call_shapes), 3)  # int(6 * 0.5)
+        self.assertTrue(all(shape[0] == 2 for shape in call_shapes))
+
+        hit_rate = _metric_scalar(metrics, "actor/dance/bestofn_hit_rate")
+        self.assertAlmostEqual(hit_rate, 0.5, places=6)

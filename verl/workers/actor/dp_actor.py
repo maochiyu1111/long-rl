@@ -694,76 +694,71 @@ class DataParallelPPOActor(BasePPOActor):
                 micro_bs_update = self.config.ppo_micro_batch_size_per_gpu or self.config.ppo_micro_batch_size
                 assert micro_bs_update is not None, "Please set actor.ppo_micro_batch_size_per_gpu (or ppo_micro_batch_size)."
                 gradient_accumulation = self.config.ppo_mini_batch_size // micro_bs_update
-                micro_batches = mini_batch.split(micro_bs_update)
+
+                mini_inputs = {**mini_batch.batch, **mini_batch.non_tensor_batch}
+                if "log_probs" not in mini_inputs:
+                    mini_inputs["log_probs"] = mini_inputs["old_log_probs"]
+
+                vq_advantages = mini_inputs["vq_advantages"]
+                if vq_advantages.ndim == 2 and vq_advantages.shape[1] == 1:
+                    vq_advantages = vq_advantages[:, 0]
+                elif vq_advantages.ndim != 1:
+                    raise ValueError(
+                        f"vq_advantages must be shape (batch,) or (batch, 1), got {tuple(vq_advantages.shape)}"
+                    )
+                mq_advantages = mini_inputs["mq_advantages"]
+                if mq_advantages.ndim == 2 and mq_advantages.shape[1] == 1:
+                    mq_advantages = mq_advantages[:, 0]
+                elif mq_advantages.ndim != 1:
+                    raise ValueError(
+                        f"mq_advantages must be shape (batch,) or (batch, 1), got {tuple(mq_advantages.shape)}"
+                    )
+                if vq_advantages.shape != mq_advantages.shape:
+                    raise ValueError(
+                        f"vq_advantages and mq_advantages shape mismatch: {tuple(vq_advantages.shape)} vs {tuple(mq_advantages.shape)}"
+                    )
+                mini_inputs["vq_advantages"] = vq_advantages
+                mini_inputs["mq_advantages"] = mq_advantages
+
+                total_scores = dance_vq_coef * vq_advantages + dance_mq_coef * mq_advantages
+                sorted_indices = torch.argsort(total_scores)
+                top_indices = sorted_indices[-dance_bestofn // 2 :]
+                bottom_indices = sorted_indices[: dance_bestofn // 2]
+                selected_indices = torch.cat([top_indices, bottom_indices], dim=0)
+                shuffled_order = torch.randperm(selected_indices.shape[0], device=selected_indices.device)
+                selected_indices = selected_indices[shuffled_order]
+
+                original_batch_size = total_scores.shape[0]
+                if dance_num_generations != dance_bestofn:
+                    for key in list(mini_inputs.keys()):
+                        value = mini_inputs[key]
+                        if torch.is_tensor(value) and value.shape[0] == original_batch_size:
+                            mini_inputs[key] = value[selected_indices]
+                    batch_size = selected_indices.shape[0]
+                else:
+                    batch_size = original_batch_size
+
+                total_steps = mini_inputs["timesteps"].shape[1]
+                perms = torch.stack(
+                    [torch.randperm(total_steps, device=mini_inputs["timesteps"].device) for _ in range(batch_size)]
+                )
+                sample_indices = torch.arange(batch_size, device=mini_inputs["timesteps"].device)[:, None]
+                for key in ["timesteps", "latents", "next_latents", "log_probs"]:
+                    mini_inputs[key] = mini_inputs[key][sample_indices, perms]
+
+                train_timesteps = int(total_steps * self.config.timestep_fraction)
+                if train_timesteps <= 0:
+                    raise ValueError(
+                        f"timestep_fraction={self.config.timestep_fraction} produces non-positive train_timesteps for total_steps={total_steps}"
+                    )
+
+                mini_tensors = {key: value for key, value in mini_inputs.items() if torch.is_tensor(value)}
+                prepared_mini_batch = DataProto.from_dict(tensors=mini_tensors, meta_info=mini_batch.meta_info)
+                micro_batches = prepared_mini_batch.split(micro_bs_update)
 
                 self.actor_optimizer.zero_grad()
                 for micro_batch in micro_batches:
                     model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch}
-                    if "log_probs" not in model_inputs:
-                        model_inputs["log_probs"] = model_inputs["old_log_probs"]
-
-                    vq_advantages = model_inputs["vq_advantages"]
-                    if vq_advantages.ndim == 2 and vq_advantages.shape[1] == 1:
-                        vq_advantages = vq_advantages[:, 0]
-                    elif vq_advantages.ndim != 1:
-                        raise ValueError(
-                            f"vq_advantages must be shape (batch,) or (batch, 1), got {tuple(vq_advantages.shape)}"
-                        )
-                    mq_advantages = model_inputs["mq_advantages"]
-                    if mq_advantages.ndim == 2 and mq_advantages.shape[1] == 1:
-                        mq_advantages = mq_advantages[:, 0]
-                    elif mq_advantages.ndim != 1:
-                        raise ValueError(
-                            f"mq_advantages must be shape (batch,) or (batch, 1), got {tuple(mq_advantages.shape)}"
-                        )
-                    if vq_advantages.shape != mq_advantages.shape:
-                        raise ValueError(
-                            f"vq_advantages and mq_advantages shape mismatch: {tuple(vq_advantages.shape)} vs {tuple(mq_advantages.shape)}"
-                        )
-
-                    total_scores = dance_vq_coef * vq_advantages + dance_mq_coef * mq_advantages
-                    sorted_indices = torch.argsort(total_scores)
-                    top_indices = sorted_indices[-dance_bestofn // 2 :]
-                    bottom_indices = sorted_indices[: dance_bestofn // 2]
-                    selected_indices = torch.cat([top_indices, bottom_indices], dim=0)
-                    shuffled_order = torch.randperm(selected_indices.shape[0], device=selected_indices.device)
-                    selected_indices = selected_indices[shuffled_order]
-
-                    original_batch_size = total_scores.shape[0]
-                    if dance_num_generations != dance_bestofn:
-                        if original_batch_size < dance_bestofn:
-                            raise ValueError(
-                                f"micro batch size ({original_batch_size}) must be >= dance_bestofn ({dance_bestofn})"
-                            )
-                        for key in list(model_inputs.keys()):
-                            value = model_inputs[key]
-                            if torch.is_tensor(value) and value.shape[0] == original_batch_size:
-                                model_inputs[key] = value[selected_indices]
-                        batch_size = selected_indices.shape[0]
-                    else:
-                        batch_size = original_batch_size
-
-                    for key in ("vq_advantages", "mq_advantages"):
-                        if model_inputs[key].ndim == 2 and model_inputs[key].shape[1] == 1:
-                            model_inputs[key] = model_inputs[key][:, 0]
-                        elif model_inputs[key].ndim != 1:
-                            raise ValueError(
-                                f"{key} must be shape (batch,) or (batch, 1), got {tuple(model_inputs[key].shape)}"
-                            )
-
-                    total_steps = model_inputs["timesteps"].shape[1]
-                    perms = torch.stack(
-                        [torch.randperm(total_steps, device=model_inputs["timesteps"].device) for _ in range(batch_size)]
-                    )
-                    sample_indices = torch.arange(batch_size, device=model_inputs["timesteps"].device)[:, None]
-                    for key in ["timesteps", "latents", "next_latents", "log_probs"]:
-                        model_inputs[key] = model_inputs[key][sample_indices, perms]
-
-                    train_timesteps = int(total_steps * self.config.timestep_fraction)
-                    if train_timesteps <= 0:
-                        raise ValueError(
-                            f"timestep_fraction={self.config.timestep_fraction} produces non-positive train_timesteps for total_steps={total_steps}"
-                        )
 
                     clip_range = 1e-4
                     adv_clip_max = 5.0
