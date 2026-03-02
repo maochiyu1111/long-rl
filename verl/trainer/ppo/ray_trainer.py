@@ -1097,6 +1097,20 @@ class RayPPOTrainer:
                 if self.config.trainer.critic_warmup <= self.global_steps:
                     with marked_timer("update_actor", timing_raw, color="red"):
                         batch.meta_info["multi_turn"] = self.config.actor_rollout_ref.rollout.multi_turn.enable
+                        if self.diffusion and self.diffusion_algo == "dancegrpo":
+                            for adv_name in ("vq_advantages", "mq_advantages"):
+                                if adv_name not in batch.batch.keys():
+                                    raise KeyError(
+                                        f"{adv_name} is required for dancegrpo actor update, "
+                                        f"available={list(batch.batch.keys())}"
+                                    )
+                            batch.meta_info["diffusion_algo"] = self.diffusion_algo
+                            batch.meta_info["dance_bestofn"] = int(self.config.actor_rollout_ref.rollout.bestofn)
+                            batch.meta_info["dance_num_generations"] = int(
+                                self.config.actor_rollout_ref.rollout.num_generations
+                            )
+                            batch.meta_info["dance_vq_coef"] = float(self.config.actor_rollout_ref.rollout.vq_coef)
+                            batch.meta_info["dance_mq_coef"] = float(self.config.actor_rollout_ref.rollout.mq_coef)
                         actor_output = self.actor_wg.update_actor(batch)
                     actor_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                     metrics.update(actor_metrics)
@@ -2712,6 +2726,20 @@ class RayPPOTrainer:
                         # update actor
                         with marked_timer("update_actor", timing_raw, color="red"):
                             batch.meta_info["multi_turn"] = self.config.actor_rollout_ref.rollout.multi_turn.enable
+                            if self.diffusion and self.diffusion_algo == "dancegrpo":
+                                for adv_name in ("vq_advantages", "mq_advantages"):
+                                    if adv_name not in batch.batch.keys():
+                                        raise KeyError(
+                                            f"{adv_name} is required for dancegrpo actor update, "
+                                            f"available={list(batch.batch.keys())}"
+                                        )
+                                batch.meta_info["diffusion_algo"] = self.diffusion_algo
+                                batch.meta_info["dance_bestofn"] = int(self.config.actor_rollout_ref.rollout.bestofn)
+                                batch.meta_info["dance_num_generations"] = int(
+                                    self.config.actor_rollout_ref.rollout.num_generations
+                                )
+                                batch.meta_info["dance_vq_coef"] = float(self.config.actor_rollout_ref.rollout.vq_coef)
+                                batch.meta_info["dance_mq_coef"] = float(self.config.actor_rollout_ref.rollout.mq_coef)
                             if self.disaggregate_actor_rollout:
                             
                                 encoder_embed = self.actor_rollout_encoder_wg.actor_forward(batch)

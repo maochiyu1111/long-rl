@@ -499,7 +499,9 @@ class DataParallelPPOActor(BasePPOActor):
 
         return log_probs, entropys
 
-    def _forward_micro_batch_diffusion(self, micro_batch: Dict[str, torch.Tensor], temperature: float) -> torch.Tensor:
+    def _forward_micro_batch_diffusion(
+        self, micro_batch: Dict[str, torch.Tensor], temperature: float, step_idx: int = 0
+    ) -> torch.Tensor:
         """
         Returns:
             log_probs: # (bs, response_len)
@@ -508,7 +510,7 @@ class DataParallelPPOActor(BasePPOActor):
         prev_sample, log_prob, prev_sample_mean, std_dev_t = compute_log_prob_flow_grpo(self.actor_module,
                                                                                         self.scheduler,
                                                                                         micro_batch,
-                                                                                        0,
+                                                                                        step_idx,
                                                                                         micro_batch["prompt_embeds"],
                                                                                         micro_batch["pooled_prompt_embeds"] if "pooled_prompt_embeds" in micro_batch else None,
                                                                                         micro_batch["negative_prompt_embeds"] if "negative_prompt_embeds" in micro_batch else None,
@@ -564,10 +566,7 @@ class DataParallelPPOActor(BasePPOActor):
         prev_sample_mean = torch.concat(prev_sample_mean_lst, dim=0)
         return log_probs, prev_sample_mean
 
-    @GPUMemoryLogger(role="dp actor", logger=logger)
-    def update_policy_diffusion(self, data: DataProto) -> Dict[str, Any]:
-        self.actor_module.train()
-
+    def _update_policy_diffusion_flow_grpo(self, data: DataProto) -> Dict[str, Any]:
         temperature = 0.0
         required_keys = [
             "old_log_probs",
@@ -648,6 +647,182 @@ class DataParallelPPOActor(BasePPOActor):
                 append_to_dict(metrics, {"actor/grad_norm": grad_norm.detach().item()})
 
         return metrics
+
+    def _update_policy_diffusion_dancegrpo(self, data: DataProto) -> Dict[str, Any]:
+        temperature = 0.0
+        required_keys = [
+            "latents",
+            "next_latents",
+            "timesteps",
+            "prompt_embeds",
+            "negative_prompt_embeds",
+            "vq_advantages",
+            "mq_advantages",
+        ]
+        available_keys = set(data.batch.keys()) if data.batch is not None else set()
+        missing_required = [key for key in required_keys if key not in available_keys]
+        if missing_required:
+            raise KeyError(f"Dance diffusion policy update missing required keys: {missing_required}")
+        if "log_probs" not in available_keys and "old_log_probs" not in available_keys:
+            raise KeyError("Dance diffusion policy update requires log_probs or old_log_probs in batch.")
+
+        dance_bestofn = int(data.meta_info.get("dance_bestofn", 0))
+        dance_num_generations = int(data.meta_info.get("dance_num_generations", 0))
+        dance_vq_coef = float(data.meta_info.get("dance_vq_coef", 0.0))
+        dance_mq_coef = float(data.meta_info.get("dance_mq_coef", 0.0))
+
+        if dance_bestofn <= 0:
+            raise ValueError(f"dance_bestofn must be > 0, got {dance_bestofn}")
+        if dance_num_generations <= 0:
+            raise ValueError(f"dance_num_generations must be > 0, got {dance_num_generations}")
+        if dance_bestofn > dance_num_generations:
+            raise ValueError(
+                f"dance_bestofn ({dance_bestofn}) must be <= dance_num_generations ({dance_num_generations})"
+            )
+        if dance_bestofn % 2 != 0:
+            raise ValueError(f"dance_bestofn must be even, got {dance_bestofn}")
+
+        optional_keys = ["log_probs", "old_log_probs", "pooled_prompt_embeds", "negative_pooled_prompt_embeds"]
+        select_keys = required_keys + [key for key in optional_keys if key in available_keys]
+        non_tensor_select_keys = []
+
+        mini_batches = data.select(select_keys, non_tensor_select_keys).split(self.config.ppo_mini_batch_size)
+
+        metrics = defaultdict(list)
+        for _ in range(self.config.ppo_epochs):
+            for mini_batch in mini_batches:
+                micro_bs_update = self.config.ppo_micro_batch_size_per_gpu or self.config.ppo_micro_batch_size
+                assert micro_bs_update is not None, "Please set actor.ppo_micro_batch_size_per_gpu (or ppo_micro_batch_size)."
+                gradient_accumulation = self.config.ppo_mini_batch_size // micro_bs_update
+                micro_batches = mini_batch.split(micro_bs_update)
+
+                self.actor_optimizer.zero_grad()
+                for micro_batch in micro_batches:
+                    model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch}
+                    if "log_probs" not in model_inputs:
+                        model_inputs["log_probs"] = model_inputs["old_log_probs"]
+
+                    vq_advantages = model_inputs["vq_advantages"]
+                    if vq_advantages.ndim == 2 and vq_advantages.shape[1] == 1:
+                        vq_advantages = vq_advantages[:, 0]
+                    elif vq_advantages.ndim != 1:
+                        raise ValueError(
+                            f"vq_advantages must be shape (batch,) or (batch, 1), got {tuple(vq_advantages.shape)}"
+                        )
+                    mq_advantages = model_inputs["mq_advantages"]
+                    if mq_advantages.ndim == 2 and mq_advantages.shape[1] == 1:
+                        mq_advantages = mq_advantages[:, 0]
+                    elif mq_advantages.ndim != 1:
+                        raise ValueError(
+                            f"mq_advantages must be shape (batch,) or (batch, 1), got {tuple(mq_advantages.shape)}"
+                        )
+                    if vq_advantages.shape != mq_advantages.shape:
+                        raise ValueError(
+                            f"vq_advantages and mq_advantages shape mismatch: {tuple(vq_advantages.shape)} vs {tuple(mq_advantages.shape)}"
+                        )
+
+                    total_scores = dance_vq_coef * vq_advantages + dance_mq_coef * mq_advantages
+                    sorted_indices = torch.argsort(total_scores)
+                    top_indices = sorted_indices[-dance_bestofn // 2 :]
+                    bottom_indices = sorted_indices[: dance_bestofn // 2]
+                    selected_indices = torch.cat([top_indices, bottom_indices], dim=0)
+                    shuffled_order = torch.randperm(selected_indices.shape[0], device=selected_indices.device)
+                    selected_indices = selected_indices[shuffled_order]
+
+                    original_batch_size = total_scores.shape[0]
+                    if dance_num_generations != dance_bestofn:
+                        if original_batch_size < dance_bestofn:
+                            raise ValueError(
+                                f"micro batch size ({original_batch_size}) must be >= dance_bestofn ({dance_bestofn})"
+                            )
+                        for key in list(model_inputs.keys()):
+                            value = model_inputs[key]
+                            if torch.is_tensor(value) and value.shape[0] == original_batch_size:
+                                model_inputs[key] = value[selected_indices]
+                        batch_size = selected_indices.shape[0]
+                    else:
+                        batch_size = original_batch_size
+
+                    for key in ("vq_advantages", "mq_advantages"):
+                        if model_inputs[key].ndim == 2 and model_inputs[key].shape[1] == 1:
+                            model_inputs[key] = model_inputs[key][:, 0]
+                        elif model_inputs[key].ndim != 1:
+                            raise ValueError(
+                                f"{key} must be shape (batch,) or (batch, 1), got {tuple(model_inputs[key].shape)}"
+                            )
+
+                    total_steps = model_inputs["timesteps"].shape[1]
+                    perms = torch.stack(
+                        [torch.randperm(total_steps, device=model_inputs["timesteps"].device) for _ in range(batch_size)]
+                    )
+                    sample_indices = torch.arange(batch_size, device=model_inputs["timesteps"].device)[:, None]
+                    for key in ["timesteps", "latents", "next_latents", "log_probs"]:
+                        model_inputs[key] = model_inputs[key][sample_indices, perms]
+
+                    train_timesteps = int(total_steps * self.config.timestep_fraction)
+                    if train_timesteps <= 0:
+                        raise ValueError(
+                            f"timestep_fraction={self.config.timestep_fraction} produces non-positive train_timesteps for total_steps={total_steps}"
+                        )
+
+                    clip_range = 1e-4
+                    adv_clip_max = 5.0
+                    last_vq_loss = None
+                    last_mq_loss = None
+                    last_final_loss = None
+                    for step_idx in range(train_timesteps):
+                        new_log_probs, _ = self._forward_micro_batch(
+                            model_inputs,
+                            temperature=temperature,
+                            step_idx=step_idx,
+                        )
+
+                        ratio = torch.exp(new_log_probs - model_inputs["log_probs"][:, step_idx])
+                        vq_adv = torch.clamp(model_inputs["vq_advantages"], -adv_clip_max, adv_clip_max)
+                        vq_unclipped_loss = -vq_adv * ratio
+                        vq_clipped_loss = -vq_adv * torch.clamp(ratio, 1.0 - clip_range, 1.0 + clip_range)
+                        vq_loss = torch.mean(torch.maximum(vq_unclipped_loss, vq_clipped_loss)) / (
+                            gradient_accumulation * train_timesteps
+                        )
+
+                        mq_adv = torch.clamp(model_inputs["mq_advantages"], -adv_clip_max, adv_clip_max)
+                        mq_unclipped_loss = -mq_adv * ratio
+                        mq_clipped_loss = -mq_adv * torch.clamp(ratio, 1.0 - clip_range, 1.0 + clip_range)
+                        mq_loss = torch.mean(torch.maximum(mq_unclipped_loss, mq_clipped_loss)) / (
+                            gradient_accumulation * train_timesteps
+                        )
+
+                        final_loss = dance_vq_coef * vq_loss + dance_mq_coef * mq_loss
+                        final_loss.backward()
+
+                        last_vq_loss = vq_loss.detach()
+                        last_mq_loss = mq_loss.detach()
+                        last_final_loss = final_loss.detach()
+
+                    dance_batch_metrics = {
+                        "actor/dance/vq_loss": float(last_vq_loss.item()),
+                        "actor/dance/mq_loss": float(last_mq_loss.item()),
+                        "actor/dance/final_loss": float(last_final_loss.item()),
+                        "actor/dance/train_step_ratio": float(train_timesteps / total_steps),
+                        "actor/dance/bestofn_hit_rate": float(batch_size / max(original_batch_size, 1)),
+                    }
+                    append_to_dict(metrics, dance_batch_metrics)
+
+                grad_norm = self._optimizer_step()
+                self.actor_optimizer.zero_grad()
+                append_to_dict(metrics, {"actor/grad_norm": grad_norm.detach().item()})
+
+        return metrics
+
+    @GPUMemoryLogger(role="dp actor", logger=logger)
+    def update_policy_diffusion(self, data: DataProto) -> Dict[str, Any]:
+        self.actor_module.train()
+        diffusion_algo = str(data.meta_info.get("diffusion_algo", "flow_grpo"))
+        if diffusion_algo == "dancegrpo":
+            return self._update_policy_diffusion_dancegrpo(data)
+        if diffusion_algo == "flow_grpo":
+            return self._update_policy_diffusion_flow_grpo(data)
+        raise ValueError(f"Unknown diffusion_algo for actor update: {diffusion_algo}")
     
     @GPUMemoryLogger(role="dp actor", logger=logger)
     def compute_log_prob_llm(self, data: DataProto, calculate_entropy=False) -> torch.Tensor:
