@@ -173,3 +173,36 @@ def test_videoalign_backend_timeout_fallback_and_counts(monkeypatch):
     assert torch.allclose(result["reward_tensor"], torch.tensor([[-3.0], [-3.0]], dtype=torch.float32), atol=1e-6)
     assert result["reward_extra_info"]["videoalign_timeout_count"] == [2.0, 2.0]
     assert result["reward_extra_info"]["videoalign_exception_count"] == [0.0, 0.0]
+
+
+def test_videoalign_backend_partial_failure_isolated_per_sample(monkeypatch):
+    class FakeInferencer:
+        def reward_from_videos(self, videos, prompts, use_norm=True):
+            # Simulate batch API failure first, then per-sample fallback behavior.
+            if len(videos) > 1:
+                raise RuntimeError("batch inference failed")
+            if prompts[0] == "prompt-0":
+                return [{"VQ": 1.0, "MQ": 2.0, "TA": 3.0, "Overall": 6.0}]
+            raise RuntimeError("single-sample inference failed")
+
+        def reward(self, video_paths, prompts, use_norm=True):
+            raise AssertionError("reward() should not be called when video paths are unavailable")
+
+    def _fake_init(self):
+        self.videoalign_inferencer = FakeInferencer()
+        self.videoalign_use_norm = True
+        self.videoalign_init_error = None
+
+    monkeypatch.setattr(BatchRewardManager, "_init_videoalign_backend", _fake_init)
+
+    mgr = BatchRewardManager(tokenizer=None, num_examine=0, compute_score=None, backend="videoalign")
+    batch = _build_video_batch(batch_size=2, with_paths=False)
+    result = mgr(batch, return_dict=True)
+
+    assert torch.allclose(result["reward_tensor"], torch.tensor([[6.0], [-3.0]], dtype=torch.float32), atol=1e-6)
+    assert result["reward_extra_info"]["VQ"] == [1.0, -1.0]
+    assert result["reward_extra_info"]["MQ"] == [2.0, -1.0]
+    assert result["reward_extra_info"]["TA"] == [3.0, -1.0]
+    assert result["reward_extra_info"]["Overall"] == [6.0, -3.0]
+    assert result["reward_extra_info"]["videoalign_exception_count"] == [1.0, 1.0]
+    assert result["reward_extra_info"]["videoalign_timeout_count"] == [0.0, 0.0]

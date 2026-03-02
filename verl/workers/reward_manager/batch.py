@@ -177,14 +177,14 @@ class BatchRewardManager:
                 continue
             out = []
             for item in raw:
-                if isinstance(item, (list, tuple)) and len(item) > 0:
-                    item = item[0]
+                if isinstance(item, (list, tuple)):
+                    item = item[0] if len(item) > 0 else None
                 if item is None:
-                    out = []
-                    break
-                out.append(str(item))
-            if len(out) == batch_size:
-                return out
+                    out.append(None)
+                    continue
+                item_str = str(item)
+                out.append(item_str if item_str else None)
+            return out
         return None
 
     @staticmethod
@@ -232,36 +232,57 @@ class BatchRewardManager:
         prompts = self._extract_prompt_texts(data, batch_size)
         videos = [data.batch["videos"][i] for i in range(batch_size)]
         video_paths = self._extract_video_paths(data, batch_size)
-        from_videos_error = None
 
         try:
             scores = self.videoalign_inferencer.reward_from_videos(videos, prompts, use_norm=self.videoalign_use_norm)
             if isinstance(scores, (list, tuple)) and len(scores) == batch_size:
                 return list(scores), stats
-            raise ValueError(f"videoalign.reward_from_videos returned invalid length: {len(scores)}")
-        except TimeoutError as exc:
-            from_videos_error = exc
-        except Exception as exc:
-            from_videos_error = exc
+            raise ValueError("videoalign.reward_from_videos returned invalid batch output.")
+        except Exception:
+            pass
 
-        if video_paths:
+        fallback_score = self._videoalign_fallback_scores(1)[0]
+        scores = []
+        for i in range(batch_size):
+            prompt = prompts[i]
+            video = videos[i]
+            video_path = video_paths[i] if video_paths is not None else None
+            failure_type = "exception"
+
             try:
-                scores = self.videoalign_inferencer.reward(video_paths, prompts, use_norm=self.videoalign_use_norm)
-                if isinstance(scores, (list, tuple)) and len(scores) == batch_size:
-                    return list(scores), stats
-                raise ValueError(f"videoalign.reward returned invalid length: {len(scores)}")
+                sample_scores = self.videoalign_inferencer.reward_from_videos(
+                    [video], [prompt], use_norm=self.videoalign_use_norm
+                )
+                if isinstance(sample_scores, (list, tuple)) and len(sample_scores) == 1:
+                    scores.append(sample_scores[0])
+                    continue
+                raise ValueError("videoalign.reward_from_videos returned invalid sample output.")
             except TimeoutError:
-                stats["videoalign_timeout_count"] = float(batch_size)
-                return self._videoalign_fallback_scores(batch_size), stats
+                failure_type = "timeout"
             except Exception:
-                stats["videoalign_exception_count"] = float(batch_size)
-                return self._videoalign_fallback_scores(batch_size), stats
+                failure_type = "exception"
 
-        if isinstance(from_videos_error, TimeoutError):
-            stats["videoalign_timeout_count"] = float(batch_size)
-        else:
-            stats["videoalign_exception_count"] = float(batch_size)
-        return self._videoalign_fallback_scores(batch_size), stats
+            if video_path is not None:
+                try:
+                    sample_scores = self.videoalign_inferencer.reward(
+                        [video_path], [prompt], use_norm=self.videoalign_use_norm
+                    )
+                    if isinstance(sample_scores, (list, tuple)) and len(sample_scores) == 1:
+                        scores.append(sample_scores[0])
+                        continue
+                    raise ValueError("videoalign.reward returned invalid sample output.")
+                except TimeoutError:
+                    failure_type = "timeout"
+                except Exception:
+                    failure_type = "exception"
+
+            scores.append(fallback_score)
+            if failure_type == "timeout":
+                stats["videoalign_timeout_count"] += 1.0
+            else:
+                stats["videoalign_exception_count"] += 1.0
+
+        return scores, stats
 
     def verify(self, data):
         prompt_ids = data.batch["prompts"]

@@ -22,6 +22,19 @@ from verl import DataProto
 from verl.utils.reward_score import default_compute_score
 
 
+_BATCH_ONLY_REWARD_KWARGS = {
+    "backend",
+    "use_videoalign",
+    "videoalign",
+    "videoalign_model_path",
+    "videoalign_load_from_pretrained",
+    "videoalign_load_from_pretrained_step",
+    "videoalign_device",
+    "videoalign_dtype",
+    "videoalign_use_norm",
+}
+
+
 def _call_with_kwargs(raw_fn, extra_kwargs, *args, **kwargs):
     """Calls `raw_fn` by merging `extra_kwargs` into call-time `kwargs`, with `extra_kwargs` taking precedence.
 
@@ -81,6 +94,12 @@ def get_custom_reward_fn(config):
     return partial(_call_with_kwargs, raw_fn, reward_kwargs)
 
 
+def _sanitize_reward_manager_kwargs(reward_manager_name: str, reward_kwargs: dict) -> dict:
+    if reward_manager_name == "batch":
+        return dict(reward_kwargs)
+    return {k: v for k, v in reward_kwargs.items() if k not in _BATCH_ONLY_REWARD_KWARGS}
+
+
 def load_reward_manager(config, tokenizer, num_examine, **reward_kwargs):
     """
     Load and initialize a reward manager based on the configuration.
@@ -128,13 +147,15 @@ def load_reward_manager(config, tokenizer, num_examine, **reward_kwargs):
         else:
             final_compute_score = default_compute_score
 
+    reward_manager_kwargs = _sanitize_reward_manager_kwargs(reward_manager_name, reward_kwargs)
+
     # Instantiate and return the reward manager with the specified parameters
     return reward_manager_cls(
         tokenizer=tokenizer,
         num_examine=num_examine,
         compute_score=final_compute_score,
         reward_fn_key=config.data.reward_fn_key,
-        **reward_kwargs,
+        **reward_manager_kwargs,
     )
 
 
