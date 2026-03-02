@@ -49,6 +49,13 @@ forward_max_token_len_per_gpu: ${critic.forward_max_token_len_per_gpu}
 # the reward manager can be set to prime for parallel verification.
 reward_manager: naive
 
+# Additional kwargs passed to reward managers.
+reward_kwargs:
+  # Backward-compatible switch from disco_rl.
+  use_videoalign: false
+  # Preferred backend selector for batch reward manager.
+  backend: builtin
+
 # Whether to launch custom reward function asynchronously during log_prob
 # custom reward function executed async on CPU, during log_prob
 launch_reward_fn_async: False

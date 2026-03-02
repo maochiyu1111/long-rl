@@ -16,6 +16,7 @@ data:
   train_batch_size: 32
   gen_batch_size: 8
   val_batch_size: 4
+  return_full_prompt: true
   shuffle: true
   min_pixels: 262144
   max_pixels: 4194304
@@ -88,6 +89,15 @@ actor_rollout_ref:
 
 reward_model:
   reward_manager: batch
+  reward_kwargs:
+    use_videoalign: false
+    backend: builtin
+    videoalign:
+      load_from_pretrained: null
+      load_from_pretrained_step: -1
+      device: cuda
+      dtype: bfloat16
+      use_norm: true
 custom_reward_function:
   path: ./examples/reward_function/diffusion.py
   name: compute_score

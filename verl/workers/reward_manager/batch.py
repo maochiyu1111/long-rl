@@ -38,7 +38,230 @@ class BatchRewardManager:
         self.num_examine = num_examine
         self.compute_score = compute_score
         self.reward_fn_key = reward_fn_key
-        self.reward_kwargs = reward_kwargs
+        self.reward_kwargs = dict(reward_kwargs)
+        self.reward_backend = self._resolve_reward_backend(self.reward_kwargs)
+        self.compute_score_kwargs = self._extract_compute_score_kwargs(self.reward_kwargs)
+
+        self.videoalign_inferencer = None
+        self.videoalign_use_norm = True
+        self.videoalign_init_error = None
+
+        if self.reward_backend == "videoalign":
+            self._init_videoalign_backend()
+
+    @staticmethod
+    def _resolve_reward_backend(reward_kwargs):
+        backend = reward_kwargs.get("backend", None)
+        use_videoalign = bool(reward_kwargs.get("use_videoalign", False))
+        if backend is None:
+            return "videoalign" if use_videoalign else "builtin"
+        backend = str(backend).lower()
+        if backend not in {"builtin", "videoalign"}:
+            raise ValueError(f"Unsupported reward backend: {backend}. Expected one of ['builtin', 'videoalign'].")
+        return backend
+
+    @staticmethod
+    def _extract_compute_score_kwargs(reward_kwargs):
+        kwargs = dict(reward_kwargs)
+        kwargs.pop("backend", None)
+        kwargs.pop("use_videoalign", None)
+        kwargs.pop("videoalign", None)
+        kwargs.pop("videoalign_model_path", None)
+        kwargs.pop("videoalign_load_from_pretrained", None)
+        kwargs.pop("videoalign_load_from_pretrained_step", None)
+        kwargs.pop("videoalign_device", None)
+        kwargs.pop("videoalign_dtype", None)
+        kwargs.pop("videoalign_use_norm", None)
+        return kwargs
+
+    def _init_videoalign_backend(self):
+        videoalign_cfg = self.reward_kwargs.get("videoalign", {}) or {}
+        if not isinstance(videoalign_cfg, dict):
+            raise ValueError(
+                "reward_kwargs.videoalign must be a dict when backend=videoalign, "
+                f"got {type(videoalign_cfg)}."
+            )
+
+        model_path = (
+            videoalign_cfg.get("load_from_pretrained")
+            or self.reward_kwargs.get("videoalign_load_from_pretrained")
+            or self.reward_kwargs.get("videoalign_model_path")
+        )
+        load_step = int(
+            videoalign_cfg.get(
+                "load_from_pretrained_step", self.reward_kwargs.get("videoalign_load_from_pretrained_step", -1)
+            )
+        )
+        device = videoalign_cfg.get("device", self.reward_kwargs.get("videoalign_device"))
+        if device is None:
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+        dtype_name = str(videoalign_cfg.get("dtype", self.reward_kwargs.get("videoalign_dtype", "bfloat16"))).lower()
+        self.videoalign_use_norm = bool(
+            videoalign_cfg.get("use_norm", self.reward_kwargs.get("videoalign_use_norm", True))
+        )
+
+        dtype_map = {
+            "bfloat16": torch.bfloat16,
+            "bf16": torch.bfloat16,
+            "float16": torch.float16,
+            "fp16": torch.float16,
+            "float32": torch.float32,
+            "fp32": torch.float32,
+        }
+        dtype = dtype_map.get(dtype_name)
+        if dtype is None:
+            raise ValueError(
+                f"Unsupported videoalign dtype: {dtype_name}. "
+                "Expected one of ['bfloat16', 'float16', 'float32']."
+            )
+
+        if not model_path:
+            self.videoalign_init_error = "missing_model_path"
+            return
+
+        try:
+            from fastvideo.models.videoalign.inference import VideoVLMRewardInference
+
+            self.videoalign_inferencer = VideoVLMRewardInference(
+                load_from_pretrained=model_path,
+                load_from_pretrained_step=load_step,
+                device=device,
+                dtype=dtype,
+            )
+        except Exception as exc:
+            self.videoalign_init_error = f"{type(exc).__name__}: {exc}"
+            self.videoalign_inferencer = None
+
+    @staticmethod
+    def _normalize_non_tensor_list(value):
+        if isinstance(value, list):
+            return value
+        if isinstance(value, tuple):
+            return list(value)
+        if torch.is_tensor(value):
+            return value.detach().cpu().tolist()
+        if hasattr(value, "tolist"):
+            converted = value.tolist()
+            if isinstance(converted, (list, tuple)):
+                return list(converted)
+            return [converted]
+        return [value]
+
+    def _extract_prompt_texts(self, data: DataProto, batch_size: int):
+        candidate_keys = (
+            "full_prompts",
+            "full_prompt",
+            "text",
+            "texts",
+            "prompt",
+            "prompts",
+            "caption",
+            "captions",
+        )
+        for key in candidate_keys:
+            if key not in data.non_tensor_batch:
+                continue
+            raw = self._normalize_non_tensor_list(data.non_tensor_batch[key])
+            if len(raw) != batch_size:
+                continue
+            return ["" if item is None else str(item) for item in raw]
+        return [""] * batch_size
+
+    def _extract_video_paths(self, data: DataProto, batch_size: int):
+        candidate_keys = ("video_paths", "video_path", "videos_path", "videos_paths", "path", "paths")
+        for key in candidate_keys:
+            if key not in data.non_tensor_batch:
+                continue
+            raw = self._normalize_non_tensor_list(data.non_tensor_batch[key])
+            if len(raw) != batch_size:
+                continue
+            out = []
+            for item in raw:
+                if isinstance(item, (list, tuple)) and len(item) > 0:
+                    item = item[0]
+                if item is None:
+                    out = []
+                    break
+                out.append(str(item))
+            if len(out) == batch_size:
+                return out
+        return None
+
+    @staticmethod
+    def _videoalign_fallback_scores(batch_size):
+        return [{"VQ": -1.0, "MQ": -1.0, "TA": -1.0, "Overall": -3.0} for _ in range(batch_size)]
+
+    @staticmethod
+    def _normalize_videoalign_score(score):
+        if not isinstance(score, dict):
+            return {
+                "VQ": -1.0,
+                "MQ": -1.0,
+                "TA": -1.0,
+                "Overall": float(score),
+            }
+        vq = float(score.get("VQ", score.get("vq_reward", score.get("vq", -1.0))))
+        mq = float(score.get("MQ", score.get("mq_reward", score.get("mq", -1.0))))
+        ta = float(score.get("TA", score.get("ta_reward", score.get("ta", -1.0))))
+        overall = score.get("Overall", score.get("overall", score.get("overall_reward", None)))
+        if overall is None:
+            overall = vq + mq + ta
+        return {
+            "VQ": vq,
+            "MQ": mq,
+            "TA": ta,
+            "Overall": float(overall),
+        }
+
+    def _compute_videoalign_scores(self, data: DataProto, modality_key: str):
+        batch_size = len(data)
+        stats = {
+            "videoalign_unavailable_count": 0.0,
+            "videoalign_timeout_count": 0.0,
+            "videoalign_exception_count": 0.0,
+        }
+
+        if modality_key != "videos":
+            stats["videoalign_unavailable_count"] = float(batch_size)
+            return self._videoalign_fallback_scores(batch_size), stats
+
+        if self.videoalign_inferencer is None:
+            stats["videoalign_unavailable_count"] = float(batch_size)
+            return self._videoalign_fallback_scores(batch_size), stats
+
+        prompts = self._extract_prompt_texts(data, batch_size)
+        videos = [data.batch["videos"][i] for i in range(batch_size)]
+        video_paths = self._extract_video_paths(data, batch_size)
+        from_videos_error = None
+
+        try:
+            scores = self.videoalign_inferencer.reward_from_videos(videos, prompts, use_norm=self.videoalign_use_norm)
+            if isinstance(scores, (list, tuple)) and len(scores) == batch_size:
+                return list(scores), stats
+            raise ValueError(f"videoalign.reward_from_videos returned invalid length: {len(scores)}")
+        except TimeoutError as exc:
+            from_videos_error = exc
+        except Exception as exc:
+            from_videos_error = exc
+
+        if video_paths:
+            try:
+                scores = self.videoalign_inferencer.reward(video_paths, prompts, use_norm=self.videoalign_use_norm)
+                if isinstance(scores, (list, tuple)) and len(scores) == batch_size:
+                    return list(scores), stats
+                raise ValueError(f"videoalign.reward returned invalid length: {len(scores)}")
+            except TimeoutError:
+                stats["videoalign_timeout_count"] = float(batch_size)
+                return self._videoalign_fallback_scores(batch_size), stats
+            except Exception:
+                stats["videoalign_exception_count"] = float(batch_size)
+                return self._videoalign_fallback_scores(batch_size), stats
+
+        if isinstance(from_videos_error, TimeoutError):
+            stats["videoalign_timeout_count"] = float(batch_size)
+        else:
+            stats["videoalign_exception_count"] = float(batch_size)
+        return self._videoalign_fallback_scores(batch_size), stats
 
     def verify(self, data):
         prompt_ids = data.batch["prompts"]
@@ -64,7 +287,7 @@ class BatchRewardManager:
             solution_strs=responses_str,
             ground_truths=ground_truths,
             extra_infos=extras,
-            **self.reward_kwargs,
+            **self.compute_score_kwargs,
         )
 
         return scores
@@ -93,15 +316,33 @@ class BatchRewardManager:
             reward_tensor = torch.zeros((len(data), 1), dtype=torch.float32, device=device)
             reward_extra_info = defaultdict(list)
             reward_inputs = [{modality_key: data.batch[modality_key][i]} for i in range(len(data))]
+            backend_metrics = {
+                "backend_videoalign": 0.0,
+                "backend_builtin": 1.0,
+                "videoalign_unavailable_count": 0.0,
+                "videoalign_timeout_count": 0.0,
+                "videoalign_exception_count": 0.0,
+            }
 
-            try:
-                scores = self.compute_score(reward_inputs=reward_inputs, **self.reward_kwargs)
-            except TypeError:
-                scores = self.compute_score(reward_inputs, **self.reward_kwargs)
+            if self.reward_backend == "videoalign":
+                backend_metrics["backend_videoalign"] = 1.0
+                backend_metrics["backend_builtin"] = 0.0
+                scores, videoalign_stats = self._compute_videoalign_scores(data, modality_key)
+                backend_metrics.update(videoalign_stats)
+            else:
+                try:
+                    scores = self.compute_score(reward_inputs=reward_inputs, **self.compute_score_kwargs)
+                except TypeError:
+                    scores = self.compute_score(reward_inputs, **self.compute_score_kwargs)
 
             rewards = []
             for i, score in enumerate(scores):
-                if isinstance(score, dict):
+                if self.reward_backend == "videoalign":
+                    normalized_score = self._normalize_videoalign_score(score)
+                    reward = normalized_score["Overall"]
+                    for key, value in normalized_score.items():
+                        reward_extra_info[key].append(float(value))
+                elif isinstance(score, dict):
                     reward = score.get("overall", score.get("score", score.get("overall_reward", None)))
                     for key, value in score.items():
                         reward_extra_info[key].append(value)
@@ -118,6 +359,8 @@ class BatchRewardManager:
                 rewards.append(reward)
 
             data.batch["acc"] = torch.tensor(rewards, dtype=torch.float32, device=device)
+            for key, value in backend_metrics.items():
+                reward_extra_info[key].extend([float(value)] * len(data))
 
             if return_dict:
                 return {"reward_tensor": reward_tensor, "reward_extra_info": reward_extra_info}

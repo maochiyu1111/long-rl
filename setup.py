@@ -57,6 +57,13 @@ SGLANG_REQUIRES = [
 ]
 TRL_REQUIRES = ["trl<=0.9.6"]
 MCORE_REQUIRES = ["mbridge"]
+VIDEOALIGN_REQUIRES = [
+    "pillow",
+    "requests",
+    "safetensors",
+    "torchvision",
+    "trl<=0.9.6",
+]
 
 extras_require = {
     "test": TEST_REQUIRES,
@@ -68,6 +75,7 @@ extras_require = {
     "sglang": SGLANG_REQUIRES,
     "trl": TRL_REQUIRES,
     "mcore": MCORE_REQUIRES,
+    "videoalign": VIDEOALIGN_REQUIRES,
 }
 
 
