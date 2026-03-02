@@ -9,6 +9,8 @@ defaults:
 actor_rollout_ref:
   actor:
     disco: false
+  rollout:
+    mode: async
 
 trainer:
   pipelined_micro_batch: true

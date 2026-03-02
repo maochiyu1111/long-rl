@@ -184,10 +184,10 @@ class StableDiffusionRollout(BaseRollout):
                     raise ValueError(f"seed size {seed_tensor.numel()} does not match batch size {batch_size}")
                 sampling_kwargs["generator"] = _build_seed_generators(prompt_embeds.device, seed_tensor)
             else:
-                if _is_sync_mode(self.config):
-                    auto_seeds = torch.full((batch_size,), 42, dtype=torch.long, device=prompt_embeds.device)
-                else:
+                if _is_async_rollout_request(self.config, prompts):
                     auto_seeds = torch.arange(42, 42 + batch_size, dtype=torch.long, device=prompt_embeds.device)
+                else:
+                    auto_seeds = torch.full((batch_size,), 42, dtype=torch.long, device=prompt_embeds.device)
                 sampling_kwargs["generator"] = _build_seed_generators(prompt_embeds.device, auto_seeds)
 
         with torch.no_grad():
