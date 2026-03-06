@@ -1072,38 +1072,54 @@ class RayPPOTrainer:
         """
         Creates the train and validation dataloaders.
         """
-        # TODO: we have to make sure the batch size is divisible by the dp size
-        from verl.trainer.main_ppo import create_rl_dataset, create_rl_sampler
+        dance_case4_mode = self._is_dance_case4_enabled()
+        if dance_case4_mode:
+            from fastvideo.dataset.latent_rl_datasets import LatentDataset, latent_collate_function
 
-        if train_dataset is None:
-            train_dataset = create_rl_dataset(
-                self.config.data.train_files, self.config.data, self.tokenizer, self.processor
-            )
-        if val_dataset is None:
-            val_dataset = create_rl_dataset(
-                self.config.data.val_files, self.config.data, self.tokenizer, self.processor
-            )
+            data_json_path = self.config.data.get("data_json_path", None)
+            if data_json_path is None:
+                raise ValueError("dance_case4_mode=true requires `data.data_json_path`")
+            val_data_json_path = self.config.data.get("val_data_json_path", data_json_path)
+            num_latent_t = int(self.config.data.get("t", 1))
+            cfg_rate = float(self.config.data.get("cfg", 0.0))
+            train_dataset = LatentDataset(data_json_path, num_latent_t=num_latent_t, cfg_rate=cfg_rate)
+            val_dataset = LatentDataset(val_data_json_path, num_latent_t=num_latent_t, cfg_rate=cfg_rate)
+            train_sampler = None
+            collate_fn = latent_collate_function
+        else:
+            # TODO: we have to make sure the batch size is divisible by the dp size
+            from verl.trainer.main_ppo import create_rl_dataset, create_rl_sampler
+
+            if train_dataset is None:
+                train_dataset = create_rl_dataset(
+                    self.config.data.train_files, self.config.data, self.tokenizer, self.processor
+                )
+            if val_dataset is None:
+                val_dataset = create_rl_dataset(
+                    self.config.data.val_files, self.config.data, self.tokenizer, self.processor
+                )
+            if train_sampler is None:
+                train_sampler = create_rl_sampler(self.config.data, train_dataset)
+            if collate_fn is None:
+                from verl.utils.dataset.rl_dataset import collate_fn as default_collate_fn
+
+                collate_fn = default_collate_fn
+
         self.train_dataset, self.val_dataset = train_dataset, val_dataset
 
-        if train_sampler is None:
-            train_sampler = create_rl_sampler(self.config.data, self.train_dataset)
-        if collate_fn is None:
-            from verl.utils.dataset.rl_dataset import collate_fn as default_collate_fn
-
-            collate_fn = default_collate_fn
-
-        num_workers = self.config.data["dataloader_num_workers"]
+        num_workers = int(self.config.data.get("dataloader_num_workers", 0))
+        train_batch_size = int(self.config.data.get("gen_batch_size", self.config.data.get("train_batch_size", 1)))
 
         self.train_dataloader = StatefulDataLoader(
             dataset=self.train_dataset,
-            batch_size=self.config.data.gen_batch_size,
+            batch_size=train_batch_size,
             num_workers=num_workers,
             drop_last=True,
             collate_fn=collate_fn,
             sampler=train_sampler,
         )
 
-        val_batch_size = self.config.data.val_batch_size  # Prefer config value if set
+        val_batch_size = self.config.data.get("val_batch_size", None)  # Prefer config value if set
         if val_batch_size is None:
             val_batch_size = len(self.val_dataset)
 
@@ -1951,6 +1967,74 @@ class RayPPOTrainer:
         else:
             print(header)
 
+    def _is_dance_case4_enabled(self) -> bool:
+        return bool(self.config.actor_rollout_ref.actor.get("dance_case4_mode", False))
+
+    def _dance_case4_mismatch_reasons(self) -> list[str]:
+        reasons: list[str] = []
+        if not self.diffusion:
+            reasons.append("trainer.diffusion must be true")
+        if self.diffusion_disaggregate:
+            reasons.append("trainer.disaggregate must be false")
+        if bool(self.config.trainer.get("pipelined_micro_batch", False)):
+            reasons.append("trainer.pipelined_micro_batch must be false")
+        if bool(self.config.actor_rollout_ref.actor.get("disco", False)):
+            reasons.append("actor_rollout_ref.actor.disco must be false")
+
+        adv_estimator = str(self.config.algorithm.adv_estimator).lower()
+        if adv_estimator not in {"grpo", "advantageestimator.grpo"}:
+            reasons.append("algorithm.adv_estimator must be grpo")
+        return reasons
+
+    def _is_dance_case4_mode(self) -> bool:
+        return self._is_dance_case4_enabled() and len(self._dance_case4_mismatch_reasons()) == 0
+
+    def fit_dance_case4(self):
+        max_train_steps = self.config.trainer.get("max_train_steps", None)
+        if max_train_steps is None:
+            max_train_steps = self.total_training_steps
+        max_train_steps = int(max_train_steps)
+        if max_train_steps <= 0:
+            raise ValueError(f"Invalid max_train_steps for dance case4: {max_train_steps}")
+
+        self.global_steps = 0
+        data_iterator = iter(self.train_dataloader)
+        progress_bar = tqdm(total=max_train_steps, initial=self.global_steps, desc="Dance Case4")
+
+        while self.global_steps < max_train_steps:
+            try:
+                batch = next(data_iterator)
+            except StopIteration:
+                data_iterator = iter(self.train_dataloader)
+                batch = next(data_iterator)
+
+            if not isinstance(batch, (list, tuple)) or len(batch) != 3:
+                raise ValueError(
+                    "dance_case4_mode requires dataloader to return "
+                    "(encoder_hidden_states, encoder_attention_mask, caption)"
+                )
+
+            encoder_hidden_states, encoder_attention_mask, caption = batch
+            new_batch = DataProto.from_single_dict(
+                {
+                    "encoder_hidden_states": encoder_hidden_states,
+                    "encoder_attention_mask": encoder_attention_mask,
+                },
+                meta_info={"caption": caption},
+            )
+
+            rollout_batch = self.actor_rollout_wg.generate_sequences(new_batch)
+            actor_output = self.actor_rollout_wg.update_actor(rollout_batch)
+            actor_metrics = actor_output.meta_info.get("metrics", {}) if actor_output is not None else {}
+            if actor_metrics:
+                progress_bar.set_postfix({k: f"{v:.4f}" for k, v in actor_metrics.items() if isinstance(v, (int, float))})
+
+            self.global_steps += 1
+            progress_bar.update(1)
+
+        progress_bar.close()
+        return None
+
     def fit(self):
         """
         The training loop of PPO.
@@ -1959,6 +2043,16 @@ class RayPPOTrainer:
         The light-weight advantage computation is done on the driver process.
         """
         from omegaconf import OmegaConf
+
+        if self._is_dance_case4_enabled():
+            reasons = self._dance_case4_mismatch_reasons()
+            if reasons:
+                reason_text = "; ".join(reasons)
+                raise ValueError(
+                    f"dance_case4_mode=true but Case4 conditions are not met ({reason_text}). "
+                    "Expected: diffusion=true, disaggregate=false, pipelined_micro_batch=false, actor.disco=false, adv_estimator=grpo."
+                )
+            return self.fit_dance_case4()
 
         # from verl.utils.tracking import Tracking
 

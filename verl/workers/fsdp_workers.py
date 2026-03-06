@@ -17,6 +17,7 @@ The main entry point to run the PPO algorithm
 
 import json
 import logging
+import math
 import os
 import warnings
 from datetime import timedelta
@@ -716,6 +717,466 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             scheduler_path = os.path.join(local_model_path, "scheduler")
         return scheduler_path
 
+    def _is_dance_case4_enabled(self) -> bool:
+        return bool(self.config.actor.get("dance_case4_mode", False))
+
+    def _dance_case4_mismatch_reasons(self) -> list[str]:
+        reasons: list[str] = []
+        if not self.diffusion:
+            reasons.append("trainer.diffusion must be true")
+        if self.disaggregate:
+            reasons.append("trainer.disaggregate must be false")
+        if bool(self.config.actor.get("disco", False)):
+            reasons.append("actor.disco must be false")
+
+        trainer_pipelined = OmegaConf.select(self.config, "trainer.pipelined_micro_batch")
+        if trainer_pipelined is not None and bool(trainer_pipelined):
+            reasons.append("trainer.pipelined_micro_batch must be false")
+
+        adv_estimator = OmegaConf.select(self.config, "algorithm.adv_estimator")
+        if adv_estimator is not None and str(adv_estimator).lower() != "grpo":
+            reasons.append("algorithm.adv_estimator must be grpo")
+        return reasons
+
+    def _is_dance_case4_mode(self) -> bool:
+        return self._is_dance_case4_enabled() and len(self._dance_case4_mismatch_reasons()) == 0
+
+    def _build_model_optimizer_dance(self) -> None:
+        from accelerate.utils import set_seed
+        from diffusers.optimization import get_scheduler
+        from fastvideo.utils.fsdp_util import apply_fsdp_checkpointing, get_dit_fsdp_kwargs
+        from fastvideo.utils.load import load_transformer, load_vae
+
+        actor_extra = self.config.actor.get("extra", {})
+        dance_cfg = actor_extra.get("dance", {}) if hasattr(actor_extra, "get") else {}
+
+        def _cfg_get(cfg: Any, key: str, default: Any = None) -> Any:
+            if cfg is None:
+                return default
+            if hasattr(cfg, "get"):
+                val = cfg.get(key, default)
+            else:
+                val = getattr(cfg, key, default)
+            return default if val is None else val
+
+        seed = OmegaConf.select(self.config, "algorithm.seed")
+        if seed is not None:
+            set_seed(seed)
+
+        if self.rank == 0:
+            logger.info("[dance_case4] building dance actor/rollout worker for role=%s", self.role)
+
+        pretrained_model_name_or_path = _cfg_get(dance_cfg, "pretrained_model_name_or_path", self._get_local_model_path())
+        model_type = _cfg_get(dance_cfg, "model_type", "hunyuan_hf")
+        master_weight_type = _cfg_get(dance_cfg, "master_weight_type", "bf16")
+        sharding_strategy = _cfg_get(dance_cfg, "fsdp_sharding_strategy", "full")
+        use_cpu_offload = bool(_cfg_get(dance_cfg, "use_cpu_offload", False))
+
+        self.inferencer = None
+        if self.role in ["actor_rollout_ref", "rollout_ref", "actor_rollout"]:
+            use_videoalign = bool(_cfg_get(dance_cfg, "use_videoalign", False))
+            if use_videoalign:
+                from fastvideo.models.videoalign.inference import VideoVLMRewardInference
+
+                ckpt_path = _cfg_get(dance_cfg, "videoalign_ckpt_path", "/workspace/DanceGRPO/videoalign_ckpt")
+                self.inferencer = VideoVLMRewardInference(
+                    load_from_pretrained=ckpt_path,
+                    device=torch.device(get_device_name(), get_device_id()),
+                    dtype=torch.bfloat16,
+                )
+
+        transformer = load_transformer(
+            model_type=model_type,
+            dit_model_name_or_path=None,
+            pretrained_model_name_or_path=pretrained_model_name_or_path,
+            master_weight_type=torch.float32 if master_weight_type == "fp32" else torch.bfloat16,
+        )
+        fsdp_kwargs, no_split_modules = get_dit_fsdp_kwargs(
+            transformer=transformer,
+            sharding_strategy=sharding_strategy,
+            use_lora=False,
+            cpu_offload=use_cpu_offload,
+            master_weight_type=master_weight_type,
+        )
+        self.transformer = FSDP(transformer, **fsdp_kwargs)
+
+        gradient_checkpointing = bool(
+            self.config.model.get("enable_gradient_checkpointing", False)
+            or actor_extra.get("gradient_checkpointing", False)
+        )
+        if gradient_checkpointing:
+            selective_checkpointing = actor_extra.get("selective_checkpointing", 1.0)
+            apply_fsdp_checkpointing(transformer, no_split_modules, selective_checkpointing)
+
+        self.transformer.train()
+        params_to_optimize = [p for p in self.transformer.parameters() if p.requires_grad]
+        self.optimizer = torch.optim.AdamW(
+            params_to_optimize,
+            lr=float(self.config.actor.optim.lr),
+            betas=(0.9, 0.999),
+            weight_decay=float(self.config.actor.optim.weight_decay),
+            eps=1e-8,
+        )
+        self.lr_scheduler = get_scheduler(
+            name=self.config.actor.optim.get("warmup_style", "constant"),
+            optimizer=self.optimizer,
+            num_warmup_steps=max(0, int(self.config.actor.optim.get("lr_warmup_steps", 0))),
+            num_training_steps=max(1, int(self.config.actor.optim.get("total_training_steps", 1_000_000))),
+            num_cycles=float(self.config.actor.optim.get("num_cycles", 0.5)),
+            power=float(self.config.actor.optim.get("power", 1.0)),
+            last_epoch=-1,
+        )
+
+        vae_model_path = _cfg_get(dance_cfg, "vae_model_path", pretrained_model_name_or_path)
+        self.vae, _, fps = load_vae(model_type, vae_model_path)
+        self.rollout_fps = int(_cfg_get(self.config.rollout, "fps", fps))
+
+    def _generate_sequences_dance(self, prompts: DataProto) -> DataProto:
+        from diffusers.video_processor import VideoProcessor
+        from diffusers.utils import export_to_video
+
+        actor_extra = self.config.actor.get("extra", {})
+        dance_cfg = actor_extra.get("dance", {}) if hasattr(actor_extra, "get") else {}
+        use_videoalign = bool(dance_cfg.get("use_videoalign", False))
+        device = torch.device(get_device_name(), get_device_id())
+
+        encoder_hidden_states = prompts.batch["encoder_hidden_states"].to(device)
+        encoder_attention_mask = prompts.batch["encoder_attention_mask"].to(device)
+        caption = prompts.meta_info.get("caption")
+
+        if self.config.rollout.get("use_group", False):
+            encoder_hidden_states = torch.repeat_interleave(
+                encoder_hidden_states, self.config.rollout.num_generations, dim=0
+            )
+            encoder_attention_mask = torch.repeat_interleave(
+                encoder_attention_mask, self.config.rollout.num_generations, dim=0
+            )
+            if isinstance(caption, str):
+                caption = [caption] * self.config.rollout.num_generations
+            elif isinstance(caption, (list, tuple)):
+                caption = [item for item in list(caption) for _ in range(self.config.rollout.num_generations)]
+            else:
+                raise ValueError(f"Unsupported caption type for dance case4: {type(caption)}")
+        elif isinstance(caption, str):
+            caption = [caption]
+        elif isinstance(caption, tuple):
+            caption = list(caption)
+
+        def sd3_time_shift(shift: float, t: torch.Tensor) -> torch.Tensor:
+            return (shift * t) / (1 + (shift - 1) * t)
+
+        def flux_step(
+            model_output: torch.Tensor,
+            latents: torch.Tensor,
+            eta: float,
+            sigmas: torch.Tensor,
+            index: int,
+            prev_sample: torch.Tensor | None,
+            grpo: bool,
+            sde_solver: bool,
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+            sigma = sigmas[index]
+            dsigma = sigmas[index + 1] - sigma
+            prev_sample_mean = latents + dsigma * model_output
+            pred_original_sample = latents - sigma * model_output
+            delta_t = sigma - sigmas[index + 1]
+            std_dev_t = eta * math.sqrt(float(delta_t))
+            if sde_solver:
+                score_estimate = -(latents - pred_original_sample * (1 - sigma)) / sigma**2
+                log_term = -0.5 * eta**2 * score_estimate
+                prev_sample_mean = prev_sample_mean + log_term * dsigma
+            if grpo and prev_sample is None:
+                prev_sample = prev_sample_mean + torch.randn_like(prev_sample_mean) * std_dev_t
+            if not grpo:
+                raise ValueError("dance case4 rollout expects GRPO mode")
+            log_prob = (
+                -((prev_sample.detach().to(torch.float32) - prev_sample_mean.to(torch.float32)) ** 2)
+                / (2 * (std_dev_t**2))
+            ) - math.log(std_dev_t) - torch.log(torch.sqrt(2 * torch.as_tensor(math.pi)))
+            log_prob = log_prob.mean(dim=tuple(range(1, log_prob.ndim)))
+            return prev_sample, pred_original_sample, log_prob
+
+        w = int(self.config.rollout.width)
+        h = int(self.config.rollout.height)
+        t = int(self.config.rollout.num_frames)
+        sample_steps = int(self.config.rollout.sampling_steps)
+        sigma_schedule = sd3_time_shift(
+            float(self.config.rollout.shift), torch.linspace(1, 0, sample_steps + 1, device=encoder_hidden_states.device)
+        )
+
+        spatial_downsample = 8
+        temporal_downsample = 4
+        in_channels = 16
+        latent_t = ((t - 1) // temporal_downsample) + 1
+        latent_w, latent_h = w // spatial_downsample, h // spatial_downsample
+
+        all_latents: list[torch.Tensor] = []
+        all_log_probs: list[torch.Tensor] = []
+        all_vq_rewards: list[torch.Tensor] = []
+        all_mq_rewards: list[torch.Tensor] = []
+        os.makedirs("./videos", exist_ok=True)
+
+        batch_indices = torch.chunk(torch.arange(encoder_hidden_states.shape[0], device=encoder_hidden_states.device), encoder_hidden_states.shape[0])
+        shared_noise = None
+        if self.config.rollout.get("use_same_noise", False):
+            shared_noise = torch.randn(
+                (1, in_channels, latent_t, latent_h, latent_w),
+                device=encoder_hidden_states.device,
+                dtype=torch.bfloat16,
+            )
+
+        for index, batch_idx in enumerate(batch_indices):
+            batch_encoder_hidden_states = encoder_hidden_states[batch_idx]
+            batch_encoder_attention_mask = encoder_attention_mask[batch_idx]
+            batch_caption = [caption[int(i.item())] for i in batch_idx] if caption is not None else [""]
+
+            if shared_noise is not None:
+                input_latents = shared_noise.repeat(len(batch_idx), 1, 1, 1, 1)
+            else:
+                input_latents = torch.randn(
+                    (len(batch_idx), in_channels, latent_t, latent_h, latent_w),
+                    device=encoder_hidden_states.device,
+                    dtype=torch.bfloat16,
+                )
+
+            with torch.no_grad():
+                z = input_latents.clone()
+                latents_path = [z]
+                log_probs_path = []
+                for i in range(sample_steps):
+                    sigma = sigma_schedule[i]
+                    timestep_value = int(float(sigma) * 1000)
+                    timesteps = torch.full([batch_encoder_hidden_states.shape[0]], timestep_value, device=z.device, dtype=torch.long)
+                    self.transformer.eval()
+                    with torch.autocast("cuda", torch.bfloat16):
+                        model_pred = self.transformer(
+                            hidden_states=z,
+                            encoder_hidden_states=batch_encoder_hidden_states,
+                            timestep=timesteps,
+                            guidance=torch.tensor([6018.0], device=z.device, dtype=torch.bfloat16),
+                            encoder_attention_mask=batch_encoder_attention_mask,
+                            return_dict=False,
+                        )[0]
+                    z, pred_original, log_prob = flux_step(
+                        model_output=model_pred,
+                        latents=z.to(torch.float32),
+                        eta=float(self.config.rollout.eta),
+                        sigmas=sigma_schedule,
+                        index=i,
+                        prev_sample=None,
+                        grpo=True,
+                        sde_solver=True,
+                    )
+                    z = z.to(torch.bfloat16)
+                    latents_path.append(z)
+                    log_probs_path.append(log_prob)
+                latents = pred_original.to(torch.float32) / 0.476986
+
+            batch_latents = torch.stack(latents_path, dim=1)
+            batch_log_probs = torch.stack(log_probs_path, dim=1)
+            all_latents.append(batch_latents)
+            all_log_probs.append(batch_log_probs)
+
+            self.vae.enable_tiling()
+            video_processor = VideoProcessor(vae_scale_factor=8)
+            with torch.inference_mode():
+                with torch.autocast("cuda", dtype=torch.bfloat16):
+                    video = self.vae.decode(latents, return_dict=False)[0]
+                    videos = video_processor.postprocess_video(video)
+
+            rank = int(os.environ.get("RANK", 0))
+            video_path = os.path.abspath(f"./videos/hunyuan_{rank}_{index}.mp4")
+            export_to_video(videos[0], video_path, fps=self.rollout_fps)
+
+            vq_reward = torch.tensor(-1.0, device=encoder_hidden_states.device)
+            mq_reward = torch.tensor(-1.0, device=encoder_hidden_states.device)
+            if use_videoalign and self.inferencer is not None:
+                try:
+                    with torch.no_grad():
+                        reward = self.inferencer.reward([video_path], [batch_caption[0]], use_norm=True)
+                    vq_reward = torch.tensor(reward[0]["VQ"], device=encoder_hidden_states.device)
+                    mq_reward = torch.tensor(reward[0]["MQ"], device=encoder_hidden_states.device)
+                except Exception:
+                    logger.exception("[dance_case4] videoalign reward failed, fallback to -1 reward")
+            all_vq_rewards.append(vq_reward.unsqueeze(0))
+            all_mq_rewards.append(mq_reward.unsqueeze(0))
+
+        all_latents = torch.cat(all_latents, dim=0)
+        all_log_probs = torch.cat(all_log_probs, dim=0)
+        all_vq_rewards = torch.cat(all_vq_rewards, dim=0)
+        all_mq_rewards = torch.cat(all_mq_rewards, dim=0)
+
+        batch_size = all_latents.shape[0]
+        timestep_value = [int(float(sigma) * 1000) for sigma in sigma_schedule][:sample_steps]
+        timesteps = torch.tensor([timestep_value[:] for _ in range(batch_size)], device=all_latents.device, dtype=torch.long)
+
+        samples = {
+            "timesteps": timesteps.detach().clone()[:, :-1],
+            "latents": all_latents[:, :-1][:, :-1],
+            "next_latents": all_latents[:, 1:][:, :-1],
+            "log_probs": all_log_probs[:, :-1],
+            "vq_rewards": all_vq_rewards.to(torch.float32),
+            "mq_rewards": all_mq_rewards.to(torch.float32),
+            "encoder_hidden_states": encoder_hidden_states,
+            "encoder_attention_mask": encoder_attention_mask,
+        }
+        return DataProto.from_dict(
+            tensors=samples,
+            meta_info={"sigma_schedule": sigma_schedule.detach().cpu().numpy()},
+        ).to("cpu")
+
+    def _update_actor_dance(self, data: DataProto) -> DataProto:
+        device = torch.device(get_device_name(), get_device_id())
+        samples = {k: data.batch[k].to(device) for k in data.batch.keys()}
+        sigma_schedule = torch.as_tensor(data.meta_info["sigma_schedule"], device=device, dtype=torch.float32)
+        self.optimizer.zero_grad()
+
+        def flux_step(
+            model_output: torch.Tensor,
+            latents: torch.Tensor,
+            eta: float,
+            sigmas: torch.Tensor,
+            index: int,
+            prev_sample: torch.Tensor,
+            grpo: bool,
+            sde_solver: bool,
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+            sigma = sigmas[index]
+            dsigma = sigmas[index + 1] - sigma
+            prev_sample_mean = latents + dsigma * model_output
+            pred_original_sample = latents - sigma * model_output
+            delta_t = sigma - sigmas[index + 1]
+            std_dev_t = eta * math.sqrt(float(delta_t))
+
+            if sde_solver:
+                score_estimate = -(latents - pred_original_sample * (1 - sigma)) / sigma**2
+                log_term = -0.5 * eta**2 * score_estimate
+                prev_sample_mean = prev_sample_mean + log_term * dsigma
+
+            if grpo and prev_sample is None:
+                prev_sample = prev_sample_mean + torch.randn_like(prev_sample_mean) * std_dev_t
+            if not grpo:
+                raise ValueError("dance case4 update expects GRPO mode")
+
+            log_prob = (
+                -((prev_sample.detach().to(torch.float32) - prev_sample_mean.to(torch.float32)) ** 2)
+                / (2 * (std_dev_t**2))
+            ) - math.log(std_dev_t) - torch.log(torch.sqrt(2 * torch.as_tensor(math.pi)))
+            log_prob = log_prob.mean(dim=tuple(range(1, log_prob.ndim)))
+            return prev_sample, pred_original_sample, log_prob
+
+        def grpo_one_step(
+            latents: torch.Tensor,
+            pre_latents: torch.Tensor,
+            encoder_hidden_states: torch.Tensor,
+            encoder_attention_mask: torch.Tensor,
+            timesteps: torch.Tensor,
+            idx: int,
+        ) -> torch.Tensor:
+            with torch.autocast("cuda", torch.bfloat16):
+                self.transformer.train()
+                model_pred = self.transformer(
+                    hidden_states=latents,
+                    encoder_hidden_states=encoder_hidden_states,
+                    timestep=timesteps,
+                    guidance=torch.tensor([6018.0], device=latents.device, dtype=torch.bfloat16),
+                    encoder_attention_mask=encoder_attention_mask,
+                    return_dict=False,
+                )[0]
+            _, _, log_prob = flux_step(
+                model_output=model_pred,
+                latents=latents.to(torch.float32),
+                eta=float(self.config.rollout.eta),
+                sigmas=sigma_schedule,
+                index=idx,
+                prev_sample=pre_latents.to(torch.float32),
+                grpo=True,
+                sde_solver=True,
+            )
+            return log_prob
+
+        num_generations = int(self.config.rollout.num_generations)
+        n_groups = len(samples["vq_rewards"]) // max(1, num_generations)
+        vq_advantages = torch.zeros_like(samples["vq_rewards"])
+        mq_advantages = torch.zeros_like(samples["mq_rewards"])
+        for i in range(n_groups):
+            start_idx = i * num_generations
+            end_idx = (i + 1) * num_generations
+            group_vq = samples["vq_rewards"][start_idx:end_idx]
+            vq_advantages[start_idx:end_idx] = (group_vq - group_vq.mean()) / (group_vq.std() + 1e-8)
+            group_mq = samples["mq_rewards"][start_idx:end_idx]
+            mq_advantages[start_idx:end_idx] = (group_mq - group_mq.mean()) / (group_mq.std() + 1e-8)
+        samples["vq_advantages"] = vq_advantages
+        samples["mq_advantages"] = mq_advantages
+
+        total_scores = self.config.rollout.vq_coef * vq_advantages + self.config.rollout.mq_coef * mq_advantages
+        batch_size = int(samples["timesteps"].shape[0])
+        bestofn = int(self.config.rollout.bestofn)
+        if num_generations != bestofn and bestofn > 0 and bestofn <= batch_size:
+            sorted_indices = torch.argsort(total_scores)
+            top_indices = sorted_indices[-bestofn // 2 :]
+            bottom_indices = sorted_indices[: bestofn // 2]
+            selected_indices = torch.cat([top_indices, bottom_indices])
+            selected_indices = selected_indices[torch.randperm(len(selected_indices), device=selected_indices.device)]
+            for key in list(samples.keys()):
+                samples[key] = samples[key][selected_indices]
+            batch_size = len(selected_indices)
+
+        perms = torch.stack(
+            [torch.randperm(samples["timesteps"].shape[1], device=samples["timesteps"].device) for _ in range(batch_size)]
+        )
+        for key in ["timesteps", "latents", "next_latents", "log_probs"]:
+            samples[key] = samples[key][torch.arange(batch_size, device=samples[key].device)[:, None], perms]
+
+        samples_batched = {k: v.unsqueeze(1) for k, v in samples.items()}
+        samples_batched_list = [dict(zip(samples_batched, values)) for values in zip(*samples_batched.values())]
+
+        dance_cfg = self.config.actor.get("extra", {}).get("dance", {})
+        timestep_fraction = float(dance_cfg.get("timestep_fraction", 1.0))
+        train_timesteps = int(samples["timesteps"].shape[1] * timestep_fraction)
+        train_timesteps = max(1, train_timesteps)
+        avg_loss = torch.tensor(0.0, device=device)
+        for i, sample in enumerate(samples_batched_list):
+            for step_idx in range(train_timesteps):
+                new_log_probs = grpo_one_step(
+                    latents=sample["latents"][:, step_idx],
+                    pre_latents=sample["next_latents"][:, step_idx],
+                    encoder_hidden_states=sample["encoder_hidden_states"],
+                    encoder_attention_mask=sample["encoder_attention_mask"],
+                    timesteps=sample["timesteps"][:, step_idx],
+                    idx=int(perms[i][step_idx].item()),
+                )
+
+                ratio = torch.exp(new_log_probs - sample["log_probs"][:, step_idx])
+                clip_range = 1e-4
+                adv_clip_max = 5.0
+
+                vq_adv = torch.clamp(sample["vq_advantages"], -adv_clip_max, adv_clip_max)
+                mq_adv = torch.clamp(sample["mq_advantages"], -adv_clip_max, adv_clip_max)
+
+                vq_unclipped = -vq_adv * ratio
+                vq_clipped = -vq_adv * torch.clamp(ratio, 1.0 - clip_range, 1.0 + clip_range)
+                vq_loss = torch.mean(torch.maximum(vq_unclipped, vq_clipped))
+
+                mq_unclipped = -mq_adv * ratio
+                mq_clipped = -mq_adv * torch.clamp(ratio, 1.0 - clip_range, 1.0 + clip_range)
+                mq_loss = torch.mean(torch.maximum(mq_unclipped, mq_clipped))
+
+                final_loss = (
+                    self.config.rollout.vq_coef * vq_loss + self.config.rollout.mq_coef * mq_loss
+                ) / (max(1, int(self.config.actor.get("gradient_accumulation_steps", 1))) * train_timesteps)
+                final_loss.backward()
+                avg_loss = final_loss.detach()
+
+            max_grad_norm = float(self.config.actor.get("max_grad_norm", 1.0))
+            self.transformer.clip_grad_norm_(max_grad_norm)
+            self.optimizer.step()
+            self.lr_scheduler.step()
+            self.optimizer.zero_grad()
+
+        output = DataProto(meta_info={"metrics": {"actor/loss": float(avg_loss.item())}})
+        return output.to("cpu")
+
     def _build_model_optimizer(
         self,
         model_path,
@@ -1295,6 +1756,14 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         # This is used to import external_lib into the huggingface systems
         import_external_libs(self.config.model.get("external_lib", None))
 
+        if self._is_dance_case4_enabled():
+            reasons = self._dance_case4_mismatch_reasons()
+            if reasons:
+                reason_text = "; ".join(reasons)
+                raise ValueError(f"[dance_case4] dance_case4_mode=true but case4 conditions are not met: {reason_text}")
+            self._build_model_optimizer_dance()
+            return
+
         override_model_config = OmegaConf.to_container(OmegaConf.create(self.config.model.get("override_config", {})))
         use_remove_padding = self.config.model.get("use_remove_padding", False)
         use_shm = self.config.model.get("use_shm", False)
@@ -1419,6 +1888,12 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         # Support all hardwares
         data = data.to(get_device_id())
 
+        if self._is_dance_case4_enabled() and not self._is_dance_case4_mode():
+            reasons = "; ".join(self._dance_case4_mismatch_reasons())
+            raise ValueError(f"[dance_case4] worker update_actor rejected due to case4 condition mismatch: {reasons}")
+        if self._is_dance_case4_mode():
+            return self._update_actor_dance(data)
+
         assert self._is_actor
         if self._is_offload_param:
             load_fsdp_model_to_gpu(self.actor_module_fsdp)
@@ -1466,6 +1941,12 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     def generate_sequences(self, prompts: DataProto):
         # Support all hardwares
         prompts = prompts.to(get_device_id())
+
+        if self._is_dance_case4_enabled() and not self._is_dance_case4_mode():
+            reasons = "; ".join(self._dance_case4_mismatch_reasons())
+            raise ValueError(f"[dance_case4] worker generate_sequences rejected due to case4 condition mismatch: {reasons}")
+        if self._is_dance_case4_mode():
+            return self._generate_sequences_dance(prompts)
 
         assert self._is_rollout
 

@@ -299,12 +299,19 @@ class TaskRunner:
         )
         resource_pool_manager = ResourcePoolManager(resource_pool_spec=resource_pool_spec, mapping=mapping)
 
-        from verl.utils.dataset.rl_dataset import collate_fn
+        dance_case4_mode = bool(config.actor_rollout_ref.actor.get("dance_case4_mode", False))
+        if dance_case4_mode:
+            collate_fn = None
+            train_dataset = None
+            val_dataset = None
+            train_sampler = None
+        else:
+            from verl.utils.dataset.rl_dataset import collate_fn
 
-        # Create training and validation datasets.
-        train_dataset = create_rl_dataset(config.data.train_files, config.data, tokenizer, processor, is_train=True)
-        val_dataset = create_rl_dataset(config.data.val_files, config.data, tokenizer, processor, is_train=False)
-        train_sampler = create_rl_sampler(config.data, train_dataset)
+            # Create training and validation datasets.
+            train_dataset = create_rl_dataset(config.data.train_files, config.data, tokenizer, processor, is_train=True)
+            val_dataset = create_rl_dataset(config.data.val_files, config.data, tokenizer, processor, is_train=False)
+            train_sampler = create_rl_sampler(config.data, train_dataset)
 
         # Initialize the PPO trainer.
         trainer = RayPPOTrainer(

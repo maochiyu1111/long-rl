@@ -1,0 +1,105 @@
+hydra:
+  searchpath:
+    - file://verl/trainer/config
+
+defaults:
+  - ppo_trainer
+  - _self_
+
+data:
+  train_files: null
+  val_files: null
+  train_batch_size: 1
+  gen_batch_size: 1
+  val_batch_size: 1
+  dataloader_num_workers: 0
+  data_json_path: /workspace/DanceGRPO/data/rl_embeddings/videos2caption.json
+  val_data_json_path: ${data.data_json_path}
+  t: 28
+  cfg: 0.0
+
+algorithm:
+  adv_estimator: grpo
+  use_kl_in_reward: false
+
+critic:
+  enable: false
+
+reward_model:
+  enable: false
+
+actor_rollout_ref:
+  model:
+    path: /workspace/DanceGRPO/hunyuan
+    trust_remote_code: false
+    use_remove_padding: true
+    enable_gradient_checkpointing: true
+  actor:
+    strategy: fsdp
+    ppo_mini_batch_size: 1
+    ppo_micro_batch_size_per_gpu: 1
+    use_kl_loss: false
+    disco: false
+    dance_case4_mode: true
+    extra:
+      diffusion: true
+      gradient_checkpointing: true
+      dance:
+        pretrained_model_name_or_path: /workspace/DanceGRPO/hunyuan
+        vae_model_path: /workspace/DanceGRPO/hunyuan
+        model_type: hunyuan_hf
+        master_weight_type: fp32
+        use_videoalign: true
+        videoalign_ckpt_path: /workspace/DanceGRPO/videoalign_ckpt
+        timestep_fraction: 0.5
+        fsdp_sharding_strategy: full
+    fsdp_config:
+      param_offload: false
+      optimizer_offload: false
+    optim:
+      lr: 1.0e-6
+      weight_decay: 1.0e-2
+      warmup_style: constant
+      lr_warmup_steps: 0
+  rollout:
+    name: diffusion
+    do_sample: true
+    n: 1
+    log_prob_micro_batch_size_per_gpu: 1
+    guidance_scale: 4.5
+    num_steps: 28
+    num_frames: 33
+    height: 256
+    width: 256
+    sampling_steps: 28
+    shift: 5.0
+    eta: 1.0
+    fps: 24
+    num_generations: 4
+    use_group: true
+    use_same_noise: false
+    bestofn: 4
+    vq_coef: 0.5
+    mq_coef: 0.5
+  ref:
+    diffusion: true
+    fsdp_config:
+      param_offload: false
+    log_prob_micro_batch_size_per_gpu: 1
+
+trainer:
+  total_epochs: 1
+  total_training_steps: null
+  max_train_steps: 1
+  project_name: dance_case4
+  experiment_name: case4_dance
+  logger: ["console"]
+  nnodes: 1
+  n_gpus_per_node: 8
+  test_freq: -1
+  val_freq: -1
+  val_before_train: false
+  save_freq: -1
+  diffusion: true
+  disaggregate: false
+  pipelined_micro_batch: false
