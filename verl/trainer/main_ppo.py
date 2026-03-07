@@ -40,6 +40,34 @@ def main(config):
     run_ppo(config)
 
 
+def _is_dance_case4_enabled(config) -> bool:
+    actor_config = getattr(config.actor_rollout_ref, "actor", {})
+    return bool(actor_config.get("dance_case4_mode", False))
+
+
+def _build_tokenizer_and_processor(config):
+    """Create text components for standard PPO paths.
+
+    Dance Case4 consumes latent tensors directly, so forcing the generic diffusion
+    tokenizer/processor initialization here only blocks the dedicated hard-fork
+    path before trainer-side fail-fast checks can run.
+    """
+    if _is_dance_case4_enabled(config):
+        return None, None
+
+    from verl.utils import hf_processor, hf_tokenizer
+    from verl.utils.fs import copy_to_local
+
+    local_path = copy_to_local(
+        config.actor_rollout_ref.model.path, use_shm=config.actor_rollout_ref.model.get("use_shm", False)
+    )
+    trust_remote_code = config.data.get("trust_remote_code", False)
+    diffusion_enabled = bool(config.trainer.get("diffusion", False))
+    tokenizer = hf_tokenizer(local_path, trust_remote_code=trust_remote_code, diffusion=diffusion_enabled)
+    processor = hf_processor(local_path, trust_remote_code=trust_remote_code, use_fast=True, diffusion=diffusion_enabled)
+    return tokenizer, processor
+
+
 # Define a function to run the PPO-like training process
 def run_ppo(config) -> None:
     """Initialize Ray cluster and run distributed PPO training process.
@@ -106,28 +134,11 @@ class TaskRunner:
 
         from omegaconf import OmegaConf
 
-        from verl.utils.fs import copy_to_local
-
         print(f"TaskRunner hostname: {socket.gethostname()}, PID: {os.getpid()}")
         pprint(OmegaConf.to_container(config, resolve=True))
         OmegaConf.resolve(config)
 
-        # Download the checkpoint from HDFS to the local machine.
-        # `use_shm` determines whether to use shared memory, which could lead to faster model loading if turned on
-        local_path = copy_to_local(
-            config.actor_rollout_ref.model.path, use_shm=config.actor_rollout_ref.model.get("use_shm", False)
-        )
-
-        # Instantiate the tokenizer and processor.
-        from verl.utils import hf_processor, hf_tokenizer
-
-        trust_remote_code = config.data.get("trust_remote_code", False)
-        diffusion_enabled = bool(config.trainer.get("diffusion", False))
-        tokenizer = hf_tokenizer(local_path, trust_remote_code=trust_remote_code, diffusion=diffusion_enabled)
-        # Used for multimodal LLM, could be None
-        processor = hf_processor(
-            local_path, trust_remote_code=trust_remote_code, use_fast=True, diffusion=diffusion_enabled
-        )
+        tokenizer, processor = _build_tokenizer_and_processor(config)
 
         # Define worker classes based on the actor strategy.
         if config.actor_rollout_ref.actor.strategy in {"fsdp", "fsdp2"}:
@@ -299,7 +310,7 @@ class TaskRunner:
         )
         resource_pool_manager = ResourcePoolManager(resource_pool_spec=resource_pool_spec, mapping=mapping)
 
-        dance_case4_mode = bool(config.actor_rollout_ref.actor.get("dance_case4_mode", False))
+        dance_case4_mode = _is_dance_case4_enabled(config)
         if dance_case4_mode:
             collate_fn = None
             train_dataset = None

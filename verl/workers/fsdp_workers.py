@@ -741,6 +741,12 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     def _is_dance_case4_mode(self) -> bool:
         return self._is_dance_case4_enabled() and len(self._dance_case4_mismatch_reasons()) == 0
 
+    def _get_dance_case4_grad_clip(self) -> float:
+        grad_clip = self.config.actor.get("grad_clip", None)
+        if grad_clip is None:
+            grad_clip = self.config.actor.get("max_grad_norm", 1.0)
+        return float(grad_clip)
+
     def _build_model_optimizer_dance(self) -> None:
         from accelerate.utils import set_seed
         from diffusers.optimization import get_scheduler
@@ -1168,8 +1174,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 final_loss.backward()
                 avg_loss = final_loss.detach()
 
-            max_grad_norm = float(self.config.actor.get("max_grad_norm", 1.0))
-            self.transformer.clip_grad_norm_(max_grad_norm)
+            self.transformer.clip_grad_norm_(self._get_dance_case4_grad_clip())
             self.optimizer.step()
             self.lr_scheduler.step()
             self.optimizer.zero_grad()

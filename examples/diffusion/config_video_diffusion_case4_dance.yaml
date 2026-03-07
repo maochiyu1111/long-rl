@@ -9,8 +9,8 @@ defaults:
 data:
   train_files: null
   val_files: null
-  train_batch_size: 1
-  gen_batch_size: 1
+  train_batch_size: 8
+  gen_batch_size: 8
   val_batch_size: 1
   dataloader_num_workers: 0
   data_json_path: /workspace/DanceGRPO/data/rl_embeddings/videos2caption.json
