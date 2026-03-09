@@ -301,16 +301,20 @@ class TaskRunner:
                 mapping[Role.EncoderRef] = ref_encoder_id
                 mapping[Role.LLMRef] = ref_llm_id
 
-        # Load the reward manager for training and validation.
-        reward_fn = load_reward_manager(
-            config, tokenizer, num_examine=0, **config.reward_model.get("reward_kwargs", {})
-        )
-        val_reward_fn = load_reward_manager(
-            config, tokenizer, num_examine=1, **config.reward_model.get("reward_kwargs", {})
-        )
+        dance_case4_mode = _is_dance_case4_enabled(config)
+        if dance_case4_mode:
+            reward_fn = None
+            val_reward_fn = None
+        else:
+            # Load the reward manager for training and validation.
+            reward_fn = load_reward_manager(
+                config, tokenizer, num_examine=0, **config.reward_model.get("reward_kwargs", {})
+            )
+            val_reward_fn = load_reward_manager(
+                config, tokenizer, num_examine=1, **config.reward_model.get("reward_kwargs", {})
+            )
         resource_pool_manager = ResourcePoolManager(resource_pool_spec=resource_pool_spec, mapping=mapping)
 
-        dance_case4_mode = _is_dance_case4_enabled(config)
         if dance_case4_mode:
             collate_fn = None
             train_dataset = None

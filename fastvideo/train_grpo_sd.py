@@ -274,7 +274,7 @@ def main(_):
             model_dict = {}
             model, preprocess_train, preprocess_val = create_model_and_transforms(
                 'ViT-H-14',
-                './hps_ckpt/open_clip_pytorch_model.bin',
+                '/share/models/dancegrpo/hps_ckpt/open_clip_pytorch_model.bin',
                 precision='amp',
                 device=device,
                 jit=False,
@@ -298,7 +298,7 @@ def main(_):
         model = model_dict['model']
         preprocess_val = model_dict['preprocess_val']
         #cp = huggingface_hub.hf_hub_download("xswu/HPSv2", hps_version_map["v2.1"])
-        cp = "./hps_ckpt/HPS_v2.1_compressed.pt"
+        cp = "/share/models/dancegrpo/hps_ckpt/HPS_v2.1_compressed.pt"
 
         checkpoint = torch.load(cp, map_location=f'cuda')
         model.load_state_dict(checkpoint['state_dict'])
@@ -732,4 +732,3 @@ def main(_):
 
 if __name__ == "__main__":
     app.run(main)
-

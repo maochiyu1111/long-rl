@@ -580,7 +580,7 @@ def main(args):
     # as these weights are only used for inference, keeping weights in full precision is not required.
     if args.use_videoalign:
         from fastvideo.models.videoalign.inference import VideoVLMRewardInference
-        load_from_pretrained = "./videoalign_ckpt"
+        load_from_pretrained = "/share/models/dancegrpo/videoalign_ckpt"
         dtype = torch.bfloat16
         inferencer = VideoVLMRewardInference(load_from_pretrained, device=f'cuda:{device}', dtype=dtype)
         
@@ -628,7 +628,7 @@ def main(args):
     transformer.train()
 
     pipe_flux = FluxPipeline.from_pretrained(
-        "./data/flux",
+        "/share/models/dancegrpo/flux",
         torch_dtype=torch.bfloat16
     ).to(device)
     '''

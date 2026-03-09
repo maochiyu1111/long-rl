@@ -1,4 +1,4 @@
-# Case 4（long-rl）：`disaggregate=false`、`pipelined_micro_batch=false`、`disco=false` 时 DanceGRPO 调用链
+# Case 4（long-rl）：`disaggregate=false`、`pipelined_micro_batch=false` 时 DanceGRPO 调用链
 
 ## 1. 总结（先回答你最关心的 3 点）
 
@@ -23,9 +23,10 @@
 
 - `main_ppo.py` 读取：
   - `fit_disaggregate = trainer.disaggregate`
-  - `actor_disco = actor.disco`
   - `pipelined_micro_batch = trainer.pipelined_micro_batch`  
   见 `verl/trainer/main_ppo.py:177-184`。
+
+- `actor.disco` 旧键已删除；当前代码不再使用这个配置项。
 
 - 当 `fit_disaggregate=false`（即你这个 case）：
   - `trainer.init_workers()`

@@ -9,12 +9,11 @@ defaults:
 data:
   train_files: null
   val_files: null
-  train_batch_size: 8
-  gen_batch_size: 8
+  train_batch_size: 16
+  gen_batch_size: 16
   val_batch_size: 1
   dataloader_num_workers: 0
-  data_json_path: /workspace/DanceGRPO/data/rl_embeddings/videos2caption.json
-  val_data_json_path: ${data.data_json_path}
+  data_json_path: /workspace/projetcs/long-rl/rl_embeddings/videos2caption.json
   t: 28
   cfg: 0.0
 
@@ -30,27 +29,26 @@ reward_model:
 
 actor_rollout_ref:
   model:
-    path: /workspace/DanceGRPO/hunyuan
+    path: /share/models/dancegrpo/HunyuanVideo
     trust_remote_code: false
     use_remove_padding: true
     enable_gradient_checkpointing: true
   actor:
     strategy: fsdp
-    ppo_mini_batch_size: 1
+    ppo_mini_batch_size: 16
     ppo_micro_batch_size_per_gpu: 1
     use_kl_loss: false
-    disco: false
     dance_case4_mode: true
     extra:
       diffusion: true
       gradient_checkpointing: true
       dance:
-        pretrained_model_name_or_path: /workspace/DanceGRPO/hunyuan
-        vae_model_path: /workspace/DanceGRPO/hunyuan
+        pretrained_model_name_or_path: /share/models/dancegrpo/HunyuanVideo
+        vae_model_path: /share/models/dancegrpo/HunyuanVideo
         model_type: hunyuan_hf
         master_weight_type: fp32
         use_videoalign: true
-        videoalign_ckpt_path: /workspace/DanceGRPO/videoalign_ckpt
+        videoalign_ckpt_path: /share/models/dancegrpo/videoalign_ckpt
         timestep_fraction: 0.5
         fsdp_sharding_strategy: full
     fsdp_config:

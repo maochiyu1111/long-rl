@@ -726,8 +726,6 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             reasons.append("trainer.diffusion must be true")
         if self.disaggregate:
             reasons.append("trainer.disaggregate must be false")
-        if bool(self.config.actor.get("disco", False)):
-            reasons.append("actor.disco must be false")
 
         trainer_pipelined = OmegaConf.select(self.config, "trainer.pipelined_micro_batch")
         if trainer_pipelined is not None and bool(trainer_pipelined):
@@ -784,7 +782,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             if use_videoalign:
                 from fastvideo.models.videoalign.inference import VideoVLMRewardInference
 
-                ckpt_path = _cfg_get(dance_cfg, "videoalign_ckpt_path", "/workspace/DanceGRPO/videoalign_ckpt")
+                ckpt_path = _cfg_get(dance_cfg, "videoalign_ckpt_path", "/share/models/dancegrpo/videoalign_ckpt")
                 self.inferencer = VideoVLMRewardInference(
                     load_from_pretrained=ckpt_path,
                     device=torch.device(get_device_name(), get_device_id()),

@@ -21,6 +21,30 @@ EXPERIMENT_NAME="${EXPERIMENT_NAME:-case4_dance_$(date +%Y%m%d_%H%M%S)}"
 NNODES="${NNODES:-1}"
 N_GPUS_PER_NODE="${N_GPUS_PER_NODE:-8}"
 MAX_TRAIN_STEPS="${MAX_TRAIN_STEPS:-1}"
+WORLD_SIZE="${WORLD_SIZE:-$((NNODES * N_GPUS_PER_NODE))}"
+PPO_MINI_BATCH_SIZE="${PPO_MINI_BATCH_SIZE:-$(( WORLD_SIZE > 16 ? WORLD_SIZE : 16 ))}"
+PPO_MICRO_BATCH_SIZE_PER_GPU="${PPO_MICRO_BATCH_SIZE_PER_GPU:-1}"
+TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-$(( ((PPO_MINI_BATCH_SIZE + WORLD_SIZE - 1) / WORLD_SIZE) * WORLD_SIZE ))}"
+GEN_BATCH_SIZE="${GEN_BATCH_SIZE:-${TRAIN_BATCH_SIZE}}"
+
+# Keep the default bring-up config aligned with trainer/worker validation.
+NORMALIZED_PPO_MINI_BATCH_SIZE=$((PPO_MINI_BATCH_SIZE / WORLD_SIZE))
+if (( NORMALIZED_PPO_MINI_BATCH_SIZE <= 0 )); then
+  echo "PPO_MINI_BATCH_SIZE (${PPO_MINI_BATCH_SIZE}) must be >= WORLD_SIZE (${WORLD_SIZE})." >&2
+  exit 1
+fi
+if (( NORMALIZED_PPO_MINI_BATCH_SIZE % PPO_MICRO_BATCH_SIZE_PER_GPU != 0 )); then
+  echo "Normalized ppo_mini_batch_size (${NORMALIZED_PPO_MINI_BATCH_SIZE}) must be divisible by PPO_MICRO_BATCH_SIZE_PER_GPU (${PPO_MICRO_BATCH_SIZE_PER_GPU})." >&2
+  exit 1
+fi
+if (( TRAIN_BATCH_SIZE < PPO_MINI_BATCH_SIZE )); then
+  echo "TRAIN_BATCH_SIZE (${TRAIN_BATCH_SIZE}) must be >= PPO_MINI_BATCH_SIZE (${PPO_MINI_BATCH_SIZE})." >&2
+  exit 1
+fi
+if (( TRAIN_BATCH_SIZE % WORLD_SIZE != 0 )); then
+  echo "TRAIN_BATCH_SIZE (${TRAIN_BATCH_SIZE}) must be divisible by WORLD_SIZE (${WORLD_SIZE})." >&2
+  exit 1
+fi
 
 declare -a OVERRIDES
 OVERRIDES+=("hydra.job.chdir=false")
@@ -29,10 +53,18 @@ OVERRIDES+=("trainer.experiment_name=${EXPERIMENT_NAME}")
 OVERRIDES+=("trainer.nnodes=${NNODES}")
 OVERRIDES+=("trainer.n_gpus_per_node=${N_GPUS_PER_NODE}")
 OVERRIDES+=("trainer.max_train_steps=${MAX_TRAIN_STEPS}")
+OVERRIDES+=("data.train_batch_size=${TRAIN_BATCH_SIZE}")
+OVERRIDES+=("data.gen_batch_size=${GEN_BATCH_SIZE}")
+OVERRIDES+=("actor_rollout_ref.actor.ppo_mini_batch_size=${PPO_MINI_BATCH_SIZE}")
+OVERRIDES+=("actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=${PPO_MICRO_BATCH_SIZE_PER_GPU}")
 
 # Optional path overrides for quick local bring-up.
 if [[ -n "${MODEL_PATH:-}" ]]; then
+  OVERRIDES+=("actor_rollout_ref.model.path=${MODEL_PATH}")
   OVERRIDES+=("actor_rollout_ref.actor.extra.dance.pretrained_model_name_or_path=${MODEL_PATH}")
+  if [[ -z "${VAE_MODEL_PATH:-}" ]]; then
+    OVERRIDES+=("actor_rollout_ref.actor.extra.dance.vae_model_path=${MODEL_PATH}")
+  fi
 fi
 if [[ -n "${VAE_MODEL_PATH:-}" ]]; then
   OVERRIDES+=("actor_rollout_ref.actor.extra.dance.vae_model_path=${VAE_MODEL_PATH}")
@@ -49,4 +81,3 @@ python3 -m verl.trainer.main_ppo \
   --config-name="${CONFIG_NAME}" \
   "${OVERRIDES[@]}" \
   "$@"
-

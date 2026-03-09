@@ -1,4 +1,4 @@
-# Case 4: `disaggregate=false`、`pipelined_micro_batch=false`、`disco=false` 时 DanceGRPO 执行链路
+# Case 4: `disaggregate=false`、`pipelined_micro_batch=false` 时 DanceGRPO 执行链路
 
 ## 1. 结论与范围
 
@@ -84,7 +84,7 @@
 
 1. 仅在 `role in {actor_rollout_ref, rollout_ref}` 且 `worker.reward.use_videoalign=true` 时加载。  
 2. `_build_model_optimizer_dance()` 内部直接构造：
-   `VideoVLMRewardInference("/workspace/DanceGRPO/videoalign_ckpt", device=self.device, dtype=torch.bfloat16)`。  
+   `VideoVLMRewardInference("/share/models/dancegrpo/videoalign_ckpt", device=self.device, dtype=torch.bfloat16)`。  
 3. `VideoVLMRewardInference.__init__()` 会：
    - 读取 `model_config.json`
    - 创建 `DataConfig/ModelConfig/PEFTLoraConfig/TrainingConfig`

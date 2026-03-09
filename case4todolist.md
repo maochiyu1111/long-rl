@@ -21,9 +21,9 @@
 - [ ] 固定 Case4 条件：
   - [ ] `trainer.disaggregate=false`
   - [ ] `trainer.pipelined_micro_batch=false`
-  - [ ] `actor_rollout_ref.actor.disco=false`
   - [ ] `algorithm.adv_estimator=grpo`
   - [ ] `actor_rollout_ref.actor.dance_case4_mode=true`（新增硬开关）
+  - [ ] 不再使用 `actor_rollout_ref.actor.disco` 旧键
 - [ ] 在 trainer 和 worker 两侧都做命中判断，防止误入。
 - [ ] 明确退出条件 A：`dance_case4_mode=false` 或未命中 Case4 时，必须回到原路径，不得污染其他 case。
 - [ ] 明确退出条件 B：`dance_case4_mode=true` 但未命中 Case4（配置冲突）时，必须 fail-fast 报错并提示缺失条件。
@@ -34,32 +34,32 @@
 
 ### 2.1 Trainer 主循环来源
 
-- [ ] 来源：`/Users/bytedance/codegfile/disco_rl/verl/trainer/ray_trainer.py::fit`
-- [ ] 目标：`/Users/bytedance/codegfile/long-rl/verl/trainer/ppo/ray_trainer.py::fit_dance_case4`
+- [ ] 来源：`~/codegfile/disco_rl/verl/trainer/ray_trainer.py::fit`
+- [ ] 目标：`~/codegfile/long-rl/verl/trainer/ppo/ray_trainer.py::fit_dance_case4`
 - [ ] 要求：主循环结构、batch 构造方式、调用顺序保持一致。
 
 ### 2.2 Worker 初始化来源
 
-- [ ] 来源：`/Users/bytedance/codegfile/disco_rl/verl/workers/fsdp_workers.py::_build_model_optimizer_dance`
-- [ ] 目标：`/Users/bytedance/codegfile/long-rl/verl/workers/fsdp_workers.py::_build_model_optimizer_dance`
+- [ ] 来源：`~/codegfile/disco_rl/verl/workers/fsdp_workers.py::_build_model_optimizer_dance`
+- [ ] 目标：`~/codegfile/long-rl/verl/workers/fsdp_workers.py::_build_model_optimizer_dance`
 - [ ] 要求：保留模型/优化器/vae/videoalign 初始化逻辑，只改配置键映射。
 
 ### 2.3 Worker rollout 来源
 
-- [ ] 来源：`/Users/bytedance/codegfile/disco_rl/verl/workers/fsdp_workers.py::generate_sequences`
-- [ ] 目标：`/Users/bytedance/codegfile/long-rl/verl/workers/fsdp_workers.py::_generate_sequences_dance`
+- [ ] 来源：`~/codegfile/disco_rl/verl/workers/fsdp_workers.py::generate_sequences`
+- [ ] 目标：`~/codegfile/long-rl/verl/workers/fsdp_workers.py::_generate_sequences_dance`
 - [ ] 要求：`flux_step + sigma_schedule + VAE decode + VideoAlign reward` 逻辑不改。
 
 ### 2.4 Worker update 来源
 
-- [ ] 来源：`/Users/bytedance/codegfile/disco_rl/verl/workers/fsdp_workers.py::update_actor`
-- [ ] 目标：`/Users/bytedance/codegfile/long-rl/verl/workers/fsdp_workers.py::_update_actor_dance`
+- [ ] 来源：`~/codegfile/disco_rl/verl/workers/fsdp_workers.py::update_actor`
+- [ ] 目标：`~/codegfile/long-rl/verl/workers/fsdp_workers.py::_update_actor_dance`
 - [ ] 要求：group 归一化 advantage、best-of-n、timestep 子采样、dual loss、clip ratio 逻辑一致。
 
 ### 2.5 数据集来源
 
-- [ ] 来源：`/Users/bytedance/codegfile/disco_rl/fastvideo/dataset/latent_rl_datasets.py`
-- [ ] 目标：`/Users/bytedance/codegfile/long-rl/fastvideo/dataset/latent_rl_datasets.py`
+- [ ] 来源：`~/codegfile/disco_rl/fastvideo/dataset/latent_rl_datasets.py`
+- [ ] 目标：`~/codegfile/long-rl/fastvideo/dataset/latent_rl_datasets.py`
 - [ ] 要求：输入输出字段协议不变。
 
 ---
@@ -67,7 +67,7 @@
 ## 3. 阶段 A：补齐 fastvideo 依赖（必须第一步）
 
 - [ ] A1. 全量覆盖目录：
-  - [ ] `/Users/bytedance/codegfile/disco_rl/fastvideo` -> `/Users/bytedance/codegfile/long-rl/fastvideo`
+  - [ ] `~/codegfile/disco_rl/fastvideo` -> `~/codegfile/long-rl/fastvideo`
 - [ ] A2. 快速自检 imports（至少包含）：
   - [ ] `fastvideo.utils.load`
   - [ ] `fastvideo.utils.fsdp_util`
@@ -153,9 +153,9 @@
   - [ ] `self.diffusion is True`
   - [ ] `self.diffusion_disaggregate is False`
   - [ ] `not config.trainer.pipelined_micro_batch`
-  - [ ] `not config.actor_rollout_ref.actor.disco`
   - [ ] `config.algorithm.adv_estimator == GRPO`
   - [ ] `config.actor_rollout_ref.actor.dance_case4_mode is True`
+  - [ ] 不依赖 `config.actor_rollout_ref.actor.disco`
 
 ### 6.2 训练循环切换
 
@@ -192,9 +192,9 @@
   - [ ] `algorithm.use_kl_in_reward=false`
   - [ ] `critic.enable=false`
   - [ ] `reward_model.enable=false`
-  - [ ] `actor_rollout_ref.actor.disco=false`
   - [ ] `actor_rollout_ref.actor.dance_case4_mode=true`
   - [ ] `actor_rollout_ref.actor.use_kl_loss=false`
+  - [ ] 不再配置 `actor_rollout_ref.actor.disco`
   - [ ] `actor_rollout_ref.actor.optim.{lr,weight_decay}`
   - [ ] `actor_rollout_ref.actor.extra.dance.{pretrained_model_name_or_path,vae_model_path,model_type,master_weight_type,use_videoalign,videoalign_ckpt_path,timestep_fraction}`
   - [ ] `actor_rollout_ref.rollout.{sampling_steps,shift,eta,width,height,num_frames,fps,num_generations,use_group,use_same_noise,bestofn,vq_coef,mq_coef}`

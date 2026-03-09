@@ -902,6 +902,13 @@ class RayPPOTrainer:
 
     def _validate_config(self):
         config = self.config
+        actor_cfg_raw = config.actor_rollout_ref.actor
+        if hasattr(actor_cfg_raw, "keys") and "disco" in actor_cfg_raw.keys():
+            raise ValueError(
+                "actor_rollout_ref.actor.disco is obsolete and unsupported. "
+                "Remove this key; Dance Case4 no longer uses it."
+            )
+
         # number of GPUs total
         n_gpus = config.trainer.n_gpus_per_node * config.trainer.nnodes
         if config.actor_rollout_ref.actor.strategy == "megatron":
@@ -1068,45 +1075,80 @@ class RayPPOTrainer:
 
         print("[validate_config] All configuration checks passed successfully!")
 
+    def _set_total_training_steps(self) -> None:
+        total_training_steps = len(self.train_dataloader) * self.config.trainer.total_epochs
+
+        if self.config.trainer.total_training_steps is not None:
+            total_training_steps = self.config.trainer.total_training_steps
+
+        self.total_training_steps = total_training_steps
+        print(f"Total training steps: {self.total_training_steps}")
+
+        try:
+            OmegaConf.set_struct(self.config, True)
+            with open_dict(self.config):
+                if OmegaConf.select(self.config, "actor_rollout_ref.actor.optim"):
+                    self.config.actor_rollout_ref.actor.optim.total_training_steps = total_training_steps
+                if OmegaConf.select(self.config, "critic.optim"):
+                    self.config.critic.optim.total_training_steps = total_training_steps
+        except Exception as e:
+            print(f"Warning: Could not set total_training_steps in config. Structure missing? Error: {e}")
+
+    def _create_dance_case4_dataloader(self) -> None:
+        from fastvideo.dataset.latent_rl_datasets import LatentDataset, latent_collate_function
+
+        data_json_path = self.config.data.get("data_json_path", None)
+        if data_json_path is None:
+            raise ValueError("dance_case4_mode=true requires `data.data_json_path`")
+
+        num_latent_t = int(self.config.data.get("t", 1))
+        cfg_rate = float(self.config.data.get("cfg", 0.0))
+        num_workers = int(self.config.data.get("dataloader_num_workers", 0))
+        train_batch_size = int(self.config.data.get("gen_batch_size", self.config.data.get("train_batch_size", 1)))
+
+        self.train_dataset = LatentDataset(data_json_path, num_latent_t=num_latent_t, cfg_rate=cfg_rate)
+        self.val_dataset = None
+        self.train_dataloader = StatefulDataLoader(
+            dataset=self.train_dataset,
+            batch_size=train_batch_size,
+            num_workers=num_workers,
+            drop_last=True,
+            collate_fn=latent_collate_function,
+            sampler=None,
+        )
+        self.val_dataloader = None
+
+        assert len(self.train_dataloader) >= 1, "Train dataloader is empty!"
+        print(f"Size of train dataloader: {len(self.train_dataloader)}, validation disabled for dance_case4")
+        self._set_total_training_steps()
+
     def _create_dataloader(self, train_dataset, val_dataset, collate_fn, train_sampler: Optional[Sampler]):
         """
         Creates the train and validation dataloaders.
         """
-        dance_case4_mode = self._is_dance_case4_enabled()
-        if dance_case4_mode:
-            from fastvideo.dataset.latent_rl_datasets import LatentDataset, latent_collate_function
+        if self._is_dance_case4_enabled():
+            self._create_dance_case4_dataloader()
+            return
 
-            data_json_path = self.config.data.get("data_json_path", None)
-            if data_json_path is None:
-                raise ValueError("dance_case4_mode=true requires `data.data_json_path`")
-            val_data_json_path = self.config.data.get("val_data_json_path", data_json_path)
-            num_latent_t = int(self.config.data.get("t", 1))
-            cfg_rate = float(self.config.data.get("cfg", 0.0))
-            train_dataset = LatentDataset(data_json_path, num_latent_t=num_latent_t, cfg_rate=cfg_rate)
-            val_dataset = LatentDataset(val_data_json_path, num_latent_t=num_latent_t, cfg_rate=cfg_rate)
-            train_sampler = None
-            collate_fn = latent_collate_function
-        else:
-            # TODO: we have to make sure the batch size is divisible by the dp size
-            from verl.trainer.main_ppo import create_rl_dataset, create_rl_sampler
+        # TODO: we have to make sure the batch size is divisible by the dp size
+        from verl.trainer.main_ppo import create_rl_dataset, create_rl_sampler
 
-            if train_dataset is None:
-                train_dataset = create_rl_dataset(
-                    self.config.data.train_files, self.config.data, self.tokenizer, self.processor
-                )
-            if val_dataset is None:
-                val_dataset = create_rl_dataset(
-                    self.config.data.val_files, self.config.data, self.tokenizer, self.processor
-                )
-            if train_sampler is None:
-                train_sampler = create_rl_sampler(self.config.data, train_dataset)
-            if collate_fn is None:
-                from verl.utils.dataset.rl_dataset import collate_fn as default_collate_fn
+        if train_dataset is None:
+            train_dataset = create_rl_dataset(
+                self.config.data.train_files, self.config.data, self.tokenizer, self.processor
+            )
+        if val_dataset is None:
+            val_dataset = create_rl_dataset(
+                self.config.data.val_files, self.config.data, self.tokenizer, self.processor
+            )
+        if train_sampler is None:
+            train_sampler = create_rl_sampler(self.config.data, train_dataset)
+        if collate_fn is None:
+            from verl.utils.dataset.rl_dataset import collate_fn as default_collate_fn
 
-                collate_fn = default_collate_fn
+            collate_fn = default_collate_fn
 
         self.train_dataset, self.val_dataset = train_dataset, val_dataset
-
         num_workers = int(self.config.data.get("dataloader_num_workers", 0))
         train_batch_size = int(self.config.data.get("gen_batch_size", self.config.data.get("train_batch_size", 1)))
 
@@ -1139,24 +1181,7 @@ class RayPPOTrainer:
             f"Size of train dataloader: {len(self.train_dataloader)}, Size of val dataloader: "
             f"{len(self.val_dataloader)}"
         )
-
-        total_training_steps = len(self.train_dataloader) * self.config.trainer.total_epochs
-
-        if self.config.trainer.total_training_steps is not None:
-            total_training_steps = self.config.trainer.total_training_steps
-
-        self.total_training_steps = total_training_steps
-        print(f"Total training steps: {self.total_training_steps}")
-
-        try:
-            OmegaConf.set_struct(self.config, True)
-            with open_dict(self.config):
-                if OmegaConf.select(self.config, "actor_rollout_ref.actor.optim"):
-                    self.config.actor_rollout_ref.actor.optim.total_training_steps = total_training_steps
-                if OmegaConf.select(self.config, "critic.optim"):
-                    self.config.critic.optim.total_training_steps = total_training_steps
-        except Exception as e:
-            print(f"Warning: Could not set total_training_steps in config. Structure missing? Error: {e}")
+        self._set_total_training_steps()
 
     def _dump_generations(self, inputs, outputs, scores, reward_extra_infos_dict, dump_path):
         """Dump rollout/validation samples as JSONL."""
@@ -1978,8 +2003,6 @@ class RayPPOTrainer:
             reasons.append("trainer.disaggregate must be false")
         if bool(self.config.trainer.get("pipelined_micro_batch", False)):
             reasons.append("trainer.pipelined_micro_batch must be false")
-        if bool(self.config.actor_rollout_ref.actor.get("disco", False)):
-            reasons.append("actor_rollout_ref.actor.disco must be false")
 
         adv_estimator = str(self.config.algorithm.adv_estimator).lower()
         if adv_estimator not in {"grpo", "advantageestimator.grpo"}:
@@ -2050,7 +2073,7 @@ class RayPPOTrainer:
                 reason_text = "; ".join(reasons)
                 raise ValueError(
                     f"dance_case4_mode=true but Case4 conditions are not met ({reason_text}). "
-                    "Expected: diffusion=true, disaggregate=false, pipelined_micro_batch=false, actor.disco=false, adv_estimator=grpo."
+                    "Expected: diffusion=true, disaggregate=false, pipelined_micro_batch=false, adv_estimator=grpo."
                 )
             return self.fit_dance_case4()
 

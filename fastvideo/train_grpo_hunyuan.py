@@ -533,7 +533,7 @@ def main(args):
     inferencer = None
     if args.use_videoalign:
         from fastvideo.models.videoalign.inference import VideoVLMRewardInference
-        load_from_pretrained = "/workspace/DanceGRPO/videoalign_ckpt"
+        load_from_pretrained = "/share/models/dancegrpo/videoalign_ckpt"
         dtype = torch.bfloat16
         inferencer = VideoVLMRewardInference(load_from_pretrained, device=f'cuda:{device}', dtype=dtype)
 
@@ -546,7 +546,7 @@ def main(args):
     transformer = load_transformer(
         args.model_type,
         args.dit_model_name_or_path,
-        "/workspace/DanceGRPO/data/HunyuanVideo",
+        "/share/models/dancegrpo/HunyuanVideo",
         torch.float32 if args.master_weight_type == "fp32" else torch.bfloat16,
     )
 
