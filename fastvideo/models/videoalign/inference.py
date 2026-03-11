@@ -1,30 +1,274 @@
-import ast
 import json
 import os
-import pdb
 from collections.abc import Mapping
-import pandas as pd
+from dataclasses import dataclass
+from typing import List, Optional, Union
 
 import torch
-from fastvideo.models.videoalign.vision_process import process_vision_info
+import torch.nn as nn
+from peft import LoraConfig, get_peft_model
+from transformers import AutoProcessor, Qwen2VLForConditionalGeneration
+from trl import get_kbit_device_map, get_quantization_config
 
-from fastvideo.models.videoalign.data import DataConfig
+from fastvideo.models.videoalign.prompt_template import build_prompt
 from fastvideo.models.videoalign.utils import ModelConfig, PEFTLoraConfig, TrainingConfig
 from fastvideo.models.videoalign.utils import load_model_from_checkpoint
-from fastvideo.models.videoalign.train_reward import create_model_and_processor
-from fastvideo.models.videoalign.prompt_template import build_prompt
+from fastvideo.models.videoalign.vision_process import process_vision_info
+
+
+@dataclass
+class DataConfig:
+    meta_data: str = "/path/to/dataset/meta_data.csv"
+    data_dir: str = "/path/to/dataset"
+    meta_data_test: Optional[str] = None
+    max_frame_pixels: int = 240 * 320
+    num_frames: Optional[float] = None
+    fps: float = 2.0
+    p_shuffle_frames: float = 0.0
+    p_color_jitter: float = 0.0
+    eval_dim: Union[str, List[str]] = "VQ"
+    prompt_template_type: str = "none"
+    add_noise: bool = False
+    sample_type: str = "uniform"
+    use_tied_data: bool = True
+
+
+class Qwen2VLRewardModelBT(Qwen2VLForConditionalGeneration):
+    def __init__(self, config, output_dim=4, reward_token="last", special_token_ids=None):
+        super().__init__(config)
+        self.output_dim = output_dim
+        self.rm_head = nn.Linear(config.hidden_size, output_dim, bias=False)
+        self.reward_token = reward_token
+        self.special_token_ids = special_token_ids
+        if self.special_token_ids is not None:
+            self.reward_token = "special"
+
+    def forward(
+        self,
+        input_ids: torch.LongTensor = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[List[torch.FloatTensor]] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        labels: Optional[torch.LongTensor] = None,
+        use_cache: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+        pixel_values: Optional[torch.Tensor] = None,
+        pixel_values_videos: Optional[torch.FloatTensor] = None,
+        image_grid_thw: Optional[torch.LongTensor] = None,
+        video_grid_thw: Optional[torch.LongTensor] = None,
+        rope_deltas: Optional[torch.LongTensor] = None,
+    ):
+        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+        output_hidden_states = (
+            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        )
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+        if inputs_embeds is None:
+            inputs_embeds = self.model.embed_tokens(input_ids)
+            if pixel_values is not None:
+                pixel_values = pixel_values.type(self.visual.get_dtype())
+                image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw)
+                image_mask = (input_ids == self.config.image_token_id).unsqueeze(-1).expand_as(inputs_embeds)
+                image_embeds = image_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
+                inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
+
+            if pixel_values_videos is not None:
+                pixel_values_videos = pixel_values_videos.type(self.visual.get_dtype())
+                video_embeds = self.visual(pixel_values_videos, grid_thw=video_grid_thw)
+                video_mask = (input_ids == self.config.video_token_id).unsqueeze(-1).expand_as(inputs_embeds)
+                video_embeds = video_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
+                inputs_embeds = inputs_embeds.masked_scatter(video_mask, video_embeds)
+
+            if attention_mask is not None:
+                attention_mask = attention_mask.to(inputs_embeds.device)
+
+        outputs = self.model(
+            input_ids=None,
+            position_ids=position_ids,
+            attention_mask=attention_mask,
+            past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds,
+            use_cache=use_cache,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+        )
+
+        hidden_states = outputs[0]
+        logits = self.rm_head(hidden_states)
+
+        if input_ids is not None:
+            batch_size = input_ids.shape[0]
+        else:
+            batch_size = inputs_embeds.shape[0]
+
+        if self.config.pad_token_id is None and batch_size != 1:
+            raise ValueError("Cannot handle batch sizes > 1 if no padding token is defined.")
+        if self.config.pad_token_id is None:
+            sequence_lengths = -1
+        else:
+            if input_ids is not None:
+                sequence_lengths = torch.eq(input_ids, self.config.pad_token_id).int().argmax(-1) - 1
+                sequence_lengths = sequence_lengths % input_ids.shape[-1]
+                sequence_lengths = sequence_lengths.to(logits.device)
+            else:
+                sequence_lengths = -1
+
+        if self.reward_token == "last":
+            pooled_logits = logits[torch.arange(batch_size, device=logits.device), sequence_lengths]
+        elif self.reward_token == "mean":
+            valid_lengths = torch.clamp(sequence_lengths, min=0, max=logits.size(1) - 1)
+            pooled_logits = torch.stack([logits[i, : valid_lengths[i]].mean(dim=0) for i in range(batch_size)])
+        elif self.reward_token == "special":
+            special_token_mask = torch.zeros_like(input_ids, dtype=torch.bool)
+            for special_token_id in self.special_token_ids:
+                special_token_mask = special_token_mask | (input_ids == special_token_id)
+            pooled_logits = logits[special_token_mask, ...]
+            pooled_logits = pooled_logits.view(batch_size, 3, -1)
+            if self.output_dim == 3:
+                pooled_logits = pooled_logits.diagonal(dim1=1, dim2=2)
+            pooled_logits = pooled_logits.view(batch_size, -1)
+        else:
+            raise ValueError("Invalid reward_token")
+
+        return {"logits": pooled_logits}
 
 
 def load_configs_from_json(config_path):
     with open(config_path, "r") as f:
         config_dict = json.load(f)
 
-    # del config_dict["training_args"]["_n_gpu"]
-    del config_dict["data_config"]["meta_data"]
-    del config_dict["data_config"]["data_dir"]
+    data_config = dict(config_dict["data_config"])
+    data_config.pop("meta_data", None)
+    data_config.pop("data_dir", None)
 
-    return config_dict["data_config"], None, config_dict["model_config"], config_dict["peft_lora_config"], \
-           config_dict["inference_config"] if "inference_config" in config_dict else None
+    return (
+        data_config,
+        None,
+        config_dict["model_config"],
+        config_dict["peft_lora_config"],
+        config_dict["inference_config"] if "inference_config" in config_dict else None,
+    )
+
+
+def find_target_linear_names(model, num_lora_modules=-1, lora_namespan_exclude=None):
+    linear_cls = torch.nn.Linear
+    embedding_cls = torch.nn.Embedding
+    lora_namespan_exclude = lora_namespan_exclude or []
+    lora_module_names = []
+
+    for name, module in model.named_modules():
+        if any(ex_keyword in name for ex_keyword in lora_namespan_exclude):
+            continue
+        if isinstance(module, (linear_cls, embedding_cls)):
+            lora_module_names.append(name)
+
+    if num_lora_modules > 0:
+        lora_module_names = lora_module_names[-num_lora_modules:]
+    return lora_module_names
+
+
+def _resolve_base_model_name_or_path(model_config: ModelConfig, load_from_pretrained: str) -> str:
+    candidate = model_config.model_name_or_path or "./Qwen2-VL-2B-Instruct"
+    search_roots = [os.getcwd(), load_from_pretrained, os.path.dirname(load_from_pretrained)]
+
+    if os.path.isabs(candidate) and os.path.exists(candidate):
+        return candidate
+
+    if not os.path.isabs(candidate):
+        for root in search_roots:
+            resolved = os.path.abspath(os.path.join(root, candidate))
+            if os.path.exists(resolved):
+                return resolved
+
+    aliases = {
+        "./Qwen2-VL-2B-Instruct": "Qwen/Qwen2-VL-2B-Instruct",
+        "Qwen2-VL-2B-Instruct": "Qwen/Qwen2-VL-2B-Instruct",
+    }
+    return aliases.get(candidate, aliases.get(os.path.basename(candidate.rstrip("/")), candidate))
+
+
+def create_model_and_processor(model_config, peft_lora_config, training_args, cache_dir=None):
+    model_name_or_path = _resolve_base_model_name_or_path(model_config, training_args.load_from_pretrained)
+    torch_dtype = (
+        model_config.torch_dtype
+        if model_config.torch_dtype in ["auto", None]
+        else getattr(torch, model_config.torch_dtype)
+    )
+    quantization_config = get_quantization_config(model_config)
+    model_kwargs = dict(
+        revision=model_config.model_revision,
+        trust_remote_code=model_config.trust_remote_code,
+        device_map=get_kbit_device_map() if quantization_config is not None else None,
+        quantization_config=quantization_config,
+        use_cache=True if training_args.gradient_checkpointing else False,
+    )
+
+    processor = AutoProcessor.from_pretrained(
+        model_name_or_path,
+        padding_side="right",
+        cache_dir=cache_dir,
+        revision=model_config.model_revision,
+        trust_remote_code=model_config.trust_remote_code,
+    )
+
+    special_token_ids = None
+    if model_config.use_special_tokens:
+        special_tokens = ["<|VQ_reward|>", "<|MQ_reward|>", "<|TA_reward|>"]
+        processor.tokenizer.add_special_tokens({"additional_special_tokens": special_tokens})
+        special_token_ids = processor.tokenizer.convert_tokens_to_ids(special_tokens)
+
+    attn_implementation = model_config.attn_implementation
+    if attn_implementation is None:
+        attn_implementation = "flash_attention_2" if not training_args.disable_flash_attn2 else "sdpa"
+
+    model = Qwen2VLRewardModelBT.from_pretrained(
+        model_name_or_path,
+        output_dim=model_config.output_dim,
+        reward_token=model_config.reward_token,
+        special_token_ids=special_token_ids,
+        torch_dtype=torch_dtype,
+        attn_implementation=attn_implementation,
+        cache_dir=cache_dir,
+        **model_kwargs,
+    )
+    if model_config.use_special_tokens:
+        model.resize_token_embeddings(len(processor.tokenizer))
+
+    if training_args.bf16:
+        model.to(torch.bfloat16)
+    if training_args.fp16:
+        model.to(torch.float16)
+
+    if peft_lora_config.lora_enable:
+        target_modules = find_target_linear_names(
+            model,
+            num_lora_modules=peft_lora_config.num_lora_modules,
+            lora_namespan_exclude=peft_lora_config.lora_namespan_exclude,
+        )
+        peft_config = LoraConfig(
+            target_modules=target_modules,
+            r=peft_lora_config.lora_r,
+            lora_alpha=peft_lora_config.lora_alpha,
+            lora_dropout=peft_lora_config.lora_dropout,
+            task_type=peft_lora_config.lora_task_type,
+            use_rslora=peft_lora_config.use_rslora,
+            bias="none",
+            modules_to_save=peft_lora_config.lora_modules_to_save,
+        )
+        model = get_peft_model(model, peft_config)
+    else:
+        peft_config = None
+
+    model.config.tokenizer_padding_side = processor.tokenizer.padding_side
+    model.config.pad_token_id = processor.tokenizer.pad_token_id
+
+    return model, processor, peft_config
+
 
 class VideoVLMRewardInference():
     def __init__(self, load_from_pretrained, load_from_pretrained_step=-1, device='cuda', dtype=torch.bfloat16):
@@ -44,7 +288,7 @@ class VideoVLMRewardInference():
             output_dir="",
         )
         
-        model, processor, peft_config = create_model_and_processor(
+        model, processor, _ = create_model_and_processor(
             model_config=model_config,
             peft_lora_config=peft_lora_config,
             training_args=training_args,
@@ -286,4 +530,3 @@ if __name__ == "__main__":
     with torch.no_grad():
         rewards = inferencer.reward(video_paths, prompts, use_norm=True)
         print(rewards)
-
