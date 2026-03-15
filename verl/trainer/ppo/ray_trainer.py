@@ -895,8 +895,8 @@ class RayPPOTrainer:
     def _sync_diffusion_disaggregate_before_rollout(self) -> None:
         """Sync actor->rollout_ref diffusion transformer weights via GDR relay.
 
-        IMPORTANT: `sync_transformer_gdr_with_relay` is a global-collective method (Dispatch.ALL_TO_ALL) and must be
-        scheduled on *both* WorkerGroups (actor + rollout_ref) before waiting, otherwise it can deadlock.
+        Reuse the same role-prefixed entrypoints as the main `fit_dis()` loop. Those names route the collective to the
+        correct worker inside each WorkerGroup and avoid the heavier generic dispatch path.
         """
 
         if not (self.diffusion and self.diffusion_disaggregate):
@@ -907,8 +907,10 @@ class RayPPOTrainer:
 
         chunk_mb = int(OmegaConf.select(self.config, "trainer.disaggregate_sync_chunk_mb") or 256)
         refs: list[ray.ObjectRef] = []
-        refs += self.rollout_ref_wg.execute_all_async("sync_transformer_gdr_with_relay", chunk_mb=chunk_mb)
-        refs += self.actor_wg.execute_all_async("sync_transformer_gdr_with_relay", chunk_mb=chunk_mb)
+        refs += self.rollout_ref_wg.execute_all_async(
+            "rollout_ref_sync_transformer_gdr_with_relay", chunk_mb=chunk_mb
+        )
+        refs += self.actor_wg.execute_all_async("actor_sync_transformer_gdr_with_relay", chunk_mb=chunk_mb)
         ray.get(refs)
 
     def _validate_config(self):

@@ -94,6 +94,9 @@ fi
 if [[ -n "${VIDEOALIGN_BASE_MODEL_PATH:-}" ]]; then
   OVERRIDES+=("+actor_rollout_ref.actor.extra.dance.videoalign_base_model_name_or_path=${VIDEOALIGN_BASE_MODEL_PATH}")
 fi
+if [[ -n "${DANCE_MASTER_WEIGHT_TYPE:-}" ]]; then
+  OVERRIDES+=("actor_rollout_ref.actor.extra.dance.master_weight_type=${DANCE_MASTER_WEIGHT_TYPE}")
+fi
 if [[ -n "${DATA_JSON_PATH:-}" ]]; then
   OVERRIDES+=("data.data_json_path=${DATA_JSON_PATH}")
 fi

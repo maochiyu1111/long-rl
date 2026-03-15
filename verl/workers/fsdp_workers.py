@@ -132,6 +132,55 @@ def _bcast_cuda_chunks_into_(flat_tensor: torch.Tensor, *, src_group_rank: int, 
         offset = end
 
 
+def _bcast_cuda_chunks_maybe_cast_(
+    *,
+    src_flat_tensor: torch.Tensor | None = None,
+    dst_flat_tensor: torch.Tensor | None = None,
+    src_group_rank: int,
+    group,
+    chunk_mb: int = 256,
+    wire_dtype: torch.dtype | None = None,
+) -> None:
+    """Broadcast a 1D CUDA tensor in chunks, optionally casting on the sender chunk-by-chunk."""
+
+    if (src_flat_tensor is None) == (dst_flat_tensor is None):
+        raise ValueError("Exactly one of src_flat_tensor or dst_flat_tensor must be provided")
+
+    ref_tensor = src_flat_tensor if src_flat_tensor is not None else dst_flat_tensor
+    assert ref_tensor is not None
+    if ref_tensor.device.type == "cpu":
+        raise ValueError("_bcast_cuda_chunks_maybe_cast_ requires a non-CPU tensor")
+    if ref_tensor.ndim != 1:
+        raise ValueError(
+            "_bcast_cuda_chunks_maybe_cast_ requires a 1D tensor, "
+            f"got shape={tuple(ref_tensor.shape)}"
+        )
+    if chunk_mb <= 0:
+        raise ValueError(f"chunk_mb must be positive, got {chunk_mb}")
+
+    wire_dtype = wire_dtype or ref_tensor.dtype
+    if dst_flat_tensor is not None and dst_flat_tensor.dtype != wire_dtype:
+        raise ValueError(f"Receiver dtype mismatch: expected {wire_dtype}, got {dst_flat_tensor.dtype}")
+
+    # Casting on the sender allocates a temporary tensor, so keep those chunks small.
+    effective_chunk_mb = min(chunk_mb, 8) if wire_dtype != ref_tensor.dtype or src_flat_tensor is None else chunk_mb
+    bytes_per_el = torch.empty((), dtype=wire_dtype, device=ref_tensor.device).element_size()
+    chunk_elems = max(1, (effective_chunk_mb * 1024 * 1024) // bytes_per_el)
+
+    numel = ref_tensor.numel()
+    offset = 0
+    while offset < numel:
+        end = min(offset + chunk_elems, numel)
+        if src_flat_tensor is not None:
+            chunk = src_flat_tensor[offset:end]
+            if chunk.dtype != wire_dtype:
+                chunk = chunk.to(dtype=wire_dtype)
+            dist.broadcast(chunk, src=src_group_rank, group=group)
+        else:
+            dist.broadcast(dst_flat_tensor[offset:end], src=src_group_rank, group=group)
+        offset = end
+
+
 class _NoOpProfiler:
     def start(self, **kwargs) -> None:
         return None
@@ -558,57 +607,42 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             if self._is_offload_param:
                 load_fsdp_model_to_gpu(actor_module_fsdp)
 
-            names, src_gpu_tensors = [], []
             try:
-                from torch.distributed.fsdp import FullStateDictConfig, StateDictType
+                summon_rank0_only = actor_src_global_rank == 0
+                with FSDP.summon_full_params(
+                    actor_module_fsdp,
+                    writeback=False,
+                    rank0_only=summon_rank0_only,
+                    offload_to_cpu=False,
+                ):
+                    if world_rank == actor_src_global_rank:
+                        named_params = list(actor_module_fsdp.named_parameters())
+                        obj = [len(named_params)]
+                        dist.broadcast_object_list(obj, src=actor_src_global_rank, group=pair_pg)
+                        dist.barrier(pair_pg)
 
-                cfg = FullStateDictConfig(offload_to_cpu=False, rank0_only=True)
-                with FSDP.state_dict_type(actor_module_fsdp, StateDictType.FULL_STATE_DICT, cfg):
-                    sd_full = actor_module_fsdp.state_dict()
+                        for name, param in named_params:
+                            tensor = param.data
+                            if not tensor.is_cuda:
+                                raise RuntimeError(f"actor params are not on cuda {name}")
+                            if not tensor.is_contiguous():
+                                raise RuntimeError(f"actor params are not contiguous {name}")
 
-                dev = torch.device(get_device_name(), get_device_id())
-                for k, v in sd_full.items():
-                    if isinstance(v, torch.Tensor):
-                        if target_dtype is not None and v.dtype != target_dtype:
-                            v = v.to(dtype=target_dtype, non_blocking=True)
-                        if v.device != dev:
-                            v = v.to(dev, non_blocking=True)
-                        names.append(k)
-                        src_gpu_tensors.append(v)
-            except Exception:
-                from torch.distributed.fsdp import FullStateDictConfig, StateDictType
-
-                cfg = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
-                with FSDP.state_dict_type(actor_module_fsdp, StateDictType.FULL_STATE_DICT, cfg):
-                    sd_full = actor_module_fsdp.state_dict()
-                dev = torch.device(get_device_name(), get_device_id())
-                for k, v in sd_full.items():
-                    if isinstance(v, torch.Tensor):
-                        if target_dtype is not None:
-                            v = v.to(device=dev, dtype=target_dtype, non_blocking=True)
-                        else:
-                            v = v.to(device=dev, non_blocking=True)
-                        names.append(k)
-                        src_gpu_tensors.append(v)
+                            meta = (name, tuple(tensor.shape))
+                            obj = [meta]
+                            dist.broadcast_object_list(obj, src=actor_src_global_rank, group=pair_pg)
+                            dist.barrier(pair_pg)
+                            _bcast_cuda_chunks_maybe_cast_(
+                                src_flat_tensor=tensor.view(-1),
+                                src_group_rank=actor_src_global_rank,
+                                group=pair_pg,
+                                chunk_mb=chunk_mb,
+                                wire_dtype=target_dtype,
+                            )
+                            dist.barrier(pair_pg)
             finally:
                 if self._is_offload_param:
                     offload_fsdp_model_to_cpu(actor_module_fsdp)
-
-            if world_rank == actor_src_global_rank:
-                obj = [len(names)]
-                dist.broadcast_object_list(obj, src=actor_src_global_rank, group=pair_pg)
-                dist.barrier(pair_pg)
-
-                for i, k in enumerate(names):
-                    meta = (k, tuple(src_gpu_tensors[i].shape))
-                    obj = [meta]
-                    dist.broadcast_object_list(obj, src=actor_src_global_rank, group=pair_pg)
-                    dist.barrier(pair_pg)
-                    flat_send = src_gpu_tensors[i].view(-1)
-                    _bcast_cuda_chunks_into_(
-                        flat_send, src_group_rank=actor_src_global_rank, group=pair_pg, chunk_mb=chunk_mb
-                    )
-                    dist.barrier(pair_pg)
 
         elif world_rank == relay_global_rank:
             assert pipeline_transformer is not None
@@ -638,9 +672,12 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 if not param.data.is_contiguous():
                     raise RuntimeError(f"relay params are not contiguous {name}")
 
-                flat_recv = param.data.view(-1)
-                _bcast_cuda_chunks_into_(
-                    flat_recv, src_group_rank=actor_src_global_rank, group=pair_pg, chunk_mb=chunk_mb
+                _bcast_cuda_chunks_maybe_cast_(
+                    dst_flat_tensor=param.data.view(-1),
+                    src_group_rank=actor_src_global_rank,
+                    group=pair_pg,
+                    chunk_mb=chunk_mb,
+                    wire_dtype=target_dtype,
                 )
                 dist.barrier(pair_pg)
 
