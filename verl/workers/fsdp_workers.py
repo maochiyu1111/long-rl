@@ -783,10 +783,12 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 from fastvideo.models.videoalign.inference import VideoVLMRewardInference
 
                 ckpt_path = _cfg_get(dance_cfg, "videoalign_ckpt_path", "/share/models/dancegrpo/videoalign_ckpt")
+                base_model_name_or_path = _cfg_get(dance_cfg, "videoalign_base_model_name_or_path", None)
                 self.inferencer = VideoVLMRewardInference(
                     load_from_pretrained=ckpt_path,
                     device=torch.device(get_device_name(), get_device_id()),
                     dtype=torch.bfloat16,
+                    base_model_name_or_path=base_model_name_or_path,
                 )
 
         transformer = load_transformer(

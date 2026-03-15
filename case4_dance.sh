@@ -4,6 +4,8 @@ set -euo pipefail
 set -x
 
 export PYTHONUNBUFFERED=1
+export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
+export TRANSFORMERS_OFFLINE="${TRANSFORMERS_OFFLINE:-1}"
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONFIG_PATH="${CONFIG_PATH:-${ROOT_DIR}/examples/diffusion}"
@@ -58,6 +60,9 @@ OVERRIDES+=("data.gen_batch_size=${GEN_BATCH_SIZE}")
 OVERRIDES+=("actor_rollout_ref.actor.ppo_mini_batch_size=${PPO_MINI_BATCH_SIZE}")
 OVERRIDES+=("actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=${PPO_MICRO_BATCH_SIZE_PER_GPU}")
 
+VIDEOALIGN_CKPT_PATH=/share/models/dancegrpo/videoalign_ckpt
+VIDEOALIGN_BASE_MODEL_PATH=/workspace/models/Qwen2-VL-2B-Instruct
+
 # Optional path overrides for quick local bring-up.
 if [[ -n "${MODEL_PATH:-}" ]]; then
   OVERRIDES+=("actor_rollout_ref.model.path=${MODEL_PATH}")
@@ -71,6 +76,9 @@ if [[ -n "${VAE_MODEL_PATH:-}" ]]; then
 fi
 if [[ -n "${VIDEOALIGN_CKPT_PATH:-}" ]]; then
   OVERRIDES+=("actor_rollout_ref.actor.extra.dance.videoalign_ckpt_path=${VIDEOALIGN_CKPT_PATH}")
+fi
+if [[ -n "${VIDEOALIGN_BASE_MODEL_PATH:-}" ]]; then
+  OVERRIDES+=("actor_rollout_ref.actor.extra.dance.videoalign_base_model_name_or_path=${VIDEOALIGN_BASE_MODEL_PATH}")
 fi
 if [[ -n "${DATA_JSON_PATH:-}" ]]; then
   OVERRIDES+=("data.data_json_path=${DATA_JSON_PATH}")

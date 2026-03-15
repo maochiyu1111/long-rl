@@ -192,8 +192,20 @@ def _resolve_base_model_name_or_path(model_config: ModelConfig, load_from_pretra
     return aliases.get(candidate, aliases.get(os.path.basename(candidate.rstrip("/")), candidate))
 
 
+def _env_flag_enabled(name: str) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return False
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _should_force_local_files_only(model_name_or_path: str) -> bool:
+    return os.path.isdir(model_name_or_path) or _env_flag_enabled("HF_HUB_OFFLINE") or _env_flag_enabled("TRANSFORMERS_OFFLINE")
+
+
 def create_model_and_processor(model_config, peft_lora_config, training_args, cache_dir=None):
     model_name_or_path = _resolve_base_model_name_or_path(model_config, training_args.load_from_pretrained)
+    local_files_only = _should_force_local_files_only(model_name_or_path)
     torch_dtype = (
         model_config.torch_dtype
         if model_config.torch_dtype in ["auto", None]
@@ -214,6 +226,7 @@ def create_model_and_processor(model_config, peft_lora_config, training_args, ca
         cache_dir=cache_dir,
         revision=model_config.model_revision,
         trust_remote_code=model_config.trust_remote_code,
+        local_files_only=local_files_only,
     )
 
     special_token_ids = None
@@ -234,6 +247,7 @@ def create_model_and_processor(model_config, peft_lora_config, training_args, ca
         torch_dtype=torch_dtype,
         attn_implementation=attn_implementation,
         cache_dir=cache_dir,
+        local_files_only=local_files_only,
         **model_kwargs,
     )
     if model_config.use_special_tokens:
@@ -271,11 +285,20 @@ def create_model_and_processor(model_config, peft_lora_config, training_args, ca
 
 
 class VideoVLMRewardInference():
-    def __init__(self, load_from_pretrained, load_from_pretrained_step=-1, device='cuda', dtype=torch.bfloat16):
+    def __init__(
+        self,
+        load_from_pretrained,
+        load_from_pretrained_step=-1,
+        device='cuda',
+        dtype=torch.bfloat16,
+        base_model_name_or_path: Optional[str] = None,
+    ):
         config_path = os.path.join(load_from_pretrained, "model_config.json")
         data_config, _, model_config, peft_lora_config, inference_config = load_configs_from_json(config_path)
         data_config = DataConfig(**data_config)
         model_config = ModelConfig(**model_config)
+        if base_model_name_or_path is not None:
+            model_config.model_name_or_path = base_model_name_or_path
         peft_lora_config = PEFTLoraConfig(**peft_lora_config)
 
         training_args = TrainingConfig(
