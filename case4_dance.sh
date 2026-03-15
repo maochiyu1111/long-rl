@@ -6,7 +6,7 @@ set -x
 export PYTHONUNBUFFERED=1
 export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
 export TRANSFORMERS_OFFLINE="${TRANSFORMERS_OFFLINE:-1}"
-export SERIAL_INIT_MODEL="${SERIAL_INIT_MODEL:-0}"
+export N_GPUS_VIDEO_INIT="${N_GPUS_VIDEO_INIT:-0}"
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONFIG_PATH="${CONFIG_PATH:-${ROOT_DIR}/examples/diffusion}"
@@ -49,12 +49,16 @@ if (( TRAIN_BATCH_SIZE % WORLD_SIZE != 0 )); then
   exit 1
 fi
 
-if [[ "${SERIAL_INIT_MODEL}" == "1" ]]; then
-  echo "SERIAL_INIT_MODEL=1, actor/rollout worker init_model will run serially." >&2
-  OVERRIDES+=("+trainer.serial_init_model=true")
+declare -a OVERRIDES
+if [[ ! "${N_GPUS_VIDEO_INIT}" =~ ^[0-9]+$ ]]; then
+  echo "N_GPUS_VIDEO_INIT (${N_GPUS_VIDEO_INIT}) must be a non-negative integer." >&2
+  exit 1
+fi
+if (( N_GPUS_VIDEO_INIT > 0 )); then
+  echo "N_GPUS_VIDEO_INIT=${N_GPUS_VIDEO_INIT}, actor/rollout worker init_model will initialize in groups of ${N_GPUS_VIDEO_INIT}." >&2
+  OVERRIDES+=("+trainer.n_gpus_video_init=${N_GPUS_VIDEO_INIT}")
 fi
 
-declare -a OVERRIDES
 OVERRIDES+=("hydra.job.chdir=false")
 OVERRIDES+=("trainer.project_name=${PROJECT_NAME}")
 OVERRIDES+=("trainer.experiment_name=${EXPERIMENT_NAME}")

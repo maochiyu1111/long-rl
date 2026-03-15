@@ -664,6 +664,20 @@ class RayWorkerGroup(WorkerGroup):
             results.append(ray.get(self._execute_remote_single_worker(worker, method_name, *args, **kwargs)))
         return results
 
+    def execute_all_batched_sync(self, method_name: str, batch_size: int, *args, **kwargs):
+        """Execute a method on all workers synchronously in fixed-size batches."""
+        if batch_size <= 0:
+            raise ValueError(f"batch_size must be positive, got {batch_size}")
+
+        results = []
+        for start in range(0, len(self._workers), batch_size):
+            worker_batch = self._workers[start : start + batch_size]
+            result_batch = [
+                self._execute_remote_single_worker(worker, method_name, *args, **kwargs) for worker in worker_batch
+            ]
+            results.extend(ray.get(result_batch))
+        return results
+
     def execute_all_async(self, method_name: str, *args, **kwargs):
         """Execute a method on all workers asynchronously.
 

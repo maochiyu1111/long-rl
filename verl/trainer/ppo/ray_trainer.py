@@ -1674,11 +1674,35 @@ class RayPPOTrainer:
             self.actor_rollout_llm_wg.init_model()
         else:
             self.actor_rollout_wg = all_wg["actor_rollout"]
+            n_gpus_video_init = OmegaConf.select(self.config, "trainer.n_gpus_video_init", default=0)
+            if n_gpus_video_init is None:
+                n_gpus_video_init = 0
+            try:
+                n_gpus_video_init = int(n_gpus_video_init)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"trainer.n_gpus_video_init must be an integer, got {n_gpus_video_init!r}") from exc
             serial_init_model = bool(
                 OmegaConf.select(self.config, "trainer.serial_init_model", default=False)
             ) or os.environ.get("SERIAL_INIT_MODEL", "0").strip().lower() in {"1", "true", "yes", "on"}
-            if serial_init_model:
+            env_n_gpus_video_init = os.environ.get("N_GPUS_VIDEO_INIT")
+            if env_n_gpus_video_init:
+                try:
+                    n_gpus_video_init = int(env_n_gpus_video_init)
+                except ValueError as exc:
+                    raise ValueError(
+                        f"N_GPUS_VIDEO_INIT must be an integer, got {env_n_gpus_video_init!r}"
+                    ) from exc
+
+            if n_gpus_video_init < 0:
+                raise ValueError(f"n_gpus_video_init must be non-negative, got {n_gpus_video_init}")
+
+            if serial_init_model and n_gpus_video_init <= 0:
+                n_gpus_video_init = 1
+
+            if n_gpus_video_init == 1:
                 self.actor_rollout_wg.execute_all_serial_sync("init_model")
+            elif 1 < n_gpus_video_init < self.actor_rollout_wg.world_size:
+                self.actor_rollout_wg.execute_all_batched_sync("init_model", n_gpus_video_init)
             else:
                 self.actor_rollout_wg.init_model()
 
