@@ -13,7 +13,7 @@ data:
   gen_batch_size: 16
   val_batch_size: 1
   dataloader_num_workers: 0
-  data_json_path: /workspace/projetcs/long-rl/rl_embeddings/videos2caption.json
+  data_json_path: /share/models/dancegrpo/rl_embeddings/videos2caption.json
   t: 28
   cfg: 0.0
 
@@ -88,7 +88,7 @@ actor_rollout_ref:
 trainer:
   total_epochs: 1
   total_training_steps: null
-  max_train_steps: 1
+  max_train_steps: 4
   project_name: dance_case4
   experiment_name: case4_dance
   logger: ["console"]

@@ -43,6 +43,21 @@ class Qwen2VLRewardModelBT(Qwen2VLForConditionalGeneration):
         if self.special_token_ids is not None:
             self.reward_token = "special"
 
+    def _embed_input_ids(self, input_ids: torch.LongTensor) -> torch.FloatTensor:
+        embedding_layer = None
+
+        if hasattr(self, "get_input_embeddings"):
+            embedding_layer = self.get_input_embeddings()
+        elif hasattr(self.model, "get_input_embeddings"):
+            embedding_layer = self.model.get_input_embeddings()
+        elif hasattr(self.model, "embed_tokens"):
+            embedding_layer = self.model.embed_tokens
+
+        if embedding_layer is None:
+            raise AttributeError("Qwen2VL reward model could not resolve an input embedding layer")
+
+        return embedding_layer(input_ids)
+
     def forward(
         self,
         input_ids: torch.LongTensor = None,
@@ -68,7 +83,7 @@ class Qwen2VLRewardModelBT(Qwen2VLForConditionalGeneration):
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
         if inputs_embeds is None:
-            inputs_embeds = self.model.embed_tokens(input_ids)
+            inputs_embeds = self._embed_input_ids(input_ids)
             if pixel_values is not None:
                 pixel_values = pixel_values.type(self.visual.get_dtype())
                 image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw)
