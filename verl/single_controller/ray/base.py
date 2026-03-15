@@ -576,7 +576,20 @@ class RayWorkerGroup(WorkerGroup):
             remote_call = getattr(worker, self.fused_worker_execute_fn_name)
             return remote_call.remote(f"{self.sub_cls_name}_fwmn_{method_name}", *args, **kwargs)
         # fused worker not used
-        remote_call = getattr(worker, method_name)
+        try:
+            remote_call = getattr(worker, method_name)
+        except AttributeError:
+            prefixed_method_name = next(
+                (
+                    candidate
+                    for candidate in dir(self)
+                    if candidate.endswith(f"_{method_name}") and callable(getattr(self, candidate))
+                ),
+                None,
+            )
+            if prefixed_method_name is None:
+                raise
+            remote_call = getattr(worker, prefixed_method_name)
         return remote_call.remote(*args, **kwargs)
 
     def execute_rank_zero_sync(self, method_name: str, *args, **kwargs):
@@ -643,6 +656,13 @@ class RayWorkerGroup(WorkerGroup):
             List of results from all workers
         """
         return ray.get(self.execute_all_async(method_name, *args, **kwargs))
+
+    def execute_all_serial_sync(self, method_name: str, *args, **kwargs):
+        """Execute a method on all workers synchronously, one worker at a time."""
+        results = []
+        for worker in self._workers:
+            results.append(ray.get(self._execute_remote_single_worker(worker, method_name, *args, **kwargs)))
+        return results
 
     def execute_all_async(self, method_name: str, *args, **kwargs):
         """Execute a method on all workers asynchronously.

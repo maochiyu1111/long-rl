@@ -1674,7 +1674,13 @@ class RayPPOTrainer:
             self.actor_rollout_llm_wg.init_model()
         else:
             self.actor_rollout_wg = all_wg["actor_rollout"]
-            self.actor_rollout_wg.init_model()
+            serial_init_model = bool(
+                OmegaConf.select(self.config, "trainer.serial_init_model", default=False)
+            ) or os.environ.get("SERIAL_INIT_MODEL", "0").strip().lower() in {"1", "true", "yes", "on"}
+            if serial_init_model:
+                self.actor_rollout_wg.execute_all_serial_sync("init_model")
+            else:
+                self.actor_rollout_wg.init_model()
 
         # create async rollout manager and request scheduler
         self.async_rollout_mode = False

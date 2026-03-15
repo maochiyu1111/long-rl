@@ -6,6 +6,7 @@ set -x
 export PYTHONUNBUFFERED=1
 export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
 export TRANSFORMERS_OFFLINE="${TRANSFORMERS_OFFLINE:-1}"
+export SERIAL_INIT_MODEL="${SERIAL_INIT_MODEL:-0}"
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONFIG_PATH="${CONFIG_PATH:-${ROOT_DIR}/examples/diffusion}"
@@ -48,6 +49,11 @@ if (( TRAIN_BATCH_SIZE % WORLD_SIZE != 0 )); then
   exit 1
 fi
 
+if [[ "${SERIAL_INIT_MODEL}" == "1" ]]; then
+  echo "SERIAL_INIT_MODEL=1, actor/rollout worker init_model will run serially." >&2
+  OVERRIDES+=("+trainer.serial_init_model=true")
+fi
+
 declare -a OVERRIDES
 OVERRIDES+=("hydra.job.chdir=false")
 OVERRIDES+=("trainer.project_name=${PROJECT_NAME}")
@@ -78,7 +84,7 @@ if [[ -n "${VIDEOALIGN_CKPT_PATH:-}" ]]; then
   OVERRIDES+=("actor_rollout_ref.actor.extra.dance.videoalign_ckpt_path=${VIDEOALIGN_CKPT_PATH}")
 fi
 if [[ -n "${VIDEOALIGN_BASE_MODEL_PATH:-}" ]]; then
-  OVERRIDES+=("actor_rollout_ref.actor.extra.dance.videoalign_base_model_name_or_path=${VIDEOALIGN_BASE_MODEL_PATH}")
+  OVERRIDES+=("+actor_rollout_ref.actor.extra.dance.videoalign_base_model_name_or_path=${VIDEOALIGN_BASE_MODEL_PATH}")
 fi
 if [[ -n "${DATA_JSON_PATH:-}" ]]; then
   OVERRIDES+=("data.data_json_path=${DATA_JSON_PATH}")
