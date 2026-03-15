@@ -444,12 +444,16 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         rollout = getattr(self, "rollout", None)
         pipeline = getattr(rollout, "pipeline", None)
-        if pipeline is None:
+        if pipeline is not None:
+            pipeline_module = getattr(pipeline, module, None)
+            if pipeline_module is None:
+                raise AttributeError(f"rollout.pipeline has no module '{module}'")
+        elif self._is_dance_case3_mode():
+            pipeline_module = rollout
+            if pipeline_module is None:
+                raise RuntimeError("normalize_pipeline_dtype() requires dance case3 rollout to be initialized.")
+        else:
             raise RuntimeError("normalize_pipeline_dtype() requires a rollout with a `pipeline` attribute.")
-
-        pipeline_module = getattr(pipeline, module, None)
-        if pipeline_module is None:
-            raise AttributeError(f"rollout.pipeline has no module '{module}'")
 
         from verl.utils.torch_dtypes import PrecisionType
 
@@ -473,6 +477,18 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                     if buffer.dtype != target_dtype:
                         submodule._buffers[buffer_name] = buffer.to(dtype=target_dtype)
 
+    def _get_rollout_sync_module(self):
+        rollout = getattr(self, "rollout", None)
+        if rollout is None:
+            raise RuntimeError("rollout is not initialized")
+
+        pipeline = getattr(rollout, "pipeline", None)
+        if pipeline is not None and getattr(pipeline, "transformer", None) is not None:
+            return pipeline.transformer
+        if self._is_dance_case3_mode():
+            return rollout
+        raise RuntimeError("rollout.pipeline or pipeline.transformer doesn't exist")
+
     @register(dispatch_mode=Dispatch.ALL_TO_ALL)
     def sync_transformer_gdr_with_relay(self, chunk_mb: int = 256) -> None:
         if not self.diffusion:
@@ -492,10 +508,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         pipeline_transformer = None
         if world_rank in self.rollout_ref_group_ranks:
-            pipe = getattr(self.rollout, "pipeline", None)
-            if pipe is None or getattr(pipe, "transformer", None) is None:
-                raise RuntimeError("rollout.pipeline or pipeline.transformer doesn't exist")
-            pipeline_transformer = pipe.transformer
+            pipeline_transformer = self._get_rollout_sync_module()
 
         logger.debug(
             "[GDR-Relay][Phase0][enter] world_rank=%s actor_src=%s relay=%s local_rank=%s cuda_device=%s pair_ranks=%s",
@@ -717,6 +730,28 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             scheduler_path = os.path.join(local_model_path, "scheduler")
         return scheduler_path
 
+    def _is_dance_case3_enabled(self) -> bool:
+        return bool(self.config.actor.get("dance_case3_mode", False))
+
+    def _dance_case3_mismatch_reasons(self) -> list[str]:
+        reasons: list[str] = []
+        if not self.diffusion:
+            reasons.append("trainer.diffusion must be true")
+        if not self.disaggregate:
+            reasons.append("trainer.disaggregate must be true")
+
+        trainer_pipelined = OmegaConf.select(self.config, "trainer.pipelined_micro_batch")
+        if trainer_pipelined is not None and bool(trainer_pipelined):
+            reasons.append("trainer.pipelined_micro_batch must be false")
+
+        adv_estimator = OmegaConf.select(self.config, "algorithm.adv_estimator")
+        if adv_estimator is not None and str(adv_estimator).lower() != "grpo":
+            reasons.append("algorithm.adv_estimator must be grpo")
+        return reasons
+
+    def _is_dance_case3_mode(self) -> bool:
+        return self._is_dance_case3_enabled() and len(self._dance_case3_mismatch_reasons()) == 0
+
     def _is_dance_case4_enabled(self) -> bool:
         return bool(self.config.actor.get("dance_case4_mode", False))
 
@@ -744,6 +779,108 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         if grad_clip is None:
             grad_clip = self.config.actor.get("max_grad_norm", 1.0)
         return float(grad_clip)
+
+    def _build_model_optimizer_dance_dis(self) -> None:
+        from accelerate.utils import set_seed
+        from diffusers.optimization import get_scheduler
+        from fastvideo.utils.fsdp_util import apply_fsdp_checkpointing, get_dit_fsdp_kwargs
+        from fastvideo.utils.load import load_transformer, load_vae
+
+        actor_extra = self.config.actor.get("extra", {})
+        dance_cfg = actor_extra.get("dance", {}) if hasattr(actor_extra, "get") else {}
+
+        def _cfg_get(cfg: Any, key: str, default: Any = None) -> Any:
+            if cfg is None:
+                return default
+            if hasattr(cfg, "get"):
+                val = cfg.get(key, default)
+            else:
+                val = getattr(cfg, key, default)
+            return default if val is None else val
+
+        seed = OmegaConf.select(self.config, "algorithm.seed")
+        if seed is not None:
+            set_seed(seed)
+
+        pretrained_model_name_or_path = _cfg_get(dance_cfg, "pretrained_model_name_or_path", self._get_local_model_path())
+        model_type = _cfg_get(dance_cfg, "model_type", "hunyuan_hf")
+        master_weight_type = _cfg_get(dance_cfg, "master_weight_type", "bf16")
+        sharding_strategy = _cfg_get(dance_cfg, "fsdp_sharding_strategy", "full")
+        use_cpu_offload = bool(_cfg_get(dance_cfg, "use_cpu_offload", False))
+        gradient_checkpointing = bool(
+            self.config.model.get("enable_gradient_checkpointing", False)
+            or actor_extra.get("gradient_checkpointing", False)
+        )
+
+        self.inferencer = None
+        if self.role == "rollout_ref":
+            use_videoalign = bool(_cfg_get(dance_cfg, "use_videoalign", False))
+            if use_videoalign:
+                from fastvideo.models.videoalign.inference import VideoVLMRewardInference
+
+                ckpt_path = _cfg_get(dance_cfg, "videoalign_ckpt_path", "/share/models/dancegrpo/videoalign_ckpt")
+                base_model_name_or_path = _cfg_get(dance_cfg, "videoalign_base_model_name_or_path", None)
+                self.inferencer = VideoVLMRewardInference(
+                    load_from_pretrained=ckpt_path,
+                    device=torch.device(get_device_name(), get_device_id()),
+                    dtype=torch.bfloat16,
+                    base_model_name_or_path=base_model_name_or_path,
+                )
+
+            self.rollout = load_transformer(
+                model_type=model_type,
+                dit_model_name_or_path=None,
+                pretrained_model_name_or_path=pretrained_model_name_or_path,
+                master_weight_type=torch.bfloat16,
+            ).to(torch.device(get_device_name(), get_device_id()))
+            self.rollout.eval()
+
+            vae_model_path = _cfg_get(dance_cfg, "vae_model_path", pretrained_model_name_or_path)
+            self.vae, _, fps = load_vae(model_type, vae_model_path)
+            self.rollout_fps = int(_cfg_get(self.config.rollout, "fps", fps))
+            return
+
+        if self.role != "actor":
+            raise ValueError(f"dance_case3_mode only supports role='actor' or role='rollout_ref', got {self.role}")
+
+        transformer = load_transformer(
+            model_type=model_type,
+            dit_model_name_or_path=None,
+            pretrained_model_name_or_path=pretrained_model_name_or_path,
+            master_weight_type=torch.float32 if master_weight_type == "fp32" else torch.bfloat16,
+        )
+        fsdp_kwargs, no_split_modules = get_dit_fsdp_kwargs(
+            transformer=transformer,
+            sharding_strategy=sharding_strategy,
+            use_lora=False,
+            cpu_offload=use_cpu_offload,
+            master_weight_type=master_weight_type,
+        )
+        self.transformer = FSDP(transformer, process_group=self.actor_pg, **fsdp_kwargs)
+        self.actor_module_fsdp = self.transformer
+
+        if gradient_checkpointing:
+            selective_checkpointing = actor_extra.get("selective_checkpointing", 1.0)
+            apply_fsdp_checkpointing(transformer, no_split_modules, selective_checkpointing)
+
+        self.transformer.train()
+        params_to_optimize = [p for p in self.transformer.parameters() if p.requires_grad]
+        self.optimizer = torch.optim.AdamW(
+            params_to_optimize,
+            lr=float(self.config.actor.optim.lr),
+            betas=(0.9, 0.999),
+            weight_decay=float(self.config.actor.optim.weight_decay),
+            eps=1e-8,
+        )
+        self.lr_scheduler = get_scheduler(
+            name=self.config.actor.optim.get("warmup_style", "constant"),
+            optimizer=self.optimizer,
+            num_warmup_steps=max(0, int(self.config.actor.optim.get("lr_warmup_steps", 0))),
+            num_training_steps=max(1, int(self.config.actor.optim.get("total_training_steps", 1_000_000))),
+            num_cycles=float(self.config.actor.optim.get("num_cycles", 0.5)),
+            power=float(self.config.actor.optim.get("power", 1.0)),
+            last_epoch=-1,
+        )
 
     def _build_model_optimizer_dance(self) -> None:
         from accelerate.utils import set_seed
@@ -845,6 +982,9 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         dance_cfg = actor_extra.get("dance", {}) if hasattr(actor_extra, "get") else {}
         use_videoalign = bool(dance_cfg.get("use_videoalign", False))
         device = torch.device(get_device_name(), get_device_id())
+        rollout_model = self.rollout if self._is_dance_case3_mode() else self.transformer
+        if rollout_model is None:
+            raise RuntimeError("dance rollout model is not initialized")
 
         encoder_hidden_states = prompts.batch["encoder_hidden_states"].to(device)
         encoder_attention_mask = prompts.batch["encoder_attention_mask"].to(device)
@@ -862,7 +1002,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             elif isinstance(caption, (list, tuple)):
                 caption = [item for item in list(caption) for _ in range(self.config.rollout.num_generations)]
             else:
-                raise ValueError(f"Unsupported caption type for dance case4: {type(caption)}")
+                raise ValueError(f"Unsupported caption type for dance case rollout: {type(caption)}")
         elif isinstance(caption, str):
             caption = [caption]
         elif isinstance(caption, tuple):
@@ -894,7 +1034,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             if grpo and prev_sample is None:
                 prev_sample = prev_sample_mean + torch.randn_like(prev_sample_mean) * std_dev_t
             if not grpo:
-                raise ValueError("dance case4 rollout expects GRPO mode")
+                raise ValueError("dance case rollout expects GRPO mode")
             log_prob = (
                 -((prev_sample.detach().to(torch.float32) - prev_sample_mean.to(torch.float32)) ** 2)
                 / (2 * (std_dev_t**2))
@@ -953,9 +1093,9 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                     sigma = sigma_schedule[i]
                     timestep_value = int(float(sigma) * 1000)
                     timesteps = torch.full([batch_encoder_hidden_states.shape[0]], timestep_value, device=z.device, dtype=torch.long)
-                    self.transformer.eval()
+                    rollout_model.eval()
                     with torch.autocast("cuda", torch.bfloat16):
-                        model_pred = self.transformer(
+                        model_pred = rollout_model(
                             hidden_states=z,
                             encoder_hidden_states=batch_encoder_hidden_states,
                             timestep=timesteps,
@@ -1003,7 +1143,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                     vq_reward = torch.tensor(reward[0]["VQ"], device=encoder_hidden_states.device)
                     mq_reward = torch.tensor(reward[0]["MQ"], device=encoder_hidden_states.device)
                 except Exception:
-                    logger.exception("[dance_case4] videoalign reward failed, fallback to -1 reward")
+                    logger.exception("[dance_case] videoalign reward failed, fallback to -1 reward")
             all_vq_rewards.append(vq_reward.unsqueeze(0))
             all_mq_rewards.append(mq_reward.unsqueeze(0))
 
@@ -1062,7 +1202,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             if grpo and prev_sample is None:
                 prev_sample = prev_sample_mean + torch.randn_like(prev_sample_mean) * std_dev_t
             if not grpo:
-                raise ValueError("dance case4 update expects GRPO mode")
+                raise ValueError("dance case update expects GRPO mode")
 
             log_prob = (
                 -((prev_sample.detach().to(torch.float32) - prev_sample_mean.to(torch.float32)) ** 2)
@@ -1761,6 +1901,14 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         # This is used to import external_lib into the huggingface systems
         import_external_libs(self.config.model.get("external_lib", None))
 
+        if self._is_dance_case3_enabled():
+            reasons = self._dance_case3_mismatch_reasons()
+            if reasons:
+                reason_text = "; ".join(reasons)
+                raise ValueError(f"[dance_case3] dance_case3_mode=true but case3 conditions are not met: {reason_text}")
+            self._build_model_optimizer_dance_dis()
+            return
+
         if self._is_dance_case4_enabled():
             reasons = self._dance_case4_mismatch_reasons()
             if reasons:
@@ -1893,6 +2041,14 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         # Support all hardwares
         data = data.to(get_device_id())
 
+        if self._is_dance_case3_enabled() and not self._is_dance_case3_mode():
+            reasons = "; ".join(self._dance_case3_mismatch_reasons())
+            raise ValueError(f"[dance_case3] worker update_actor rejected due to case3 condition mismatch: {reasons}")
+        if self._is_dance_case3_mode():
+            if self.role != "actor":
+                raise ValueError(f"[dance_case3] update_actor is only valid on role='actor', got {self.role}")
+            return self._update_actor_dance(data)
+
         if self._is_dance_case4_enabled() and not self._is_dance_case4_mode():
             reasons = "; ".join(self._dance_case4_mismatch_reasons())
             raise ValueError(f"[dance_case4] worker update_actor rejected due to case4 condition mismatch: {reasons}")
@@ -1946,6 +2102,16 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     def generate_sequences(self, prompts: DataProto):
         # Support all hardwares
         prompts = prompts.to(get_device_id())
+
+        if self._is_dance_case3_enabled() and not self._is_dance_case3_mode():
+            reasons = "; ".join(self._dance_case3_mismatch_reasons())
+            raise ValueError(f"[dance_case3] worker generate_sequences rejected due to case3 condition mismatch: {reasons}")
+        if self._is_dance_case3_mode():
+            if self.role != "rollout_ref":
+                raise ValueError(
+                    f"[dance_case3] generate_sequences is only valid on role='rollout_ref', got {self.role}"
+                )
+            return self._generate_sequences_dance(prompts)
 
         if self._is_dance_case4_enabled() and not self._is_dance_case4_mode():
             reasons = "; ".join(self._dance_case4_mismatch_reasons())

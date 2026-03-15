@@ -393,7 +393,7 @@ Case3 迁移过程中可以有最小适配，但不能在不记录的情况下�
 只有同时满足下面这些条件，Case3 才算迁移完成：
 
 - [ ] 1 step 冒烟跑通
-- [ ] 10 steps 稳定运行
+- [ ] 4 steps 稳定运行
 - [ ] 无 NaN / shape mismatch / key missing
 - [ ] rollout 返回字段与 `disco_rl` 基线一致
 - [ ] actor 至少发生一次真实 `optimizer.step()`

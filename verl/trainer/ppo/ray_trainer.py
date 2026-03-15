@@ -621,6 +621,17 @@ class RayPPOTrainer:
 
     def fit_dis(self):
         """Disaggregate training entry (diffusion path)."""
+        if self._is_dance_case3_enabled():
+            reasons = self._dance_case3_mismatch_reasons()
+            if reasons:
+                reason_text = "; ".join(reasons)
+                raise ValueError(
+                    f"dance_case3_mode=true but Case3 conditions are not met ({reason_text}). "
+                    "Expected: diffusion=true, disaggregate=true, pipelined_micro_batch=false, adv_estimator=grpo."
+                )
+            self.init_workers_dis()
+            return self.fit_dance_case3_dis()
+
         self.init_workers_dis()
         if self.diffusion:
             pipeline_dtype = OmegaConf.select(
@@ -1094,12 +1105,12 @@ class RayPPOTrainer:
         except Exception as e:
             print(f"Warning: Could not set total_training_steps in config. Structure missing? Error: {e}")
 
-    def _create_dance_case4_dataloader(self) -> None:
+    def _create_dance_latent_dataloader(self, mode_name: str) -> None:
         from fastvideo.dataset.latent_rl_datasets import LatentDataset, latent_collate_function
 
         data_json_path = self.config.data.get("data_json_path", None)
         if data_json_path is None:
-            raise ValueError("dance_case4_mode=true requires `data.data_json_path`")
+            raise ValueError(f"{mode_name}=true requires `data.data_json_path`")
 
         num_latent_t = int(self.config.data.get("t", 1))
         cfg_rate = float(self.config.data.get("cfg", 0.0))
@@ -1119,13 +1130,22 @@ class RayPPOTrainer:
         self.val_dataloader = None
 
         assert len(self.train_dataloader) >= 1, "Train dataloader is empty!"
-        print(f"Size of train dataloader: {len(self.train_dataloader)}, validation disabled for dance_case4")
+        print(f"Size of train dataloader: {len(self.train_dataloader)}, validation disabled for {mode_name}")
         self._set_total_training_steps()
+
+    def _create_dance_case3_dataloader(self) -> None:
+        self._create_dance_latent_dataloader("dance_case3_mode")
+
+    def _create_dance_case4_dataloader(self) -> None:
+        self._create_dance_latent_dataloader("dance_case4_mode")
 
     def _create_dataloader(self, train_dataset, val_dataset, collate_fn, train_sampler: Optional[Sampler]):
         """
         Creates the train and validation dataloaders.
         """
+        if self._is_dance_case3_enabled():
+            self._create_dance_case3_dataloader()
+            return
         if self._is_dance_case4_enabled():
             self._create_dance_case4_dataloader()
             return
@@ -2022,6 +2042,26 @@ class RayPPOTrainer:
         else:
             print(header)
 
+    def _is_dance_case3_enabled(self) -> bool:
+        return bool(self.config.actor_rollout_ref.actor.get("dance_case3_mode", False))
+
+    def _dance_case3_mismatch_reasons(self) -> list[str]:
+        reasons: list[str] = []
+        if not self.diffusion:
+            reasons.append("trainer.diffusion must be true")
+        if not self.diffusion_disaggregate:
+            reasons.append("trainer.disaggregate must be true")
+        if bool(self.config.trainer.get("pipelined_micro_batch", False)):
+            reasons.append("trainer.pipelined_micro_batch must be false")
+
+        adv_estimator = str(self.config.algorithm.adv_estimator).lower()
+        if adv_estimator not in {"grpo", "advantageestimator.grpo"}:
+            reasons.append("algorithm.adv_estimator must be grpo")
+        return reasons
+
+    def _is_dance_case3_mode(self) -> bool:
+        return self._is_dance_case3_enabled() and len(self._dance_case3_mismatch_reasons()) == 0
+
     def _is_dance_case4_enabled(self) -> bool:
         return bool(self.config.actor_rollout_ref.actor.get("dance_case4_mode", False))
 
@@ -2041,6 +2081,53 @@ class RayPPOTrainer:
 
     def _is_dance_case4_mode(self) -> bool:
         return self._is_dance_case4_enabled() and len(self._dance_case4_mismatch_reasons()) == 0
+
+    def fit_dance_case3_dis(self):
+        max_train_steps = self.config.trainer.get("max_train_steps", None)
+        if max_train_steps is None:
+            max_train_steps = self.total_training_steps
+        max_train_steps = int(max_train_steps)
+        if max_train_steps <= 0:
+            raise ValueError(f"Invalid max_train_steps for dance case3: {max_train_steps}")
+
+        self.global_steps = 0
+        data_iterator = iter(self.train_dataloader)
+        progress_bar = tqdm(total=max_train_steps, initial=self.global_steps, desc="Dance Case3")
+
+        while self.global_steps < max_train_steps:
+            try:
+                batch = next(data_iterator)
+            except StopIteration:
+                data_iterator = iter(self.train_dataloader)
+                batch = next(data_iterator)
+
+            if not isinstance(batch, (list, tuple)) or len(batch) != 3:
+                raise ValueError(
+                    "dance_case3_mode requires dataloader to return "
+                    "(encoder_hidden_states, encoder_attention_mask, caption)"
+                )
+
+            encoder_hidden_states, encoder_attention_mask, caption = batch
+            new_batch = DataProto.from_single_dict(
+                {
+                    "encoder_hidden_states": encoder_hidden_states,
+                    "encoder_attention_mask": encoder_attention_mask,
+                },
+                meta_info={"caption": caption},
+            )
+
+            self._sync_diffusion_disaggregate_before_rollout()
+            rollout_batch = self.rollout_ref_wg.generate_sequences(new_batch)
+            actor_output = self.actor_wg.update_actor(rollout_batch)
+            actor_metrics = actor_output.meta_info.get("metrics", {}) if actor_output is not None else {}
+            if actor_metrics:
+                progress_bar.set_postfix({k: f"{v:.4f}" for k, v in actor_metrics.items() if isinstance(v, (int, float))})
+
+            self.global_steps += 1
+            progress_bar.update(1)
+
+        progress_bar.close()
+        return None
 
     def fit_dance_case4(self):
         max_train_steps = self.config.trainer.get("max_train_steps", None)
