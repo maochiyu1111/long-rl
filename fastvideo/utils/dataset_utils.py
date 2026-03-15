@@ -6,7 +6,7 @@ import random
 from collections import Counter
 from typing import List, Optional
 
-import decord
+# import decord
 import torch
 import torch.utils
 import torch.utils.data

@@ -152,6 +152,27 @@ def _insert_adapter_name_into_state_dict(
     return peft_model_state_dict
 
 
+def _remap_legacy_videoalign_full_state_dict(
+    state_dict: dict[str, torch.Tensor], expected_keys
+) -> Optional[dict[str, torch.Tensor]]:
+    remapped_state_dict = {}
+    for key, value in state_dict.items():
+        new_key = key
+        if key.startswith("base_model.model.visual."):
+            new_key = "base_model.model.model.visual." + key[len("base_model.model.visual.") :]
+        elif key.startswith("base_model.model.model.embed_tokens."):
+            new_key = "base_model.model.model.language_model.embed_tokens." + key[len("base_model.model.model.embed_tokens.") :]
+        elif key.startswith("base_model.model.model.layers."):
+            new_key = "base_model.model.model.language_model.layers." + key[len("base_model.model.model.layers.") :]
+        elif key.startswith("base_model.model.model.norm."):
+            new_key = "base_model.model.model.language_model.norm." + key[len("base_model.model.model.norm.") :]
+        remapped_state_dict[new_key] = value
+
+    if set(remapped_state_dict.keys()) == set(expected_keys):
+        return remapped_state_dict
+    return None
+
+
 def save_video(tensor, path):
     from torchvision.io import write_video
     tensor = tensor * 255.0
@@ -185,7 +206,17 @@ def load_model_from_checkpoint(
     non_lora_ckpt = os.path.join(checkpoint_path, "non_lora_state_dict.pth")
     if os.path.exists(full_ckpt):
         model_state_dict = torch.load(full_ckpt, map_location="cpu")
-        model.load_state_dict(model_state_dict, strict=True)
+        try:
+            model.load_state_dict(model_state_dict, strict=True)
+        except RuntimeError as exc:
+            remapped_state_dict = _remap_legacy_videoalign_full_state_dict(
+                state_dict=model_state_dict,
+                expected_keys=model.state_dict().keys(),
+            )
+            if remapped_state_dict is None:
+                raise exc
+            print("===> Detected legacy VideoAlign checkpoint layout, remapping state_dict keys for compatibility.")
+            model.load_state_dict(remapped_state_dict, strict=True)
     else:
         lora_state_dict = safetensors.torch.load_file(lora_ckpt)
         non_lora_state_dict = torch.load(non_lora_ckpt, map_location="cpu")
