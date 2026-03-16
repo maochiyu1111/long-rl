@@ -41,7 +41,7 @@ class _RecordingActorWG:
         return DataProto(meta_info={"metrics": {"actor/loss": 0.25}})
 
 
-def test_fit_dis_dance_case3_uses_encoder_state_protocol_and_syncs_before_rollout(monkeypatch):
+def test_fit_dis_dance_case3_uses_encoder_state_protocol_without_sync(monkeypatch):
     def _legacy_path_should_not_run(*_args, **_kwargs):
         raise AssertionError("legacy diffusion fit_dis path should not run in dance_case3")
 
@@ -91,7 +91,7 @@ def test_fit_dis_dance_case3_uses_encoder_state_protocol_and_syncs_before_rollou
     trainer.fit_dis()
 
     assert calls["init_workers_dis"] == 1
-    assert calls["sync"] == 1
+    assert calls["sync"] == 0
     assert len(trainer.rollout_ref_wg.generate_inputs) == 1
     generate_input = trainer.rollout_ref_wg.generate_inputs[0]
     assert set(generate_input.batch.keys()) == {"encoder_hidden_states", "encoder_attention_mask"}

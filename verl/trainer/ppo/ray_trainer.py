@@ -2118,7 +2118,6 @@ class RayPPOTrainer:
                 meta_info={"caption": caption},
             )
 
-            self._sync_diffusion_disaggregate_before_rollout()
             rollout_batch = self.rollout_ref_wg.generate_sequences(new_batch)
             actor_output = self.actor_wg.update_actor(rollout_batch)
             actor_metrics = actor_output.meta_info.get("metrics", {}) if actor_output is not None else {}
