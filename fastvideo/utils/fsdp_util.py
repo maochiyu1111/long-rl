@@ -14,6 +14,7 @@ from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
 
 from fastvideo.models.mochi_hf.modeling_mochi import MochiTransformerBlock
 from fastvideo.utils.load import get_no_split_modules
+from verl.utils.device import get_device_id, get_device_name
 
 non_reentrant_wrapper = partial(
     checkpoint_wrapper,
@@ -95,7 +96,7 @@ def get_dit_fsdp_kwargs(
     elif sharding_strategy == "hybrid_zero2":
         sharding_strategy = ShardingStrategy._HYBRID_SHARD_ZERO2
 
-    device_id = torch.cuda.current_device()
+    device_id = None if get_device_name() == "cpu" else get_device_id()
     cpu_offload = (torch.distributed.fsdp.CPUOffload(
         offload_params=True) if cpu_offload else None)
     fsdp_kwargs = {
@@ -124,7 +125,7 @@ def get_discriminator_fsdp_kwargs(master_weight_type="fp32"):
 
     mixed_precision = get_mixed_precision(master_weight_type)
     sharding_strategy = ShardingStrategy.NO_SHARD
-    device_id = torch.cuda.current_device()
+    device_id = None if get_device_name() == "cpu" else get_device_id()
     fsdp_kwargs = {
         "auto_wrap_policy": auto_wrap_policy,
         "mixed_precision": mixed_precision,

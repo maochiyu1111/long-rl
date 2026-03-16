@@ -1131,7 +1131,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                     timestep_value = int(float(sigma) * 1000)
                     timesteps = torch.full([batch_encoder_hidden_states.shape[0]], timestep_value, device=z.device, dtype=torch.long)
                     rollout_model.eval()
-                    with torch.autocast("cuda", torch.bfloat16):
+                    with torch.autocast(device_type=get_device_name(), dtype=torch.bfloat16):
                         model_pred = rollout_model(
                             hidden_states=z,
                             encoder_hidden_states=batch_encoder_hidden_states,
@@ -1163,7 +1163,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             self.vae.enable_tiling()
             video_processor = VideoProcessor(vae_scale_factor=8)
             with torch.inference_mode():
-                with torch.autocast("cuda", dtype=torch.bfloat16):
+                with torch.autocast(device_type=get_device_name(), dtype=torch.bfloat16):
                     video = self.vae.decode(latents, return_dict=False)[0]
                     videos = video_processor.postprocess_video(video)
 
@@ -1256,7 +1256,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             timesteps: torch.Tensor,
             idx: int,
         ) -> torch.Tensor:
-            with torch.autocast("cuda", torch.bfloat16):
+            with torch.autocast(device_type=get_device_name(), dtype=torch.bfloat16):
                 self.transformer.train()
                 model_pred = self.transformer(
                     hidden_states=latents,

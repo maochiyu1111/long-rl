@@ -44,6 +44,7 @@ from diffusers.utils.accelerate_utils import apply_forward_hook
 
 from .vae import (BaseOutput, DecoderCausal3D, DecoderOutput,
                   DiagonalGaussianDistribution, EncoderCausal3D)
+from verl.utils.device import get_torch_device
 
 
 @dataclass
@@ -140,6 +141,11 @@ class AutoencoderKLCausal3D(ModelMixin, ConfigMixin, FromOriginalVAEMixin):
     def _set_gradient_checkpointing(self, module, value=False):
         if isinstance(module, (EncoderCausal3D, DecoderCausal3D)):
             module.gradient_checkpointing = value
+
+    def _empty_cache_if_available(self):
+        torch_device = get_torch_device()
+        if hasattr(torch_device, "empty_cache"):
+            torch_device.empty_cache()
 
     def enable_temporal_tiling(self, use_tiling: bool = True):
         self.use_temporal_tiling = use_tiling
@@ -689,7 +695,7 @@ class AutoencoderKLCausal3D(ModelMixin, ConfigMixin, FromOriginalVAEMixin):
 
         results = torch.cat(local_results, dim=0).contiguous()
         del local_results
-        torch.cuda.empty_cache()
+        self._empty_cache_if_available()
         # first gather size to pad the results
         local_size = torch.tensor([results.size(0)],
                                   device=results.device,
@@ -703,7 +709,7 @@ class AutoencoderKLCausal3D(ModelMixin, ConfigMixin, FromOriginalVAEMixin):
         padded_results = torch.zeros(max_size, device=results.device)
         padded_results[:results.size(0)] = results
         del results
-        torch.cuda.empty_cache()
+        self._empty_cache_if_available()
         # Gather all results
         gathered_dim_metadata = [None] * world_size
         gathered_results = torch.zeros_like(padded_results).repeat(

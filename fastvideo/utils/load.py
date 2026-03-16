@@ -21,6 +21,7 @@ from fastvideo.models.mochi_hf.modeling_mochi import (MochiTransformer3DModel,
                                                       MochiTransformerBlock)
 from fastvideo.utils.logging_ import main_print
 from diffusers.models.transformers.transformer_flux import FluxTransformer2DModel, FluxTransformerBlock, FluxSingleTransformerBlock
+from verl.utils.device import get_device_id, get_device_name
 
 hunyuan_config = {
     "mm_double_blocks_depth": 20,
@@ -302,18 +303,20 @@ def load_transformer(
 
 def load_vae(model_type, pretrained_model_name_or_path):
     weight_dtype = torch.float32
+    device_name = get_device_name()
+    device = torch.device("cpu") if device_name == "cpu" else torch.device(device_name, get_device_id())
     if model_type == "mochi":
         vae = AutoencoderKLMochi.from_pretrained(
             pretrained_model_name_or_path,
             subfolder="vae",
-            torch_dtype=weight_dtype).to("cuda")
+            torch_dtype=weight_dtype).to(device)
         autocast_type = torch.bfloat16
         fps = 30
     elif model_type == "hunyuan_hf":
         vae = AutoencoderKLHunyuanVideo.from_pretrained(
             pretrained_model_name_or_path,
             subfolder="vae",
-            torch_dtype=weight_dtype).to("cuda")
+            torch_dtype=weight_dtype).to(device)
         autocast_type = torch.bfloat16
         fps = 24
     elif model_type == "hunyuan":
@@ -338,7 +341,7 @@ def load_vae(model_type, pretrained_model_name_or_path):
         vae.load_state_dict(ckpt)
         vae = vae.to(dtype=vae_precision)
         vae.requires_grad_(False)
-        vae = vae.to("cuda")
+        vae = vae.to(device)
         vae.eval()
         autocast_type = torch.float32
         fps = 24
@@ -374,7 +377,8 @@ def get_no_split_modules(transformer):
 
 if __name__ == "__main__":
     # test encode prompt
-    device = torch.cuda.current_device()
+    device_name = get_device_name()
+    device = torch.device("cpu") if device_name == "cpu" else torch.device(device_name, get_device_id())
     pretrained_model_name_or_path = "data/hunyuan"
     text_encoder = load_text_encoder("hunyuan", pretrained_model_name_or_path,
                                      device)

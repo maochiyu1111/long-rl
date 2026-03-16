@@ -7,6 +7,13 @@ import torch.distributed as dist
 from torch import Tensor
 
 from fastvideo.utils.parallel_states import nccl_info
+from verl.utils.device import get_torch_device
+
+
+def _synchronize_if_available():
+    torch_device = get_torch_device()
+    if hasattr(torch_device, "synchronize"):
+        torch_device.synchronize()
 
 
 def broadcast(input_: torch.Tensor):
@@ -52,7 +59,7 @@ def _all_to_all_4D(input: torch.tensor,
         # (P, seq_len/P, bs, hc/P, hs) scatter seqlen -all2all-> (P, seq_len/P, bs, hc/P, hs) scatter head
         if seq_world_size > 1:
             dist.all_to_all_single(output, input_t, group=group)
-            torch.cuda.synchronize()
+            _synchronize_if_available()
         else:
             output = input_t
         # if scattering the seq-dim, transpose the heads back to the original dimension
@@ -83,7 +90,7 @@ def _all_to_all_4D(input: torch.tensor,
         # (P, bs x hc/P, seqlen/P, hs) scatter seqlen -all2all-> (P, bs x seq_len/P, hc/P, hs) scatter head
         if seq_world_size > 1:
             dist.all_to_all_single(output, input_t, group=group)
-            torch.cuda.synchronize()
+            _synchronize_if_available()
         else:
             output = input_t
 
@@ -332,4 +339,3 @@ def sp_parallel_dataloader_wrapper(
                         encoder_attention_mask,
                         caption
                     )
-

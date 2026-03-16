@@ -14,6 +14,7 @@ from fastvideo.models.videoalign.prompt_template import build_prompt
 from fastvideo.models.videoalign.utils import ModelConfig, PEFTLoraConfig, TrainingConfig
 from fastvideo.models.videoalign.utils import load_model_from_checkpoint
 from fastvideo.models.videoalign.vision_process import process_vision_info
+from verl.utils.device import get_device_id, get_device_name
 
 
 @dataclass
@@ -218,7 +219,22 @@ def _should_force_local_files_only(model_name_or_path: str) -> bool:
     return os.path.isdir(model_name_or_path) or _env_flag_enabled("HF_HUB_OFFLINE") or _env_flag_enabled("TRANSFORMERS_OFFLINE")
 
 
-def create_model_and_processor(model_config, peft_lora_config, training_args, cache_dir=None):
+def _get_default_device() -> torch.device:
+    device_name = get_device_name()
+    if device_name == "cpu":
+        return torch.device("cpu")
+    return torch.device(device_name, get_device_id())
+
+
+def _get_device_type(device: Union[str, torch.device]) -> str:
+    if isinstance(device, torch.device):
+        return device.type
+    if isinstance(device, str):
+        return device.split(":", 1)[0]
+    raise TypeError(f"Unsupported device type: {type(device)}")
+
+
+def create_model_and_processor(model_config, peft_lora_config, training_args, cache_dir=None, device_type=None):
     model_name_or_path = _resolve_base_model_name_or_path(model_config, training_args.load_from_pretrained)
     local_files_only = _should_force_local_files_only(model_name_or_path)
     torch_dtype = (
@@ -251,8 +267,10 @@ def create_model_and_processor(model_config, peft_lora_config, training_args, ca
         special_token_ids = processor.tokenizer.convert_tokens_to_ids(special_tokens)
 
     attn_implementation = model_config.attn_implementation
+    device_type = device_type or get_device_name()
     if attn_implementation is None:
-        attn_implementation = "flash_attention_2" if not training_args.disable_flash_attn2 else "sdpa"
+        use_flash_attn2 = device_type in {"cuda", "npu"} and not training_args.disable_flash_attn2
+        attn_implementation = "flash_attention_2" if use_flash_attn2 else "sdpa"
 
     model = Qwen2VLRewardModelBT.from_pretrained(
         model_name_or_path,
@@ -304,10 +322,15 @@ class VideoVLMRewardInference():
         self,
         load_from_pretrained,
         load_from_pretrained_step=-1,
-        device='cuda',
+        device=None,
         dtype=torch.bfloat16,
         base_model_name_or_path: Optional[str] = None,
     ):
+        if device is None:
+            device = _get_default_device()
+        elif not isinstance(device, torch.device):
+            device = torch.device(device)
+        device_type = _get_device_type(device)
         config_path = os.path.join(load_from_pretrained, "model_config.json")
         data_config, _, model_config, peft_lora_config, inference_config = load_configs_from_json(config_path)
         data_config = DataConfig(**data_config)
@@ -320,16 +343,17 @@ class VideoVLMRewardInference():
             load_from_pretrained=load_from_pretrained,
             load_from_pretrained_step=load_from_pretrained_step,
             gradient_checkpointing=False,
-            disable_flash_attn2=False,
+            disable_flash_attn2=device_type == "cpu",
             bf16=True if dtype == torch.bfloat16 else False,
             fp16=True if dtype == torch.float16 else False,
             output_dir="",
         )
-        
+
         model, processor, _ = create_model_and_processor(
             model_config=model_config,
             peft_lora_config=peft_lora_config,
             training_args=training_args,
+            device_type=device_type,
         )
 
         self.device = device
@@ -548,7 +572,7 @@ class VideoVLMRewardInference():
 
 if __name__ == "__main__":
     load_from_pretrained = "./checkpoints"
-    device = "cuda:0"
+    device = _get_default_device()
     dtype = torch.bfloat16
 
     inferencer = VideoVLMRewardInference(load_from_pretrained, device=device, dtype=dtype)

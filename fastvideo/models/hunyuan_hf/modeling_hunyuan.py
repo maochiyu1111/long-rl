@@ -36,8 +36,15 @@ from fastvideo.models.flash_attn_no_pad import flash_attn_no_pad
 from fastvideo.utils.communications import all_gather, all_to_all_4D
 from fastvideo.utils.parallel_states import (get_sequence_parallel_state,
                                              nccl_info)
+from verl.utils.device import get_torch_device
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
+
+
+def _reset_peak_memory_stats_if_available():
+    torch_device = get_torch_device()
+    if hasattr(torch_device, "reset_peak_memory_stats"):
+        torch_device.reset_peak_memory_stats()
 
 
 def shrink_head(encoder_state, dim):
@@ -902,7 +909,7 @@ class HunyuanVideoTransformer3DModel(ModelMixin, ConfigMixin, PeftAdapterMixin,
             rank0 = (not dist.is_initialized()) or dist.get_rank() == 0
             for block in self.transformer_blocks:
                 if torch.is_grad_enabled():
-                    torch.cuda.reset_peak_memory_stats()
+                    _reset_peak_memory_stats_if_available()
                 hidden_states, encoder_hidden_states = torch.utils.checkpoint.checkpoint(
                     create_custom_forward(block),
                     hidden_states,
@@ -928,7 +935,7 @@ class HunyuanVideoTransformer3DModel(ModelMixin, ConfigMixin, PeftAdapterMixin,
 
             for i, block in enumerate(self.transformer_blocks):
                 if torch.is_grad_enabled():
-                    torch.cuda.reset_peak_memory_stats()
+                    _reset_peak_memory_stats_if_available()
                 hidden_states, encoder_hidden_states = block(
                     hidden_states, encoder_hidden_states, temb, attention_mask, image_rotary_emb
                 )
