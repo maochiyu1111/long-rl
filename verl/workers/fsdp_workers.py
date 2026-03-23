@@ -100,7 +100,24 @@ def _pick_iface_by_subnet(prefix: str = "192.158.0.") -> str | None:
     return None
 
 
-def _setup_nic_env(prefix: str = "192.158.0.") -> None:
+def _setup_nic_env(prefix: str | None = None) -> None:
+    # Respect explicit user settings first. If only one backend is specified,
+    # mirror it to the other so Gloo/NCCL stay on the same NIC.
+    nccl_iface = os.environ.get("NCCL_SOCKET_IFNAME")
+    gloo_iface = os.environ.get("GLOO_SOCKET_IFNAME")
+    if nccl_iface or gloo_iface:
+        if nccl_iface and not gloo_iface:
+            os.environ["GLOO_SOCKET_IFNAME"] = nccl_iface
+        elif gloo_iface and not nccl_iface:
+            os.environ["NCCL_SOCKET_IFNAME"] = gloo_iface
+        logger.debug(
+            "[net] keep preconfigured NCCL/GLOO iface, NCCL=%s GLOO=%s",
+            os.environ.get("NCCL_SOCKET_IFNAME"),
+            os.environ.get("GLOO_SOCKET_IFNAME"),
+        )
+        return
+
+    prefix = prefix or os.environ.get("VERL_SOCKET_IFACE_PREFIX", "192.158.0.")
     iface = _pick_iface_by_subnet(prefix)
     if iface is None:
         os.environ["NCCL_SOCKET_IFNAME"] = "^lo,docker0,flannel,cni0,veth"
@@ -329,6 +346,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         if (not self._delay_default_pg_init) and (not torch.distributed.is_initialized()):
             rank = int(os.environ.get("RANK", 0))
             world_size = int(os.environ.get("WORLD_SIZE", 1))
+            _setup_nic_env()
             torch.distributed.init_process_group(
                 backend=f"cpu:gloo,{get_device_name()}:{get_nccl_backend()}",
                 rank=rank,
@@ -432,7 +450,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         rollout_ref_group_ranks: list[int] | None = None,
     ) -> None:
         # 设 env，使用 env:// rendezvous
-        _setup_nic_env("10.244.3.70.")
+        _setup_nic_env()
         os.environ["MASTER_ADDR"] = str(master_addr)
         os.environ["MASTER_PORT"] = str(master_port)
         os.environ["RANK"] = str(rank)
