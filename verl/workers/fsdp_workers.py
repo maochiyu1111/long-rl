@@ -19,8 +19,11 @@ import json
 import logging
 import math
 import os
+import socket
+import time
+import uuid
 import warnings
-from datetime import timedelta
+from datetime import datetime, timedelta
 from dataclasses import asdict
 from typing import Any
 
@@ -142,9 +145,248 @@ def _tensor_debug_stats(tensor: torch.Tensor) -> dict[str, Any]:
     return stats
 
 
+def _ndarray_debug_stats(array: Any) -> dict[str, Any]:
+    arr = np.asarray(array)
+    stats: dict[str, Any] = {
+        "shape": tuple(arr.shape),
+        "dtype": str(arr.dtype),
+        "numel": int(arr.size),
+    }
+    if arr.size == 0:
+        stats["empty"] = True
+        return stats
+
+    if np.issubdtype(arr.dtype, np.number):
+        finite_mask = np.isfinite(arr)
+        finite_count = int(finite_mask.sum())
+        nan_count = int(np.isnan(arr).sum()) if np.issubdtype(arr.dtype, np.floating) else 0
+        inf_mask = np.isinf(arr) if np.issubdtype(arr.dtype, np.floating) else np.zeros_like(arr, dtype=bool)
+        posinf_count = int((inf_mask & (arr > 0)).sum())
+        neginf_count = int((inf_mask & (arr < 0)).sum())
+        stats.update(
+            {
+                "finite_count": finite_count,
+                "nonfinite_count": int(arr.size) - finite_count,
+                "nan_count": nan_count,
+                "posinf_count": posinf_count,
+                "neginf_count": neginf_count,
+            }
+        )
+        if finite_count > 0:
+            finite_values = arr[finite_mask].astype(np.float32, copy=False)
+            stats.update(
+                {
+                    "finite_min": float(finite_values.min()),
+                    "finite_max": float(finite_values.max()),
+                    "finite_mean": float(finite_values.mean()),
+                }
+            )
+    return stats
+
+
+def _video_frame_debug_stats(video_frames: Any, *, black_threshold: float) -> dict[str, Any]:
+    arr = np.asarray(video_frames)
+    stats = _ndarray_debug_stats(arr)
+    if arr.ndim != 4:
+        return stats
+
+    frame_count = int(arr.shape[0])
+    stats["frame_count"] = frame_count
+    if frame_count == 0:
+        return stats
+
+    flattened = arr.reshape(frame_count, -1).astype(np.float32, copy=False)
+    with np.errstate(invalid="ignore"):
+        frame_means = np.mean(flattened, axis=1)
+        frame_mins = np.min(flattened, axis=1)
+        frame_maxs = np.max(flattened, axis=1)
+        frame_finite = np.isfinite(flattened).all(axis=1)
+    black_mask = frame_finite & (frame_means <= float(black_threshold))
+    stats.update(
+        {
+            "black_threshold": float(black_threshold),
+            "frame_mean_min": float(np.nanmin(frame_means)),
+            "frame_mean_max": float(np.nanmax(frame_means)),
+            "frame_mean_mean": float(np.nanmean(frame_means)),
+            "frame_min_min": float(np.nanmin(frame_mins)),
+            "frame_max_max": float(np.nanmax(frame_maxs)),
+            "black_frame_count": int(black_mask.sum()),
+            "black_frame_ratio": float(black_mask.mean()),
+            "black_frame_indices_preview": np.where(black_mask)[0][:16].astype(int).tolist(),
+            "nonfinite_frame_indices_preview": np.where(~frame_finite)[0][:16].astype(int).tolist(),
+        }
+    )
+    return stats
+
+
 def _format_debug_context(context: dict[str, Any]) -> str:
     parts = [f"{key}={value}" for key, value in context.items() if value is not None]
     return ", ".join(parts)
+
+
+def _truncate_text(text: Any, limit: int = 96) -> str:
+    value = str(text or "")
+    if len(value) <= limit:
+        return value
+    return value[: max(0, limit - 3)] + "..."
+
+
+def _format_trace_number(value: Any) -> str:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, float):
+        return f"{value:.6g}"
+    return str(value)
+
+
+def _trace_rank_from_id(trace_id: Any) -> int | None:
+    if not isinstance(trace_id, str):
+        return None
+    prefix = trace_id.split("_", 1)[0]
+    if not prefix.startswith("rank"):
+        return None
+    try:
+        return int(prefix[4:])
+    except ValueError:
+        return None
+
+
+def _infer_dance_case4_phase(event: str, context: dict[str, Any]) -> str:
+    name = str(context.get("name", ""))
+    if name.startswith("rollout.") or event.startswith("rollout_"):
+        return "rollout"
+    if name.startswith("actor_update.") or event.startswith("actor_update") or event in {
+        "advantage_group",
+        "reward_sanitized",
+    }:
+        return "actor_update"
+    return "trace"
+
+
+def _summarize_dance_case4_event(event: str, context: dict[str, Any], payload: dict[str, Any]) -> str:
+    name = context.get("name")
+    stats = payload.get("stats")
+    if event in {"tensor_stats", "array_stats"} and isinstance(stats, dict):
+        pieces = []
+        if name:
+            pieces.append(str(name))
+        if "step_idx" in context:
+            pieces.append(f"step={context['step_idx']}")
+        if "perm_step_idx" in context:
+            pieces.append(f"perm={context['perm_step_idx']}")
+        if "shape" in stats:
+            pieces.append(f"shape={tuple(stats['shape'])}")
+        if "finite_mean" in stats:
+            pieces.append(f"mean={_format_trace_number(stats['finite_mean'])}")
+        if "finite_min" in stats and "finite_max" in stats:
+            pieces.append(
+                f"range=[{_format_trace_number(stats['finite_min'])},{_format_trace_number(stats['finite_max'])}]"
+            )
+        nonfinite_count = int(stats.get("nonfinite_count", 0))
+        if nonfinite_count > 0:
+            pieces.append(f"nonfinite={nonfinite_count}")
+        return " ".join(pieces)
+
+    if event == "rollout_video_summary":
+        frame_count = payload.get("stats", {}).get("frame_count")
+        black_frame_count = payload.get("stats", {}).get("black_frame_count")
+        black_ratio = payload.get("stats", {}).get("black_frame_ratio")
+        return (
+            f"video frames={_format_trace_number(frame_count)} "
+            f"black={_format_trace_number(black_frame_count)} "
+            f"black_ratio={_format_trace_number(black_ratio)}"
+        )
+
+    if event == "rollout_reward":
+        return (
+            f"reward vq={_format_trace_number(payload.get('vq_reward'))} "
+            f"mq={_format_trace_number(payload.get('mq_reward'))}"
+        )
+
+    if event == "actor_update_step":
+        pieces = []
+        if "step_idx" in context:
+            pieces.append(f"step={context['step_idx']}")
+        if "perm_step_idx" in context:
+            pieces.append(f"perm={context['perm_step_idx']}")
+        pieces.append(f"ratio={_format_trace_number(payload.get('ratio'))}")
+        pieces.append(f"log_ratio={_format_trace_number(payload.get('log_ratio'))}")
+        pieces.append(f"loss={_format_trace_number(payload.get('final_loss'))}")
+        return " ".join(pieces)
+
+    if event == "actor_update_sample_start":
+        return (
+            f"sample_start src={context.get('source_trace_id')} "
+            f"vq_adv={_format_trace_number(payload.get('vq_advantage'))} "
+            f"mq_adv={_format_trace_number(payload.get('mq_advantage'))} "
+            f"caption={_truncate_text(payload.get('caption', ''))}"
+        )
+
+    if event == "actor_update_sample_end":
+        return (
+            f"sample_end grad_norm={_format_trace_number(payload.get('grad_norm'))} "
+            f"avg_loss={_format_trace_number(payload.get('avg_loss'))}"
+        )
+
+    if event == "rollout_sample_start":
+        return (
+            f"sample_start expanded_batch_idx={_format_trace_number(payload.get('expanded_batch_idx'))} "
+            f"caption={_truncate_text(payload.get('caption', ''))}"
+        )
+
+    if event == "rollout_sample_end":
+        return (
+            f"sample_end duration_ms={_format_trace_number(payload.get('duration_ms'))} "
+            f"vq={_format_trace_number(payload.get('vq_reward'))} "
+            f"mq={_format_trace_number(payload.get('mq_reward'))} "
+            f"black_ratio={_format_trace_number(payload.get('black_frame_ratio'))}"
+        )
+
+    if event in {"rollout_sample_error", "actor_update_sample_error"}:
+        return (
+            f"error type={payload.get('error_type')} "
+            f"message={_truncate_text(payload.get('error_message', ''), limit=120)}"
+        )
+
+    if event == "advantage_group":
+        vq_stats = payload.get("vq_adv_stats", {})
+        mq_stats = payload.get("mq_adv_stats", {})
+        return (
+            f"group={_format_trace_number(context.get('group_idx'))} "
+            f"vq_adv_mean={_format_trace_number(vq_stats.get('finite_mean'))} "
+            f"mq_adv_mean={_format_trace_number(mq_stats.get('finite_mean'))}"
+        )
+
+    if event == "reward_sanitized":
+        return f"reward_sanitized reward={context.get('reward_name')}"
+
+    return ""
+
+
+def _format_dance_case4_human_line(record: dict[str, Any]) -> str:
+    pieces = [
+        str(record.get("ts", "")),
+        f"{record.get('phase', 'trace')}/{record.get('event', 'event')}",
+        f"rank={record.get('rank')}",
+    ]
+    trace_id = record.get("trace_id")
+    if trace_id is not None:
+        pieces.append(f"trace={trace_id}")
+    source_trace_id = record.get("source_trace_id")
+    if source_trace_id is not None:
+        pieces.append(f"src={source_trace_id}")
+    if "sample_idx" in record:
+        pieces.append(f"sample={record['sample_idx']}")
+    if "step_idx" in record:
+        pieces.append(f"step={record['step_idx']}")
+    if "perm_step_idx" in record:
+        pieces.append(f"perm={record['perm_step_idx']}")
+    summary = record.get("summary")
+    if summary:
+        pieces.append(f"| {summary}")
+    return " ".join(pieces).strip()
 
 def _pick_iface_by_subnet(prefix: str = "192.158.0.") -> str | None:
     import socket
@@ -403,7 +645,12 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         self._gdr_pair_ranks: tuple[int, int] | None = None
         self._gdr_pair_pg = None
         self._dist_mesh_ranks: list[int] | None = None
-        self._dance_case4_debug_cfg_cache: dict[str, bool] | None = None
+        self._dance_case4_debug_cfg_cache: dict[str, Any] | None = None
+        self._dance_case4_trace_file_path: str | None = None
+        self._dance_case4_trace_log_path: str | None = None
+        self._dance_case4_trace_run_id: str | None = None
+        self._dance_case4_rollout_seq: int = 0
+        self._dance_case4_update_seq: int = 0
         self._delay_default_pg_init = bool(self.diffusion and self.disaggregate and self.role in ["actor", "rollout_ref"])
         if self._delay_default_pg_init and torch.distributed.is_initialized():
             raise RuntimeError(
@@ -903,30 +1150,171 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             grad_clip = self.config.actor.get("max_grad_norm", 1.0)
         return float(grad_clip)
 
-    def _get_dance_case4_debug_cfg(self) -> dict[str, bool]:
+    def _get_dance_case4_debug_cfg(self) -> dict[str, Any]:
         if self._dance_case4_debug_cfg_cache is not None:
             return self._dance_case4_debug_cfg_cache
 
         actor_extra = self.config.actor.get("extra", {})
         dance_cfg = actor_extra.get("dance", {}) if hasattr(actor_extra, "get") else {}
 
-        def _cfg_bool(key: str, env_name: str, default: bool = False) -> bool:
+        def _cfg_get(key: str, default: Any = None) -> Any:
             value = None
             if dance_cfg is not None:
                 if hasattr(dance_cfg, "get"):
                     value = dance_cfg.get(key, None)
                 else:
                     value = getattr(dance_cfg, key, None)
+            return default if value is None else value
+
+        def _cfg_bool(key: str, env_name: str, default: bool = False) -> bool:
+            value = _cfg_get(key, None)
             if value is None:
                 return _env_flag(env_name, default)
             return bool(value)
+
+        def _cfg_float(key: str, env_name: str, default: float) -> float:
+            value = _cfg_get(key, None)
+            if value is None:
+                env_value = os.getenv(env_name)
+                return float(default if env_value is None else env_value)
+            return float(value)
+
+        def _cfg_str(key: str, env_name: str, default: str) -> str:
+            value = _cfg_get(key, None)
+            if value is None:
+                return os.getenv(env_name, default)
+            return str(value)
 
         self._dance_case4_debug_cfg_cache = {
             "enable_finite_checks": _cfg_bool("enable_finite_checks", "VERL_DANCE_ENABLE_FINITE_CHECKS", False),
             "finite_check_sync": _cfg_bool("finite_check_sync", "VERL_DANCE_FINITE_CHECK_SYNC", True),
             "log_tensor_stats": _cfg_bool("log_tensor_stats", "VERL_DANCE_LOG_TENSOR_STATS", False),
+            "enable_trace": _cfg_bool("enable_trace", "VERL_DANCE_ENABLE_TRACE", False),
+            "trace_log_all_steps": _cfg_bool("trace_log_all_steps", "VERL_DANCE_TRACE_LOG_ALL_STEPS", True),
+            "trace_dir": _cfg_str("trace_dir", "VERL_DANCE_TRACE_DIR", "./dance_case4_traces"),
+            "trace_black_threshold": _cfg_float("trace_black_threshold", "VERL_DANCE_TRACE_BLACK_THRESHOLD", 0.03),
+            "sanitize_export_video": _cfg_bool("sanitize_export_video", "VERL_DANCE_SANITIZE_EXPORT_VIDEO", True),
+            "sanitize_reward_nan": _cfg_bool("sanitize_reward_nan", "VERL_DANCE_SANITIZE_REWARD_NAN", True),
+            "stabilize_ratio": _cfg_bool("stabilize_ratio", "VERL_DANCE_STABILIZE_RATIO", True),
+            "ratio_log_prob_clip": _cfg_float("ratio_log_prob_clip", "VERL_DANCE_RATIO_LOG_PROB_CLIP", 20.0),
         }
         return self._dance_case4_debug_cfg_cache
+
+    def _dance_case4_context(self, extra: dict[str, Any] | None = None) -> dict[str, Any]:
+        if self._dance_case4_trace_run_id is None:
+            rank = self.global_rank if self.global_rank is not None else int(os.environ.get("RANK", 0))
+            self._dance_case4_trace_run_id = f"{datetime.utcnow().strftime('%Y%m%dT%H%M%S')}_r{rank}_{os.getpid()}_{uuid.uuid4().hex[:8]}"
+        context = {
+            "role": self.role,
+            "rank": self.global_rank if self.global_rank is not None else int(os.environ.get("RANK", 0)),
+            "world_size": self.global_world_size if self.global_world_size is not None else int(os.environ.get("WORLD_SIZE", 1)),
+            "local_rank": int(os.environ.get("LOCAL_RANK", 0)),
+            "pid": os.getpid(),
+            "host": socket.gethostname(),
+            "run_id": self._dance_case4_trace_run_id,
+        }
+        if extra is not None:
+            context.update(extra)
+        return context
+
+    def _dance_case4_trace_path(self) -> str | None:
+        debug_cfg = self._get_dance_case4_debug_cfg()
+        if not debug_cfg["enable_trace"]:
+            return None
+        if self._dance_case4_trace_file_path is None:
+            trace_dir = os.path.abspath(str(debug_cfg["trace_dir"]))
+            os.makedirs(trace_dir, exist_ok=True)
+            rank = self.global_rank if self.global_rank is not None else int(os.environ.get("RANK", 0))
+            trace_base = os.path.join(trace_dir, f"{self.role}_rank{rank}")
+            self._dance_case4_trace_file_path = trace_base + ".jsonl"
+            self._dance_case4_trace_log_path = trace_base + ".log"
+        return self._dance_case4_trace_file_path
+
+    def _trace_dance_case4_event(
+        self,
+        event: str,
+        *,
+        context: dict[str, Any] | None = None,
+        payload: dict[str, Any] | None = None,
+    ) -> None:
+        trace_path = self._dance_case4_trace_path()
+        if trace_path is None:
+            return
+        context_dict = convert_to_regular_types(self._dance_case4_context(context))
+        payload_dict = convert_to_regular_types(payload or {})
+        phase = _infer_dance_case4_phase(event, context_dict)
+        record = {
+            "ts": datetime.utcnow().isoformat(timespec="milliseconds") + "Z",
+            "phase": phase,
+            "event": event,
+            "rank": context_dict.get("rank"),
+            "role": context_dict.get("role"),
+            "trace_id": context_dict.get("trace_id"),
+        }
+        for key in [
+            "source_trace_id",
+            "source_rank",
+            "sample_idx",
+            "step_idx",
+            "perm_step_idx",
+            "trace_index",
+            "group_idx",
+            "name",
+            "status",
+            "video_path",
+            "source_video_path",
+            "run_id",
+            "host",
+            "local_rank",
+        ]:
+            if key in context_dict:
+                record[key] = context_dict[key]
+        summary = _summarize_dance_case4_event(event, context_dict, payload_dict)
+        if summary:
+            record["summary"] = summary
+        record["context"] = context_dict
+        record["payload"] = payload_dict
+        with open(trace_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        if self._dance_case4_trace_log_path is not None:
+            with open(self._dance_case4_trace_log_path, "a", encoding="utf-8") as f:
+                f.write(_format_dance_case4_human_line(record) + "\n")
+
+    def _check_dance_case4_array(
+        self,
+        array: Any,
+        name: str,
+        *,
+        context: dict[str, Any] | None = None,
+        trace_if_finite: bool = False,
+    ) -> Any:
+        debug_cfg = self._get_dance_case4_debug_cfg()
+        if not debug_cfg["enable_trace"] and not debug_cfg["enable_finite_checks"]:
+            return array
+        stats = _ndarray_debug_stats(array)
+        context_dict = self._dance_case4_context(context)
+        if stats.get("nonfinite_count", 0) > 0:
+            message = (
+                f"[dance_case4][finite_check] detected non-finite array at {name} | "
+                f"{_format_debug_context(context_dict)} | stats={stats}"
+            )
+            if debug_cfg["enable_trace"]:
+                self._trace_dance_case4_event(
+                    "nonfinite_array",
+                    context={**context_dict, "name": name},
+                    payload={"stats": stats},
+                )
+            if debug_cfg["enable_finite_checks"]:
+                logger.error(message)
+                raise FloatingPointError(message)
+            logger.warning(message)
+        elif debug_cfg["enable_trace"] and (trace_if_finite or debug_cfg["trace_log_all_steps"]):
+            self._trace_dance_case4_event(
+                "array_stats",
+                context={**context_dict, "name": name},
+                payload={"stats": stats},
+            )
+        return array
 
     def _sync_dance_case4_debug_device(self) -> None:
         device_module = get_torch_device()
@@ -944,7 +1332,11 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         log_if_finite: bool = False,
     ) -> torch.Tensor:
         debug_cfg = self._get_dance_case4_debug_cfg()
-        if not debug_cfg["enable_finite_checks"] and not (debug_cfg["log_tensor_stats"] and log_if_finite):
+        if (
+            not debug_cfg["enable_finite_checks"]
+            and not (debug_cfg["log_tensor_stats"] and log_if_finite)
+            and not debug_cfg["enable_trace"]
+        ):
             return tensor
         if not torch.is_tensor(tensor):
             return tensor
@@ -952,13 +1344,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         if debug_cfg["finite_check_sync"]:
             self._sync_dance_case4_debug_device()
 
-        context_dict = {
-            "role": self.role,
-            "rank": self.global_rank if self.global_rank is not None else int(os.environ.get("RANK", 0)),
-            "world_size": self.global_world_size if self.global_world_size is not None else int(os.environ.get("WORLD_SIZE", 1)),
-        }
-        if context is not None:
-            context_dict.update(context)
+        context_dict = self._dance_case4_context(context)
 
         stats = _tensor_debug_stats(tensor)
         if stats.get("nonfinite_count", 0) > 0:
@@ -966,8 +1352,16 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 f"[dance_case4][finite_check] detected non-finite tensor at {name} | "
                 f"{_format_debug_context(context_dict)} | stats={stats}"
             )
-            logger.error(message)
-            raise FloatingPointError(message)
+            if debug_cfg["enable_trace"]:
+                self._trace_dance_case4_event(
+                    "nonfinite_tensor",
+                    context={**context_dict, "name": name},
+                    payload={"stats": stats},
+                )
+            if debug_cfg["enable_finite_checks"]:
+                logger.error(message)
+                raise FloatingPointError(message)
+            logger.warning(message)
 
         if debug_cfg["log_tensor_stats"] and log_if_finite:
             logger.warning(
@@ -975,6 +1369,12 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 name,
                 _format_debug_context(context_dict),
                 stats,
+            )
+        if debug_cfg["enable_trace"] and (log_if_finite or debug_cfg["trace_log_all_steps"]):
+            self._trace_dance_case4_event(
+                "tensor_stats",
+                context={**context_dict, "name": name},
+                payload={"stats": stats},
             )
         return tensor
 
@@ -1258,7 +1658,10 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         all_log_probs: list[torch.Tensor] = []
         all_vq_rewards: list[torch.Tensor] = []
         all_mq_rewards: list[torch.Tensor] = []
+        trace_records: list[dict[str, Any]] = []
         os.makedirs("./videos", exist_ok=True)
+        rollout_seq = self._dance_case4_rollout_seq
+        self._dance_case4_rollout_seq += 1
 
         batch_indices = torch.chunk(torch.arange(encoder_hidden_states.shape[0], device=encoder_hidden_states.device), encoder_hidden_states.shape[0])
         shared_noise = None
@@ -1273,99 +1676,203 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             batch_encoder_hidden_states = encoder_hidden_states[batch_idx]
             batch_encoder_attention_mask = encoder_attention_mask[batch_idx]
             batch_caption = [caption[int(i.item())] for i in batch_idx] if caption is not None else [""]
-
-            if shared_noise is not None:
-                input_latents = shared_noise.repeat(len(batch_idx), 1, 1, 1, 1)
-            else:
-                input_latents = torch.randn(
-                    (len(batch_idx), in_channels, latent_t, latent_h, latent_w),
-                    device=encoder_hidden_states.device,
-                    dtype=torch.bfloat16,
-                )
-
-            with torch.no_grad():
-                z = input_latents.clone()
-                latents_path = [z]
-                log_probs_path = []
-                for i in range(sample_steps):
-                    sigma = sigma_schedule[i]
-                    timestep_value = int(float(sigma) * 1000)
-                    timesteps = torch.full([batch_encoder_hidden_states.shape[0]], timestep_value, device=z.device, dtype=torch.long)
-                    rollout_model.eval()
-                    with torch.autocast(device_type=get_device_name(), dtype=torch.bfloat16):
-                        model_pred = rollout_model(
-                            hidden_states=z,
-                            encoder_hidden_states=batch_encoder_hidden_states,
-                            timestep=timesteps,
-                            guidance=torch.tensor([6018.0], device=z.device, dtype=torch.bfloat16),
-                            encoder_attention_mask=batch_encoder_attention_mask,
-                            return_dict=False,
-                        )[0]
-                    self._check_dance_case4_tensor(
-                        model_pred,
-                        "rollout.model_pred",
-                        context={"batch_idx": index, "step_idx": i},
+            trace_id = f"rank{int(os.environ.get('RANK', 0))}_rollout{rollout_seq}_sample{index}"
+            trace_record = {
+                "trace_id": trace_id,
+                "sample_idx": index,
+                "expanded_batch_idx": int(batch_idx[0].item()),
+                "caption": batch_caption[0] if batch_caption else "",
+            }
+            sample_started_at = time.perf_counter()
+            sample_context = {"trace_id": trace_id, "sample_idx": index}
+            self._trace_dance_case4_event(
+                "rollout_sample_start",
+                context={**sample_context, "status": "start"},
+                payload={
+                    "expanded_batch_idx": trace_record["expanded_batch_idx"],
+                    "caption": trace_record["caption"],
+                    "sample_steps": sample_steps,
+                },
+            )
+            video_path = ""
+            try:
+                if shared_noise is not None:
+                    input_latents = shared_noise.repeat(len(batch_idx), 1, 1, 1, 1)
+                else:
+                    input_latents = torch.randn(
+                        (len(batch_idx), in_channels, latent_t, latent_h, latent_w),
+                        device=encoder_hidden_states.device,
+                        dtype=torch.bfloat16,
                     )
-                    z, pred_original, log_prob = flux_step(
-                        model_output=model_pred,
-                        latents=z.to(torch.float32),
-                        eta=float(self.config.rollout.eta),
-                        sigmas=sigma_schedule,
-                        index=i,
-                        prev_sample=None,
-                        grpo=True,
-                        sde_solver=True,
-                    )
-                    self._check_dance_case4_tensor(
-                        log_prob,
-                        "rollout.log_prob",
-                        context={"batch_idx": index, "step_idx": i},
-                    )
-                    z = z.to(torch.bfloat16)
-                    latents_path.append(z)
-                    log_probs_path.append(log_prob)
-                latents = pred_original.to(torch.float32) / 0.476986
-                self._check_dance_case4_tensor(
-                    latents,
-                    "rollout.vae_input_latents",
-                    context={"batch_idx": index},
-                    log_if_finite=True,
-                )
 
-            batch_latents = torch.stack(latents_path, dim=1)
-            batch_log_probs = torch.stack(log_probs_path, dim=1)
-            all_latents.append(batch_latents)
-            all_log_probs.append(batch_log_probs)
-
-            self.vae.enable_tiling()
-            video_processor = VideoProcessor(vae_scale_factor=8)
-            with torch.inference_mode():
-                with torch.autocast(device_type=get_device_name(), dtype=torch.bfloat16):
-                    video = self.vae.decode(latents, return_dict=False)[0]
+                with torch.no_grad():
+                    z = input_latents.clone()
                     self._check_dance_case4_tensor(
-                        video,
-                        "rollout.vae_decoded_video",
-                        context={"batch_idx": index},
+                        z,
+                        "rollout.input_latents",
+                        context=sample_context,
+                    )
+                    latents_path = [z]
+                    log_probs_path = []
+                    for i in range(sample_steps):
+                        sigma = sigma_schedule[i]
+                        timestep_value = int(float(sigma) * 1000)
+                        timesteps = torch.full(
+                            [batch_encoder_hidden_states.shape[0]], timestep_value, device=z.device, dtype=torch.long
+                        )
+                        rollout_model.eval()
+                        with torch.autocast(device_type=get_device_name(), dtype=torch.bfloat16):
+                            model_pred = rollout_model(
+                                hidden_states=z,
+                                encoder_hidden_states=batch_encoder_hidden_states,
+                                timestep=timesteps,
+                                guidance=torch.tensor([6018.0], device=z.device, dtype=torch.bfloat16),
+                                encoder_attention_mask=batch_encoder_attention_mask,
+                                return_dict=False,
+                            )[0]
+                        self._check_dance_case4_tensor(
+                            model_pred,
+                            "rollout.model_pred",
+                            context={**sample_context, "batch_idx": index, "step_idx": i},
+                        )
+                        z, pred_original, log_prob = flux_step(
+                            model_output=model_pred,
+                            latents=z.to(torch.float32),
+                            eta=float(self.config.rollout.eta),
+                            sigmas=sigma_schedule,
+                            index=i,
+                            prev_sample=None,
+                            grpo=True,
+                            sde_solver=True,
+                        )
+                        self._check_dance_case4_tensor(
+                            log_prob,
+                            "rollout.log_prob",
+                            context={**sample_context, "batch_idx": index, "step_idx": i},
+                        )
+                        z = z.to(torch.bfloat16)
+                        self._check_dance_case4_tensor(
+                            z,
+                            "rollout.next_latents",
+                            context={**sample_context, "batch_idx": index, "step_idx": i},
+                        )
+                        latents_path.append(z)
+                        log_probs_path.append(log_prob)
+                    latents = pred_original.to(torch.float32) / 0.476986
+                    self._check_dance_case4_tensor(
+                        latents,
+                        "rollout.vae_input_latents",
+                        context={**sample_context, "batch_idx": index},
                         log_if_finite=True,
                     )
-                    videos = video_processor.postprocess_video(video)
 
-            rank = int(os.environ.get("RANK", 0))
-            video_path = os.path.abspath(f"./videos/hunyuan_{rank}_{index}.mp4")
-            export_to_video(videos[0], video_path, fps=self.rollout_fps)
+                batch_latents = torch.stack(latents_path, dim=1)
+                batch_log_probs = torch.stack(log_probs_path, dim=1)
+                all_latents.append(batch_latents)
+                all_log_probs.append(batch_log_probs)
 
-            vq_reward = torch.tensor(-1.0, device=encoder_hidden_states.device)
-            mq_reward = torch.tensor(-1.0, device=encoder_hidden_states.device)
-            if use_videoalign and self.inferencer is not None:
-                try:
-                    with torch.no_grad():
-                        reward = self.inferencer.reward([video_path], [batch_caption[0]], use_norm=True)
-                    vq_reward = torch.tensor(reward[0]["VQ"], device=encoder_hidden_states.device)
-                    mq_reward = torch.tensor(reward[0]["MQ"], device=encoder_hidden_states.device)
-                except Exception:
-                    logger.exception("[dance_case] videoalign reward failed, fallback to -1 reward")
-            all_vq_rewards.append(vq_reward.unsqueeze(0))
-            all_mq_rewards.append(mq_reward.unsqueeze(0))
+                self.vae.enable_tiling()
+                video_processor = VideoProcessor(vae_scale_factor=8)
+                with torch.inference_mode():
+                    with torch.autocast(device_type=get_device_name(), dtype=torch.bfloat16):
+                        video = self.vae.decode(latents, return_dict=False)[0]
+                        self._check_dance_case4_tensor(
+                            video,
+                            "rollout.vae_decoded_video",
+                            context={**sample_context, "batch_idx": index},
+                            log_if_finite=True,
+                        )
+                        videos = video_processor.postprocess_video(video)
+
+                rank = int(os.environ.get("RANK", 0))
+                video_path = os.path.abspath(f"./videos/hunyuan_{rank}_{index}.mp4")
+                video_frames = np.asarray(videos[0])
+                video_frame_stats = _video_frame_debug_stats(
+                    video_frames,
+                    black_threshold=float(self._get_dance_case4_debug_cfg()["trace_black_threshold"]),
+                )
+                self._check_dance_case4_array(
+                    video_frames,
+                    "rollout.postprocess_video",
+                    context={**sample_context, "batch_idx": index, "video_path": video_path},
+                    trace_if_finite=True,
+                )
+                self._trace_dance_case4_event(
+                    "rollout_video_summary",
+                    context={**sample_context, "video_path": video_path},
+                    payload={"stats": video_frame_stats},
+                )
+                export_frames = video_frames
+                sanitized_for_export = False
+                if video_frame_stats.get("nonfinite_count", 0) > 0 and self._get_dance_case4_debug_cfg()["sanitize_export_video"]:
+                    export_frames = np.nan_to_num(video_frames, nan=0.0, posinf=1.0, neginf=0.0)
+                    sanitized_for_export = True
+                    self._trace_dance_case4_event(
+                        "rollout_video_sanitized_for_export",
+                        context={**sample_context, "video_path": video_path},
+                        payload={"raw_stats": video_frame_stats},
+                    )
+                export_to_video(export_frames, video_path, fps=self.rollout_fps)
+                trace_record.update(
+                    {
+                        "video_path": video_path,
+                        "sanitized_for_export": sanitized_for_export,
+                        "black_frame_count": int(video_frame_stats.get("black_frame_count", 0)),
+                        "black_frame_ratio": float(video_frame_stats.get("black_frame_ratio", 0.0)),
+                        "postprocess_nonfinite_count": int(video_frame_stats.get("nonfinite_count", 0)),
+                    }
+                )
+
+                vq_reward = torch.tensor(-1.0, device=encoder_hidden_states.device)
+                mq_reward = torch.tensor(-1.0, device=encoder_hidden_states.device)
+                if use_videoalign and self.inferencer is not None:
+                    try:
+                        with torch.no_grad():
+                            reward = self.inferencer.reward([video_path], [batch_caption[0]], use_norm=True)
+                        vq_reward = torch.tensor(reward[0]["VQ"], device=encoder_hidden_states.device)
+                        mq_reward = torch.tensor(reward[0]["MQ"], device=encoder_hidden_states.device)
+                    except Exception:
+                        logger.exception("[dance_case] videoalign reward failed, fallback to -1 reward")
+                reward_context = {**sample_context, "video_path": video_path}
+                self._check_dance_case4_tensor(vq_reward, "rollout.vq_reward", context=reward_context, log_if_finite=True)
+                self._check_dance_case4_tensor(mq_reward, "rollout.mq_reward", context=reward_context, log_if_finite=True)
+                vq_reward_value = float(vq_reward.detach().to(torch.float32).item())
+                mq_reward_value = float(mq_reward.detach().to(torch.float32).item())
+                self._trace_dance_case4_event(
+                    "rollout_reward",
+                    context=reward_context,
+                    payload={
+                        "vq_reward": vq_reward_value,
+                        "mq_reward": mq_reward_value,
+                    },
+                )
+                self._trace_dance_case4_event(
+                    "rollout_sample_end",
+                    context={**reward_context, "status": "completed"},
+                    payload={
+                        "duration_ms": (time.perf_counter() - sample_started_at) * 1000.0,
+                        "caption": trace_record["caption"],
+                        "vq_reward": vq_reward_value,
+                        "mq_reward": mq_reward_value,
+                        "black_frame_ratio": trace_record["black_frame_ratio"],
+                        "sanitized_for_export": sanitized_for_export,
+                    },
+                )
+                all_vq_rewards.append(vq_reward.unsqueeze(0))
+                all_mq_rewards.append(mq_reward.unsqueeze(0))
+                trace_records.append(trace_record)
+            except Exception as exc:
+                self._trace_dance_case4_event(
+                    "rollout_sample_error",
+                    context={**sample_context, "status": "failed", "video_path": video_path or None},
+                    payload={
+                        "duration_ms": (time.perf_counter() - sample_started_at) * 1000.0,
+                        "caption": trace_record["caption"],
+                        "error_type": type(exc).__name__,
+                        "error_message": str(exc),
+                    },
+                )
+                raise
 
         all_latents = torch.cat(all_latents, dim=0)
         all_log_probs = torch.cat(all_log_probs, dim=0)
@@ -1383,18 +1890,29 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             "log_probs": all_log_probs[:, :-1],
             "vq_rewards": all_vq_rewards.to(torch.float32),
             "mq_rewards": all_mq_rewards.to(torch.float32),
+            "trace_indices": torch.arange(batch_size, device=all_latents.device, dtype=torch.long),
             "encoder_hidden_states": encoder_hidden_states,
             "encoder_attention_mask": encoder_attention_mask,
         }
         return DataProto.from_dict(
             tensors=samples,
-            meta_info={"sigma_schedule": sigma_schedule.detach().cpu().numpy()},
+            meta_info={
+                "sigma_schedule": sigma_schedule.detach().cpu().numpy().copy(),
+                "dance_trace_ids": [record["trace_id"] for record in trace_records],
+                "dance_trace_video_paths": [record.get("video_path", "") for record in trace_records],
+                "dance_trace_captions": [record.get("caption", "") for record in trace_records],
+                "dance_trace_rollout_seq": rollout_seq,
+            },
         ).to("cpu")
 
     def _update_actor_dance(self, data: DataProto) -> DataProto:
         device = torch.device(get_device_name(), get_device_id())
         samples = {k: data.batch[k].to(device) for k in data.batch.keys()}
-        sigma_schedule = torch.as_tensor(data.meta_info["sigma_schedule"], device=device, dtype=torch.float32)
+        sigma_schedule = torch.tensor(np.array(data.meta_info["sigma_schedule"], copy=True), device=device, dtype=torch.float32)
+        trace_ids = list(data.meta_info.get("dance_trace_ids", []))
+        trace_video_paths = list(data.meta_info.get("dance_trace_video_paths", []))
+        trace_captions = list(data.meta_info.get("dance_trace_captions", []))
+        debug_cfg = self._get_dance_case4_debug_cfg()
         self.optimizer.zero_grad()
 
         def flux_step(
@@ -1438,6 +1956,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             encoder_attention_mask: torch.Tensor,
             timesteps: torch.Tensor,
             idx: int,
+            trace_context: dict[str, Any],
         ) -> torch.Tensor:
             with torch.autocast(device_type=get_device_name(), dtype=torch.bfloat16):
                 self.transformer.train()
@@ -1449,6 +1968,11 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                     encoder_attention_mask=encoder_attention_mask,
                     return_dict=False,
                 )[0]
+            self._check_dance_case4_tensor(
+                model_pred,
+                "actor_update.model_pred",
+                context=trace_context,
+            )
             _, _, log_prob = flux_step(
                 model_output=model_pred,
                 latents=latents.to(torch.float32),
@@ -1462,23 +1986,52 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             self._check_dance_case4_tensor(
                 log_prob,
                 "actor_update.new_log_probs",
-                context={"train_step_idx": idx},
+                context={**trace_context, "train_step_idx": idx},
             )
             return log_prob
 
         num_generations = int(self.config.rollout.num_generations)
         n_groups = len(samples["vq_rewards"]) // max(1, num_generations)
+        if debug_cfg["sanitize_reward_nan"]:
+            raw_vq_rewards = samples["vq_rewards"]
+            raw_mq_rewards = samples["mq_rewards"]
+            if not torch.isfinite(raw_vq_rewards).all():
+                self._trace_dance_case4_event(
+                    "reward_sanitized",
+                    context={"stage": "actor_update", "reward_name": "vq_rewards"},
+                    payload={"stats": _tensor_debug_stats(raw_vq_rewards)},
+                )
+            if not torch.isfinite(raw_mq_rewards).all():
+                self._trace_dance_case4_event(
+                    "reward_sanitized",
+                    context={"stage": "actor_update", "reward_name": "mq_rewards"},
+                    payload={"stats": _tensor_debug_stats(raw_mq_rewards)},
+                )
+            samples["vq_rewards"] = torch.nan_to_num(raw_vq_rewards, nan=-1.0, posinf=-1.0, neginf=-1.0)
+            samples["mq_rewards"] = torch.nan_to_num(raw_mq_rewards, nan=-1.0, posinf=-1.0, neginf=-1.0)
         vq_advantages = torch.zeros_like(samples["vq_rewards"])
         mq_advantages = torch.zeros_like(samples["mq_rewards"])
         for i in range(n_groups):
             start_idx = i * num_generations
             end_idx = (i + 1) * num_generations
             group_vq = samples["vq_rewards"][start_idx:end_idx]
-            vq_advantages[start_idx:end_idx] = (group_vq - group_vq.mean()) / (group_vq.std() + 1e-8)
+            vq_advantages[start_idx:end_idx] = (group_vq - group_vq.mean()) / (group_vq.std(unbiased=False) + 1e-8)
             group_mq = samples["mq_rewards"][start_idx:end_idx]
-            mq_advantages[start_idx:end_idx] = (group_mq - group_mq.mean()) / (group_mq.std() + 1e-8)
+            mq_advantages[start_idx:end_idx] = (group_mq - group_mq.mean()) / (group_mq.std(unbiased=False) + 1e-8)
+            self._trace_dance_case4_event(
+                "advantage_group",
+                context={"group_idx": i},
+                payload={
+                    "vq_reward_stats": _tensor_debug_stats(group_vq),
+                    "mq_reward_stats": _tensor_debug_stats(group_mq),
+                    "vq_adv_stats": _tensor_debug_stats(vq_advantages[start_idx:end_idx]),
+                    "mq_adv_stats": _tensor_debug_stats(mq_advantages[start_idx:end_idx]),
+                },
+            )
         samples["vq_advantages"] = vq_advantages
         samples["mq_advantages"] = mq_advantages
+        self._check_dance_case4_tensor(samples["vq_advantages"], "actor_update.vq_advantages", context={"stage": "full_batch"}, log_if_finite=True)
+        self._check_dance_case4_tensor(samples["mq_advantages"], "actor_update.mq_advantages", context={"stage": "full_batch"}, log_if_finite=True)
 
         total_scores = self.config.rollout.vq_coef * vq_advantages + self.config.rollout.mq_coef * mq_advantages
         batch_size = int(samples["timesteps"].shape[0])
@@ -1507,52 +2060,147 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         train_timesteps = int(samples["timesteps"].shape[1] * timestep_fraction)
         train_timesteps = max(1, train_timesteps)
         avg_loss = torch.tensor(0.0, device=device)
+        update_seq = self._dance_case4_update_seq
+        self._dance_case4_update_seq += 1
         for i, sample in enumerate(samples_batched_list):
-            for step_idx in range(train_timesteps):
-                new_log_probs = grpo_one_step(
-                    latents=sample["latents"][:, step_idx],
-                    pre_latents=sample["next_latents"][:, step_idx],
-                    encoder_hidden_states=sample["encoder_hidden_states"],
-                    encoder_attention_mask=sample["encoder_attention_mask"],
-                    timesteps=sample["timesteps"][:, step_idx],
-                    idx=int(perms[i][step_idx].item()),
-                )
+            trace_index = int(sample["trace_indices"].reshape(-1)[0].item()) if "trace_indices" in sample else i
+            source_trace_id = trace_ids[trace_index] if 0 <= trace_index < len(trace_ids) else f"source_sample_{trace_index}"
+            source_video_path = trace_video_paths[trace_index] if 0 <= trace_index < len(trace_video_paths) else ""
+            trace_caption = trace_captions[trace_index] if 0 <= trace_index < len(trace_captions) else ""
+            source_rank = _trace_rank_from_id(source_trace_id)
+            update_trace_id = (
+                f"rank{self.global_rank if self.global_rank is not None else int(os.environ.get('RANK', 0))}"
+                f"_update{update_seq}_sample{i}"
+            )
+            sample_context = {
+                "trace_id": update_trace_id,
+                "source_trace_id": source_trace_id,
+                "source_rank": source_rank,
+                "sample_idx": i,
+                "trace_index": trace_index,
+                "source_video_path": source_video_path,
+            }
+            sample_started_at = time.perf_counter()
+            self._trace_dance_case4_event(
+                "actor_update_sample_start",
+                context={**sample_context, "status": "start"},
+                payload={
+                    "caption": trace_caption,
+                    "vq_advantage": float(sample["vq_advantages"].detach().to(torch.float32).reshape(-1)[0].item()),
+                    "mq_advantage": float(sample["mq_advantages"].detach().to(torch.float32).reshape(-1)[0].item()),
+                },
+            )
+            try:
+                for step_idx in range(train_timesteps):
+                    trace_context = {
+                        **sample_context,
+                        "step_idx": step_idx,
+                        "perm_step_idx": int(perms[i][step_idx].item()),
+                    }
+                    new_log_probs = grpo_one_step(
+                        latents=sample["latents"][:, step_idx],
+                        pre_latents=sample["next_latents"][:, step_idx],
+                        encoder_hidden_states=sample["encoder_hidden_states"],
+                        encoder_attention_mask=sample["encoder_attention_mask"],
+                        timesteps=sample["timesteps"][:, step_idx],
+                        idx=int(perms[i][step_idx].item()),
+                        trace_context=trace_context,
+                    )
+                    old_log_probs = sample["log_probs"][:, step_idx]
+                    self._check_dance_case4_tensor(
+                        old_log_probs,
+                        "actor_update.old_log_probs",
+                        context=trace_context,
+                    )
+                    log_ratio = new_log_probs - old_log_probs
+                    self._check_dance_case4_tensor(
+                        log_ratio,
+                        "actor_update.log_ratio",
+                        context=trace_context,
+                    )
 
-                ratio = torch.exp(new_log_probs - sample["log_probs"][:, step_idx])
+                    if debug_cfg["stabilize_ratio"]:
+                        ratio = torch.exp(
+                            torch.clamp(log_ratio, -debug_cfg["ratio_log_prob_clip"], debug_cfg["ratio_log_prob_clip"])
+                        )
+                    else:
+                        ratio = torch.exp(log_ratio)
+                    self._check_dance_case4_tensor(
+                        ratio,
+                        "actor_update.ratio",
+                        context=trace_context,
+                    )
+                    clip_range = 1e-4
+                    adv_clip_max = 5.0
+
+                    vq_adv = torch.clamp(sample["vq_advantages"], -adv_clip_max, adv_clip_max)
+                    mq_adv = torch.clamp(sample["mq_advantages"], -adv_clip_max, adv_clip_max)
+                    self._check_dance_case4_tensor(vq_adv, "actor_update.vq_adv_clipped", context=trace_context)
+                    self._check_dance_case4_tensor(mq_adv, "actor_update.mq_adv_clipped", context=trace_context)
+
+                    vq_unclipped = -vq_adv * ratio
+                    vq_clipped = -vq_adv * torch.clamp(ratio, 1.0 - clip_range, 1.0 + clip_range)
+                    vq_loss = torch.mean(torch.maximum(vq_unclipped, vq_clipped))
+
+                    mq_unclipped = -mq_adv * ratio
+                    mq_clipped = -mq_adv * torch.clamp(ratio, 1.0 - clip_range, 1.0 + clip_range)
+                    mq_loss = torch.mean(torch.maximum(mq_unclipped, mq_clipped))
+
+                    final_loss = (
+                        self.config.rollout.vq_coef * vq_loss + self.config.rollout.mq_coef * mq_loss
+                    ) / (max(1, int(self.config.actor.get("gradient_accumulation_steps", 1))) * train_timesteps)
+                    self._check_dance_case4_tensor(
+                        final_loss,
+                        "actor_update.final_loss",
+                        context=trace_context,
+                    )
+                    self._trace_dance_case4_event(
+                        "actor_update_step",
+                        context=trace_context,
+                        payload={
+                            "old_log_prob": float(old_log_probs.detach().to(torch.float32).reshape(-1)[0].item()),
+                            "new_log_prob": float(new_log_probs.detach().to(torch.float32).reshape(-1)[0].item()),
+                            "log_ratio": float(log_ratio.detach().to(torch.float32).reshape(-1)[0].item()),
+                            "ratio": float(ratio.detach().to(torch.float32).reshape(-1)[0].item()),
+                            "vq_loss": float(vq_loss.detach().to(torch.float32).item()),
+                            "mq_loss": float(mq_loss.detach().to(torch.float32).item()),
+                            "final_loss": float(final_loss.detach().to(torch.float32).item()),
+                        },
+                    )
+                    final_loss.backward()
+                    avg_loss = final_loss.detach()
+
+                grad_norm = self.transformer.clip_grad_norm_(self._get_dance_case4_grad_clip())
                 self._check_dance_case4_tensor(
-                    ratio,
-                    "actor_update.ratio",
-                    context={"sample_idx": i, "step_idx": step_idx},
+                    torch.as_tensor(grad_norm, device=device, dtype=torch.float32),
+                    "actor_update.grad_norm",
+                    context=sample_context,
+                    log_if_finite=True,
                 )
-                clip_range = 1e-4
-                adv_clip_max = 5.0
-
-                vq_adv = torch.clamp(sample["vq_advantages"], -adv_clip_max, adv_clip_max)
-                mq_adv = torch.clamp(sample["mq_advantages"], -adv_clip_max, adv_clip_max)
-
-                vq_unclipped = -vq_adv * ratio
-                vq_clipped = -vq_adv * torch.clamp(ratio, 1.0 - clip_range, 1.0 + clip_range)
-                vq_loss = torch.mean(torch.maximum(vq_unclipped, vq_clipped))
-
-                mq_unclipped = -mq_adv * ratio
-                mq_clipped = -mq_adv * torch.clamp(ratio, 1.0 - clip_range, 1.0 + clip_range)
-                mq_loss = torch.mean(torch.maximum(mq_unclipped, mq_clipped))
-
-                final_loss = (
-                    self.config.rollout.vq_coef * vq_loss + self.config.rollout.mq_coef * mq_loss
-                ) / (max(1, int(self.config.actor.get("gradient_accumulation_steps", 1))) * train_timesteps)
-                self._check_dance_case4_tensor(
-                    final_loss,
-                    "actor_update.final_loss",
-                    context={"sample_idx": i, "step_idx": step_idx},
+                self._trace_dance_case4_event(
+                    "actor_update_sample_end",
+                    context={**sample_context, "status": "completed"},
+                    payload={
+                        "duration_ms": (time.perf_counter() - sample_started_at) * 1000.0,
+                        "grad_norm": float(torch.as_tensor(grad_norm, device=device, dtype=torch.float32).item()),
+                        "avg_loss": float(avg_loss.detach().to(torch.float32).item()),
+                    },
                 )
-                final_loss.backward()
-                avg_loss = final_loss.detach()
-
-            self.transformer.clip_grad_norm_(self._get_dance_case4_grad_clip())
-            self.optimizer.step()
-            self.lr_scheduler.step()
-            self.optimizer.zero_grad()
+                self.optimizer.step()
+                self.lr_scheduler.step()
+                self.optimizer.zero_grad()
+            except Exception as exc:
+                self._trace_dance_case4_event(
+                    "actor_update_sample_error",
+                    context={**sample_context, "status": "failed"},
+                    payload={
+                        "duration_ms": (time.perf_counter() - sample_started_at) * 1000.0,
+                        "caption": trace_caption,
+                        "error_type": type(exc).__name__,
+                        "error_message": str(exc),
+                    },
+                )
+                raise
 
         output = DataProto(meta_info={"metrics": {"actor/loss": float(avg_loss.item())}})
         return output.to("cpu")
