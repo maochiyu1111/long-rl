@@ -12,7 +12,7 @@ VIDEOALIGN_BASE_MODEL_PATH=/home/qzy/models/Qwen2-VL-2B-Instruct
 DATA_JSON_PATH=/home/qzy/models/rl_embeddings_128/videos2caption.json
 
 python3 -m verl.trainer.main_ppo \
-  --config-path=/workspace/projects/long-rl/examples/diffusion \
+  --config-path=/home/qzy/project/long-rl/examples/diffusion \
   --config-name=config_video_diffusion_case4_dance_npu \
   hydra.job.chdir=false \
   trainer.project_name=dance_case4 \

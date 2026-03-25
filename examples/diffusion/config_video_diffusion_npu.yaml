@@ -110,6 +110,6 @@ trainer:
   disaggregate: true
   disaggregate_actor_n_gpus_per_node: 4
   disaggregate_rollout_ref_n_gpus_per_node: 4
-  dist_master_addr: 192.158.0.11
+  dist_master_addr: 192.168.0.85
   dist_master_port: 29400
   disaggregate_sync_chunk_mb: 256

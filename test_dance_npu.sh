@@ -6,7 +6,7 @@ export PYTHONUNBUFFERED=1
 export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
 
-LOG_DIR=${LOG_DIR:-/workspace/projects/long-rl/logs}
+LOG_DIR=${LOG_DIR:-/home/qzy/project/long-rl/logs}
 mkdir -p "${LOG_DIR}"
 RUN_TAG=${RUN_TAG:-$(date -u +%Y%m%d_%H%M%S)}
 LOG_PATH="${LOG_DIR}/test_dance_npu_${RUN_TAG}.log"
@@ -20,7 +20,7 @@ VIDEOALIGN_BASE_MODEL_PATH=${VIDEOALIGN_BASE_MODEL_PATH:-/home/qzy/models/Qwen2-
 DATA_JSON_PATH=${DATA_JSON_PATH:-/home/qzy/models/rl_embeddings_128/videos2caption.json}
 
 python3 -m verl.trainer.main_ppo \
-  --config-path=/workspace/projects/long-rl/examples/diffusion \
+  --config-path=/home/qzy/project/long-rl/examples/diffusion \
   --config-name=config_video_diffusion_case4_dance_npu \
   hydra.job.chdir=false \
   trainer.project_name=dance_case4 \
