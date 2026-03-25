@@ -2131,6 +2131,8 @@ class RayPPOTrainer:
         return None
 
     def fit_dance_case4(self):
+        dance_cfg = self.config.actor_rollout_ref.actor.get("extra", {}).get("dance", {})
+        rollout_only = bool(dance_cfg.get("rollout_only", False))
         max_train_steps = self.config.trainer.get("max_train_steps", None)
         if max_train_steps is None:
             max_train_steps = self.total_training_steps
@@ -2165,10 +2167,13 @@ class RayPPOTrainer:
             )
 
             rollout_batch = self.actor_rollout_wg.generate_sequences(new_batch)
-            actor_output = self.actor_rollout_wg.update_actor(rollout_batch)
-            actor_metrics = actor_output.meta_info.get("metrics", {}) if actor_output is not None else {}
-            if actor_metrics:
-                progress_bar.set_postfix({k: f"{v:.4f}" for k, v in actor_metrics.items() if isinstance(v, (int, float))})
+            if rollout_only:
+                progress_bar.set_postfix({"rollout_only": "true"})
+            else:
+                actor_output = self.actor_rollout_wg.update_actor(rollout_batch)
+                actor_metrics = actor_output.meta_info.get("metrics", {}) if actor_output is not None else {}
+                if actor_metrics:
+                    progress_bar.set_postfix({k: f"{v:.4f}" for k, v in actor_metrics.items() if isinstance(v, (int, float))})
 
             self.global_steps += 1
             progress_bar.update(1)

@@ -90,12 +90,78 @@ def _get_dist_timeout() -> timedelta:
         timeout_s = 60
     return timedelta(seconds=timeout_s)
 
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _tensor_debug_stats(tensor: torch.Tensor) -> dict[str, Any]:
+    detached = tensor.detach()
+    stats: dict[str, Any] = {
+        "shape": tuple(detached.shape),
+        "dtype": str(detached.dtype),
+        "device": str(detached.device),
+        "numel": int(detached.numel()),
+    }
+    if detached.numel() == 0:
+        stats["empty"] = True
+        return stats
+
+    finite_mask = torch.isfinite(detached)
+    finite_count = int(finite_mask.sum().item())
+    nan_count = int(torch.isnan(detached).sum().item())
+    inf_mask = torch.isinf(detached)
+    posinf_count = int((inf_mask & (detached > 0)).sum().item())
+    neginf_count = int((inf_mask & (detached < 0)).sum().item())
+
+    stats.update(
+        {
+            "finite_count": finite_count,
+            "nonfinite_count": int(detached.numel()) - finite_count,
+            "nan_count": nan_count,
+            "posinf_count": posinf_count,
+            "neginf_count": neginf_count,
+        }
+    )
+
+    if finite_count > 0:
+        if finite_count == int(detached.numel()):
+            finite_values = detached.to(torch.float32)
+        else:
+            finite_values = detached[finite_mask].to(torch.float32)
+        stats.update(
+            {
+                "finite_min": float(finite_values.min().item()),
+                "finite_max": float(finite_values.max().item()),
+                "finite_mean": float(finite_values.mean().item()),
+            }
+        )
+    return stats
+
+
+def _format_debug_context(context: dict[str, Any]) -> str:
+    parts = [f"{key}={value}" for key, value in context.items() if value is not None]
+    return ", ".join(parts)
+
 def _pick_iface_by_subnet(prefix: str = "192.158.0.") -> str | None:
     import socket
 
     for name, addrs in psutil.net_if_addrs().items():
         for a in addrs:
             if a.family == socket.AF_INET and a.address.startswith(prefix):
+                return name
+    return None
+
+
+def _pick_first_non_loopback_iface() -> str | None:
+    import socket
+
+    for name, addrs in psutil.net_if_addrs().items():
+        for a in addrs:
+            if a.family == socket.AF_INET and not a.address.startswith("127."):
                 return name
     return None
 
@@ -120,9 +186,10 @@ def _setup_nic_env(prefix: str | None = None) -> None:
     prefix = prefix or os.environ.get("VERL_SOCKET_IFACE_PREFIX", "192.158.0.")
     iface = _pick_iface_by_subnet(prefix)
     if iface is None:
+        iface = _pick_first_non_loopback_iface()
+    if iface is None:
         os.environ["NCCL_SOCKET_IFNAME"] = "^lo,docker0,flannel,cni0,veth"
-        os.environ["GLOO_SOCKET_IFNAME"] = os.environ["NCCL_SOCKET_IFNAME"]
-        logger.debug("[net] no iface with %s; use exclude list for NCCL/GLOO", prefix)
+        logger.debug("[net] no iface with %s and no IPv4 iface fallback; use NCCL exclude list only", prefix)
     else:
         os.environ["NCCL_SOCKET_IFNAME"] = iface
         os.environ["GLOO_SOCKET_IFNAME"] = iface
@@ -336,6 +403,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         self._gdr_pair_ranks: tuple[int, int] | None = None
         self._gdr_pair_pg = None
         self._dist_mesh_ranks: list[int] | None = None
+        self._dance_case4_debug_cfg_cache: dict[str, bool] | None = None
         self._delay_default_pg_init = bool(self.diffusion and self.disaggregate and self.role in ["actor", "rollout_ref"])
         if self._delay_default_pg_init and torch.distributed.is_initialized():
             raise RuntimeError(
@@ -835,6 +903,81 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             grad_clip = self.config.actor.get("max_grad_norm", 1.0)
         return float(grad_clip)
 
+    def _get_dance_case4_debug_cfg(self) -> dict[str, bool]:
+        if self._dance_case4_debug_cfg_cache is not None:
+            return self._dance_case4_debug_cfg_cache
+
+        actor_extra = self.config.actor.get("extra", {})
+        dance_cfg = actor_extra.get("dance", {}) if hasattr(actor_extra, "get") else {}
+
+        def _cfg_bool(key: str, env_name: str, default: bool = False) -> bool:
+            value = None
+            if dance_cfg is not None:
+                if hasattr(dance_cfg, "get"):
+                    value = dance_cfg.get(key, None)
+                else:
+                    value = getattr(dance_cfg, key, None)
+            if value is None:
+                return _env_flag(env_name, default)
+            return bool(value)
+
+        self._dance_case4_debug_cfg_cache = {
+            "enable_finite_checks": _cfg_bool("enable_finite_checks", "VERL_DANCE_ENABLE_FINITE_CHECKS", False),
+            "finite_check_sync": _cfg_bool("finite_check_sync", "VERL_DANCE_FINITE_CHECK_SYNC", True),
+            "log_tensor_stats": _cfg_bool("log_tensor_stats", "VERL_DANCE_LOG_TENSOR_STATS", False),
+        }
+        return self._dance_case4_debug_cfg_cache
+
+    def _sync_dance_case4_debug_device(self) -> None:
+        device_module = get_torch_device()
+        if hasattr(device_module, "is_available") and not device_module.is_available():
+            return
+        if hasattr(device_module, "synchronize"):
+            device_module.synchronize()
+
+    def _check_dance_case4_tensor(
+        self,
+        tensor: torch.Tensor,
+        name: str,
+        *,
+        context: dict[str, Any] | None = None,
+        log_if_finite: bool = False,
+    ) -> torch.Tensor:
+        debug_cfg = self._get_dance_case4_debug_cfg()
+        if not debug_cfg["enable_finite_checks"] and not (debug_cfg["log_tensor_stats"] and log_if_finite):
+            return tensor
+        if not torch.is_tensor(tensor):
+            return tensor
+
+        if debug_cfg["finite_check_sync"]:
+            self._sync_dance_case4_debug_device()
+
+        context_dict = {
+            "role": self.role,
+            "rank": self.global_rank if self.global_rank is not None else int(os.environ.get("RANK", 0)),
+            "world_size": self.global_world_size if self.global_world_size is not None else int(os.environ.get("WORLD_SIZE", 1)),
+        }
+        if context is not None:
+            context_dict.update(context)
+
+        stats = _tensor_debug_stats(tensor)
+        if stats.get("nonfinite_count", 0) > 0:
+            message = (
+                f"[dance_case4][finite_check] detected non-finite tensor at {name} | "
+                f"{_format_debug_context(context_dict)} | stats={stats}"
+            )
+            logger.error(message)
+            raise FloatingPointError(message)
+
+        if debug_cfg["log_tensor_stats"] and log_if_finite:
+            logger.warning(
+                "[dance_case4][tensor_stats] %s | %s | stats=%s",
+                name,
+                _format_debug_context(context_dict),
+                stats,
+            )
+        return tensor
+
     def _build_model_optimizer_dance_dis(self) -> None:
         from accelerate.utils import set_seed
         from diffusers.optimization import get_scheduler
@@ -1158,6 +1301,11 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                             encoder_attention_mask=batch_encoder_attention_mask,
                             return_dict=False,
                         )[0]
+                    self._check_dance_case4_tensor(
+                        model_pred,
+                        "rollout.model_pred",
+                        context={"batch_idx": index, "step_idx": i},
+                    )
                     z, pred_original, log_prob = flux_step(
                         model_output=model_pred,
                         latents=z.to(torch.float32),
@@ -1168,10 +1316,21 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                         grpo=True,
                         sde_solver=True,
                     )
+                    self._check_dance_case4_tensor(
+                        log_prob,
+                        "rollout.log_prob",
+                        context={"batch_idx": index, "step_idx": i},
+                    )
                     z = z.to(torch.bfloat16)
                     latents_path.append(z)
                     log_probs_path.append(log_prob)
                 latents = pred_original.to(torch.float32) / 0.476986
+                self._check_dance_case4_tensor(
+                    latents,
+                    "rollout.vae_input_latents",
+                    context={"batch_idx": index},
+                    log_if_finite=True,
+                )
 
             batch_latents = torch.stack(latents_path, dim=1)
             batch_log_probs = torch.stack(log_probs_path, dim=1)
@@ -1183,6 +1342,12 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             with torch.inference_mode():
                 with torch.autocast(device_type=get_device_name(), dtype=torch.bfloat16):
                     video = self.vae.decode(latents, return_dict=False)[0]
+                    self._check_dance_case4_tensor(
+                        video,
+                        "rollout.vae_decoded_video",
+                        context={"batch_idx": index},
+                        log_if_finite=True,
+                    )
                     videos = video_processor.postprocess_video(video)
 
             rank = int(os.environ.get("RANK", 0))
@@ -1294,6 +1459,11 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 grpo=True,
                 sde_solver=True,
             )
+            self._check_dance_case4_tensor(
+                log_prob,
+                "actor_update.new_log_probs",
+                context={"train_step_idx": idx},
+            )
             return log_prob
 
         num_generations = int(self.config.rollout.num_generations)
@@ -1349,6 +1519,11 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 )
 
                 ratio = torch.exp(new_log_probs - sample["log_probs"][:, step_idx])
+                self._check_dance_case4_tensor(
+                    ratio,
+                    "actor_update.ratio",
+                    context={"sample_idx": i, "step_idx": step_idx},
+                )
                 clip_range = 1e-4
                 adv_clip_max = 5.0
 
@@ -1366,6 +1541,11 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 final_loss = (
                     self.config.rollout.vq_coef * vq_loss + self.config.rollout.mq_coef * mq_loss
                 ) / (max(1, int(self.config.actor.get("gradient_accumulation_steps", 1))) * train_timesteps)
+                self._check_dance_case4_tensor(
+                    final_loss,
+                    "actor_update.final_loss",
+                    context={"sample_idx": i, "step_idx": step_idx},
+                )
                 final_loss.backward()
                 avg_loss = final_loss.detach()
 
