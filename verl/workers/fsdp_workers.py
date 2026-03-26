@@ -184,6 +184,17 @@ def _ndarray_debug_stats(array: Any) -> dict[str, Any]:
     return stats
 
 
+def _tensor_preview_list(tensor: torch.Tensor, max_items: int = 8) -> list[Any]:
+    detached = tensor.detach()
+    if detached.numel() == 0:
+        return []
+    preview = detached.reshape(-1)[: max(0, int(max_items))]
+    if torch.is_floating_point(preview) or preview.dtype == torch.bfloat16:
+        preview = preview.to(torch.float32)
+    preview = preview.cpu()
+    return convert_to_regular_types(preview.tolist())
+
+
 def _video_frame_debug_stats(video_frames: Any, *, black_threshold: float) -> dict[str, Any]:
     arr = np.asarray(video_frames)
     stats = _ndarray_debug_stats(arr)
@@ -255,10 +266,17 @@ def _trace_rank_from_id(trace_id: Any) -> int | None:
 
 def _infer_dance_case4_phase(event: str, context: dict[str, Any]) -> str:
     name = str(context.get("name", ""))
+    stage = str(context.get("stage", ""))
     if name.startswith("rollout.") or event.startswith("rollout_"):
         return "rollout"
+    if stage in {"rollout", "actor_update"}:
+        return stage
     if name.startswith("actor_update.") or event.startswith("actor_update") or event in {
         "advantage_group",
+        "batch_snapshot",
+        "sample_mapping_snapshot",
+        "suspicious_batch",
+        "fail_fast",
         "reward_sanitized",
     }:
         return "actor_update"
@@ -287,6 +305,28 @@ def _summarize_dance_case4_event(event: str, context: dict[str, Any], payload: d
         nonfinite_count = int(stats.get("nonfinite_count", 0))
         if nonfinite_count > 0:
             pieces.append(f"nonfinite={nonfinite_count}")
+        return " ".join(pieces)
+
+    if event == "batch_snapshot":
+        label = context.get("label", "snapshot")
+        keys = payload.get("keys", [])
+        suspicious_keys = payload.get("suspicious_keys", [])
+        pieces = [str(label)]
+        if keys:
+            pieces.append(f"keys={','.join(str(key) for key in keys[:6])}")
+        if suspicious_keys:
+            pieces.append(f"suspicious={','.join(str(key) for key in suspicious_keys[:6])}")
+        return " ".join(pieces)
+
+    if event == "sample_mapping_snapshot":
+        label = context.get("label", "mapping")
+        unique_trace_indices = payload.get("unique_trace_indices")
+        trace_indices_preview = payload.get("trace_indices_preview")
+        pieces = [str(label)]
+        if unique_trace_indices is not None:
+            pieces.append(f"unique_trace_indices={_format_trace_number(unique_trace_indices)}")
+        if trace_indices_preview:
+            pieces.append(f"trace_indices={trace_indices_preview}")
         return " ".join(pieces)
 
     if event == "rollout_video_summary":
@@ -361,6 +401,17 @@ def _summarize_dance_case4_event(event: str, context: dict[str, Any], payload: d
 
     if event == "reward_sanitized":
         return f"reward_sanitized reward={context.get('reward_name')}"
+
+    if event == "suspicious_batch":
+        label = context.get("label", "suspicious")
+        reasons = payload.get("reasons", [])
+        return f"{label} reasons={'; '.join(str(reason) for reason in reasons[:4])}"
+
+    if event == "fail_fast":
+        return (
+            f"fail_fast name={context.get('name')} "
+            f"reason={_truncate_text(payload.get('reason', ''), limit=120)}"
+        )
 
     return ""
 
@@ -1179,6 +1230,13 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 return float(default if env_value is None else env_value)
             return float(value)
 
+        def _cfg_int(key: str, env_name: str, default: int) -> int:
+            value = _cfg_get(key, None)
+            if value is None:
+                env_value = os.getenv(env_name)
+                return int(default if env_value is None else env_value)
+            return int(value)
+
         def _cfg_str(key: str, env_name: str, default: str) -> str:
             value = _cfg_get(key, None)
             if value is None:
@@ -1186,11 +1244,13 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             return str(value)
 
         self._dance_case4_debug_cfg_cache = {
-            "enable_finite_checks": _cfg_bool("enable_finite_checks", "VERL_DANCE_ENABLE_FINITE_CHECKS", False),
+            "enable_finite_checks": _cfg_bool("enable_finite_checks", "VERL_DANCE_ENABLE_FINITE_CHECKS", True),
+            "fail_on_nonfinite": _cfg_bool("fail_on_nonfinite", "VERL_DANCE_FAIL_ON_NONFINITE", True),
             "finite_check_sync": _cfg_bool("finite_check_sync", "VERL_DANCE_FINITE_CHECK_SYNC", True),
             "log_tensor_stats": _cfg_bool("log_tensor_stats", "VERL_DANCE_LOG_TENSOR_STATS", False),
             "enable_trace": _cfg_bool("enable_trace", "VERL_DANCE_ENABLE_TRACE", False),
             "trace_log_all_steps": _cfg_bool("trace_log_all_steps", "VERL_DANCE_TRACE_LOG_ALL_STEPS", True),
+            "trace_preview_limit": _cfg_int("trace_preview_limit", "VERL_DANCE_TRACE_PREVIEW_LIMIT", 8),
             "trace_dir": _cfg_str("trace_dir", "VERL_DANCE_TRACE_DIR", "./dance_case4_traces"),
             "trace_black_threshold": _cfg_float("trace_black_threshold", "VERL_DANCE_TRACE_BLACK_THRESHOLD", 0.03),
             "sanitize_export_video": _cfg_bool("sanitize_export_video", "VERL_DANCE_SANITIZE_EXPORT_VIDEO", True),
@@ -1280,6 +1340,164 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             with open(self._dance_case4_trace_log_path, "a", encoding="utf-8") as f:
                 f.write(_format_dance_case4_human_line(record) + "\n")
 
+    def _dance_case4_raise_fail_fast(
+        self,
+        name: str,
+        *,
+        context: dict[str, Any] | None = None,
+        stats: dict[str, Any] | None = None,
+        reason: str,
+    ) -> None:
+        fail_context = dict(context or {})
+        fail_context["name"] = name
+        payload: dict[str, Any] = {"reason": reason}
+        if stats is not None:
+            payload["stats"] = stats
+        if self._get_dance_case4_debug_cfg()["enable_trace"]:
+            self._trace_dance_case4_event("fail_fast", context=fail_context, payload=payload)
+        raise FloatingPointError(reason)
+
+    def _dance_case4_tensor_snapshot(
+        self,
+        tensor: torch.Tensor,
+        *,
+        preview_limit: int,
+        include_unique: bool = False,
+    ) -> dict[str, Any]:
+        snapshot = {"stats": _tensor_debug_stats(tensor)}
+        if tensor.numel() == 0:
+            return snapshot
+
+        snapshot["preview"] = _tensor_preview_list(tensor, max_items=preview_limit)
+        if tensor.ndim >= 2:
+            snapshot["row0_preview"] = _tensor_preview_list(tensor[0], max_items=preview_limit)
+        if tensor.ndim == 1:
+            snapshot["head"] = _tensor_preview_list(tensor, max_items=preview_limit)
+            if include_unique and tensor.numel() <= 4096:
+                unique_tensor = tensor.detach().reshape(-1)
+                if torch.is_floating_point(unique_tensor) or unique_tensor.dtype == torch.bfloat16:
+                    unique_tensor = unique_tensor.to(torch.float32)
+                unique_tensor = unique_tensor.cpu()
+                unique_values = torch.unique(unique_tensor)
+                snapshot["unique_count"] = int(unique_values.numel())
+                snapshot["unique_preview"] = convert_to_regular_types(unique_values[:preview_limit].tolist())
+                if unique_tensor.dtype != torch.bool:
+                    snapshot["zero_count"] = int((unique_tensor == 0).sum().item())
+        return snapshot
+
+    def _trace_dance_case4_batch_snapshot(
+        self,
+        label: str,
+        tensors: dict[str, Any],
+        *,
+        context: dict[str, Any] | None = None,
+        key_order: list[str] | tuple[str, ...] | None = None,
+        meta: dict[str, Any] | None = None,
+    ) -> None:
+        debug_cfg = self._get_dance_case4_debug_cfg()
+        if not debug_cfg["enable_trace"]:
+            return
+        if debug_cfg["finite_check_sync"]:
+            self._sync_dance_case4_debug_device()
+
+        preview_limit = max(1, int(debug_cfg["trace_preview_limit"]))
+        keys = [key for key in (key_order or list(tensors.keys())) if key in tensors]
+        payload: dict[str, Any] = {"label": label, "keys": keys, "tensors": {}}
+        suspicious_keys: list[str] = []
+        for key in keys:
+            value = tensors[key]
+            if not torch.is_tensor(value):
+                continue
+            include_unique = key in {
+                "trace_indices",
+                "vq_rewards",
+                "mq_rewards",
+                "vq_advantages",
+                "mq_advantages",
+            }
+            snapshot = self._dance_case4_tensor_snapshot(
+                value,
+                preview_limit=preview_limit,
+                include_unique=include_unique,
+            )
+            payload["tensors"][key] = snapshot
+            stats = snapshot["stats"]
+            if stats.get("nonfinite_count", 0) > 0:
+                suspicious_keys.append(key)
+                continue
+            if include_unique and snapshot.get("unique_count") == 1 and int(stats.get("numel", 0)) > 1:
+                suspicious_keys.append(key)
+            if key == "trace_indices" and snapshot.get("zero_count") == int(stats.get("numel", 0)) and int(stats.get("numel", 0)) > 1:
+                suspicious_keys.append(key)
+        if suspicious_keys:
+            payload["suspicious_keys"] = sorted(set(suspicious_keys))
+        if meta:
+            payload["meta"] = convert_to_regular_types(meta)
+        self._trace_dance_case4_event(
+            "batch_snapshot",
+            context={**(context or {}), "label": label, "name": f"{label}.batch_snapshot"},
+            payload=payload,
+        )
+
+    def _trace_dance_case4_sample_mapping(
+        self,
+        label: str,
+        samples: dict[str, torch.Tensor],
+        *,
+        trace_ids: list[str],
+        trace_video_paths: list[str] | None = None,
+        trace_captions: list[str] | None = None,
+        context: dict[str, Any] | None = None,
+    ) -> None:
+        debug_cfg = self._get_dance_case4_debug_cfg()
+        if not debug_cfg["enable_trace"]:
+            return
+        if "trace_indices" not in samples or not torch.is_tensor(samples["trace_indices"]):
+            return
+
+        trace_indices_cpu = samples["trace_indices"].detach().reshape(-1).to(torch.long).cpu()
+        preview_limit = max(1, int(debug_cfg["trace_preview_limit"]))
+        mappings: list[dict[str, Any]] = []
+        duplicate_trace_indices = len(set(trace_indices_cpu.tolist())) != len(trace_indices_cpu.tolist())
+        for sample_idx, trace_index_tensor in enumerate(trace_indices_cpu[:preview_limit]):
+            trace_index = int(trace_index_tensor.item())
+            mapping: dict[str, Any] = {
+                "sample_idx": sample_idx,
+                "trace_index": trace_index,
+                "source_trace_id": trace_ids[trace_index] if 0 <= trace_index < len(trace_ids) else f"source_sample_{trace_index}",
+            }
+            if trace_video_paths is not None and 0 <= trace_index < len(trace_video_paths):
+                mapping["source_video_path"] = trace_video_paths[trace_index]
+            if trace_captions is not None and 0 <= trace_index < len(trace_captions):
+                mapping["caption"] = trace_captions[trace_index]
+            for key in ["vq_rewards", "mq_rewards", "vq_advantages", "mq_advantages"]:
+                if key in samples and torch.is_tensor(samples[key]) and sample_idx < int(samples[key].shape[0]):
+                    mapping[key] = _tensor_preview_list(samples[key][sample_idx], max_items=preview_limit)
+            if "log_probs" in samples and torch.is_tensor(samples["log_probs"]) and sample_idx < int(samples["log_probs"].shape[0]):
+                mapping["log_probs_preview"] = _tensor_preview_list(samples["log_probs"][sample_idx], max_items=preview_limit)
+            mappings.append(mapping)
+
+        payload = {
+            "label": label,
+            "mapping_count": int(trace_indices_cpu.numel()),
+            "trace_indices_preview": trace_indices_cpu[:preview_limit].tolist(),
+            "unique_trace_indices": int(torch.unique(trace_indices_cpu).numel()),
+            "duplicate_trace_indices": duplicate_trace_indices,
+            "mappings": mappings,
+        }
+        self._trace_dance_case4_event(
+            "sample_mapping_snapshot",
+            context={**(context or {}), "label": label, "name": f"{label}.sample_mapping_snapshot"},
+            payload=payload,
+        )
+        if duplicate_trace_indices:
+            reasons = [f"duplicate trace_indices detected: {trace_indices_cpu[:preview_limit].tolist()}"]
+            self._trace_dance_case4_event(
+                "suspicious_batch",
+                context={**(context or {}), "label": label, "name": f"{label}.suspicious_batch"},
+                payload={"reasons": reasons, "trace_indices_preview": trace_indices_cpu[:preview_limit].tolist()},
+            )
+
     def _check_dance_case4_array(
         self,
         array: Any,
@@ -1289,7 +1507,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         trace_if_finite: bool = False,
     ) -> Any:
         debug_cfg = self._get_dance_case4_debug_cfg()
-        if not debug_cfg["enable_trace"] and not debug_cfg["enable_finite_checks"]:
+        if not debug_cfg["enable_trace"] and not debug_cfg["enable_finite_checks"] and not debug_cfg["fail_on_nonfinite"]:
             return array
         stats = _ndarray_debug_stats(array)
         context_dict = self._dance_case4_context(context)
@@ -1304,9 +1522,9 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                     context={**context_dict, "name": name},
                     payload={"stats": stats},
                 )
-            if debug_cfg["enable_finite_checks"]:
+            if debug_cfg["fail_on_nonfinite"] or debug_cfg["enable_finite_checks"]:
                 logger.error(message)
-                raise FloatingPointError(message)
+                self._dance_case4_raise_fail_fast(name, context=context, stats=stats, reason=message)
             logger.warning(message)
         elif debug_cfg["enable_trace"] and (trace_if_finite or debug_cfg["trace_log_all_steps"]):
             self._trace_dance_case4_event(
@@ -1334,6 +1552,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         debug_cfg = self._get_dance_case4_debug_cfg()
         if (
             not debug_cfg["enable_finite_checks"]
+            and not debug_cfg["fail_on_nonfinite"]
             and not (debug_cfg["log_tensor_stats"] and log_if_finite)
             and not debug_cfg["enable_trace"]
         ):
@@ -1358,9 +1577,9 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                     context={**context_dict, "name": name},
                     payload={"stats": stats},
                 )
-            if debug_cfg["enable_finite_checks"]:
+            if debug_cfg["fail_on_nonfinite"] or debug_cfg["enable_finite_checks"]:
                 logger.error(message)
-                raise FloatingPointError(message)
+                self._dance_case4_raise_fail_fast(name, context=context, stats=stats, reason=message)
             logger.warning(message)
 
         if debug_cfg["log_tensor_stats"] and log_if_finite:
@@ -1894,16 +2113,57 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             "encoder_hidden_states": encoder_hidden_states,
             "encoder_attention_mask": encoder_attention_mask,
         }
-        return DataProto.from_dict(
+        trace_meta = {
+            "dance_trace_ids": [record["trace_id"] for record in trace_records],
+            "dance_trace_video_paths": [record.get("video_path", "") for record in trace_records],
+            "dance_trace_captions": [record.get("caption", "") for record in trace_records],
+            "dance_trace_rollout_seq": rollout_seq,
+        }
+        self._trace_dance_case4_batch_snapshot(
+            "rollout_return_device",
+            samples,
+            context={"stage": "rollout"},
+            key_order=[
+                "trace_indices",
+                "vq_rewards",
+                "mq_rewards",
+                "log_probs",
+                "timesteps",
+                "latents",
+                "next_latents",
+            ],
+            meta={
+                "trace_ids_preview": trace_meta["dance_trace_ids"][:8],
+                "rollout_seq": rollout_seq,
+            },
+        )
+        data_proto = DataProto.from_dict(
             tensors=samples,
             meta_info={
                 "sigma_schedule": sigma_schedule.detach().cpu().numpy().copy(),
-                "dance_trace_ids": [record["trace_id"] for record in trace_records],
-                "dance_trace_video_paths": [record.get("video_path", "") for record in trace_records],
-                "dance_trace_captions": [record.get("caption", "") for record in trace_records],
-                "dance_trace_rollout_seq": rollout_seq,
+                **trace_meta,
             },
-        ).to("cpu")
+        )
+        data_proto = data_proto.to("cpu")
+        self._trace_dance_case4_batch_snapshot(
+            "rollout_return_cpu",
+            dict(data_proto.batch.items()),
+            context={"stage": "rollout"},
+            key_order=[
+                "trace_indices",
+                "vq_rewards",
+                "mq_rewards",
+                "log_probs",
+                "timesteps",
+                "latents",
+                "next_latents",
+            ],
+            meta={
+                "trace_ids_preview": trace_meta["dance_trace_ids"][:8],
+                "rollout_seq": rollout_seq,
+            },
+        )
+        return data_proto
 
     def _update_actor_dance(self, data: DataProto) -> DataProto:
         device = torch.device(get_device_name(), get_device_id())
@@ -1913,6 +2173,33 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         trace_video_paths = list(data.meta_info.get("dance_trace_video_paths", []))
         trace_captions = list(data.meta_info.get("dance_trace_captions", []))
         debug_cfg = self._get_dance_case4_debug_cfg()
+        self._trace_dance_case4_batch_snapshot(
+            "update_entry",
+            samples,
+            context={"stage": "actor_update"},
+            key_order=[
+                "trace_indices",
+                "vq_rewards",
+                "mq_rewards",
+                "log_probs",
+                "timesteps",
+                "latents",
+                "next_latents",
+            ],
+            meta={
+                "trace_ids_preview": trace_ids[:8],
+                "trace_video_paths_preview": trace_video_paths[:4],
+                "trace_captions_preview": trace_captions[:2],
+            },
+        )
+        self._trace_dance_case4_sample_mapping(
+            "update_entry",
+            samples,
+            trace_ids=trace_ids,
+            trace_video_paths=trace_video_paths,
+            trace_captions=trace_captions,
+            context={"stage": "actor_update"},
+        )
         self.optimizer.zero_grad()
 
         def flux_step(
@@ -2009,6 +2296,12 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 )
             samples["vq_rewards"] = torch.nan_to_num(raw_vq_rewards, nan=-1.0, posinf=-1.0, neginf=-1.0)
             samples["mq_rewards"] = torch.nan_to_num(raw_mq_rewards, nan=-1.0, posinf=-1.0, neginf=-1.0)
+        self._trace_dance_case4_batch_snapshot(
+            "pre_advantage",
+            samples,
+            context={"stage": "actor_update"},
+            key_order=["trace_indices", "vq_rewards", "mq_rewards", "log_probs"],
+        )
         vq_advantages = torch.zeros_like(samples["vq_rewards"])
         mq_advantages = torch.zeros_like(samples["mq_rewards"])
         for i in range(n_groups):
@@ -2032,6 +2325,12 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         samples["mq_advantages"] = mq_advantages
         self._check_dance_case4_tensor(samples["vq_advantages"], "actor_update.vq_advantages", context={"stage": "full_batch"}, log_if_finite=True)
         self._check_dance_case4_tensor(samples["mq_advantages"], "actor_update.mq_advantages", context={"stage": "full_batch"}, log_if_finite=True)
+        self._trace_dance_case4_batch_snapshot(
+            "post_advantage",
+            samples,
+            context={"stage": "actor_update"},
+            key_order=["trace_indices", "vq_rewards", "mq_rewards", "vq_advantages", "mq_advantages", "log_probs"],
+        )
 
         total_scores = self.config.rollout.vq_coef * vq_advantages + self.config.rollout.mq_coef * mq_advantages
         batch_size = int(samples["timesteps"].shape[0])
@@ -2045,12 +2344,42 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             for key in list(samples.keys()):
                 samples[key] = samples[key][selected_indices]
             batch_size = len(selected_indices)
+            self._trace_dance_case4_batch_snapshot(
+                "post_bestofn_selection",
+                samples,
+                context={"stage": "actor_update"},
+                key_order=["trace_indices", "vq_rewards", "mq_rewards", "vq_advantages", "mq_advantages", "log_probs"],
+                meta={"selected_indices": _tensor_preview_list(selected_indices, max_items=debug_cfg["trace_preview_limit"])},
+            )
+            self._trace_dance_case4_sample_mapping(
+                "post_bestofn_selection",
+                samples,
+                trace_ids=trace_ids,
+                trace_video_paths=trace_video_paths,
+                trace_captions=trace_captions,
+                context={"stage": "actor_update"},
+            )
 
         perms = torch.stack(
             [torch.randperm(samples["timesteps"].shape[1], device=samples["timesteps"].device) for _ in range(batch_size)]
         )
         for key in ["timesteps", "latents", "next_latents", "log_probs"]:
             samples[key] = samples[key][torch.arange(batch_size, device=samples[key].device)[:, None], perms]
+        self._trace_dance_case4_batch_snapshot(
+            "post_timestep_permutation",
+            samples,
+            context={"stage": "actor_update"},
+            key_order=["trace_indices", "vq_rewards", "mq_rewards", "vq_advantages", "mq_advantages", "log_probs", "timesteps"],
+            meta={"perms_preview": _tensor_preview_list(perms, max_items=debug_cfg["trace_preview_limit"])},
+        )
+        self._trace_dance_case4_sample_mapping(
+            "pre_sample_loop",
+            samples,
+            trace_ids=trace_ids,
+            trace_video_paths=trace_video_paths,
+            trace_captions=trace_captions,
+            context={"stage": "actor_update"},
+        )
 
         samples_batched = {k: v.unsqueeze(1) for k, v in samples.items()}
         samples_batched_list = [dict(zip(samples_batched, values)) for values in zip(*samples_batched.values())]
@@ -2936,6 +3265,13 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             reasons = "; ".join(self._dance_case4_mismatch_reasons())
             raise ValueError(f"[dance_case4] worker update_actor rejected due to case4 condition mismatch: {reasons}")
         if self._is_dance_case4_mode():
+            self._trace_dance_case4_batch_snapshot(
+                "update_actor_dispatch_entry",
+                dict(data.batch.items()),
+                context={"stage": "actor_update"},
+                key_order=["trace_indices", "vq_rewards", "mq_rewards", "log_probs", "timesteps"],
+                meta={"meta_info_keys": sorted(list(data.meta_info.keys()))},
+            )
             return self._update_actor_dance(data)
 
         assert self._is_actor
