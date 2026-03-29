@@ -8,16 +8,22 @@ export TRANSFORMERS_OFFLINE=1
 export VERL_SOCKET_IFACE_PREFIX=192.158.0.
 
 RAY_ADDRESS=http://192.158.0.14:8265
-DIST_MASTER_ADDR=192.158.0.14
-DIST_MASTER_PORT=29400
+RAY_HEAD_HOST=192.158.0.14
+DIST_MASTER_ADDR=null
+DIST_MASTER_PORT=null
 WORKING_DIR=/workspace/projects/long-rl
 RUNTIME_ENV=/workspace/projects/long-rl/verl/trainer/runtime_env.yaml
+REPORT_DIR=${REPORT_DIR:-/workspace/projects/long-rl/outputs/nodes/dance_case3_step_timing}
 
 MODEL_PATH=/share/models/dancegrpo/HunyuanVideo
 VIDEOALIGN_CKPT_PATH=/share/models/dancegrpo/videoalign_ckpt
 VIDEOALIGN_BASE_MODEL_PATH=/workspace/models/Qwen2-VL-2B-Instruct
 DATA_JSON_PATH=/share/models/dancegrpo/rl_embeddings/videos2caption.json
 
+export NO_PROXY="${RAY_HEAD_HOST},127.0.0.1,localhost${NO_PROXY:+,${NO_PROXY}}"
+export no_proxy="${RAY_HEAD_HOST},127.0.0.1,localhost${no_proxy:+,${no_proxy}}"
+
+env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u all_proxy \
 ray job submit --address="${RAY_ADDRESS}" \
   --working-dir "${WORKING_DIR}" \
   --runtime-env "${RUNTIME_ENV}" \
@@ -34,7 +40,7 @@ ray job submit --address="${RAY_ADDRESS}" \
     trainer.disaggregate_rollout_ref_n_gpus_per_node=4 \
     trainer.dist_master_addr=${DIST_MASTER_ADDR} \
     trainer.dist_master_port=${DIST_MASTER_PORT} \
-    trainer.max_train_steps=4 \
+    trainer.max_train_steps=1 \
     data.train_batch_size=32 \
     data.gen_batch_size=32 \
     data.data_json_path=${DATA_JSON_PATH} \
@@ -45,4 +51,5 @@ ray job submit --address="${RAY_ADDRESS}" \
     actor_rollout_ref.actor.extra.dance.vae_model_path=${MODEL_PATH} \
     actor_rollout_ref.actor.extra.dance.videoalign_ckpt_path=${VIDEOALIGN_CKPT_PATH} \
     +actor_rollout_ref.actor.extra.dance.videoalign_base_model_name_or_path=${VIDEOALIGN_BASE_MODEL_PATH} \
-    actor_rollout_ref.actor.extra.dance.master_weight_type=bf16
+    actor_rollout_ref.actor.extra.dance.master_weight_type=bf16 \
+    +trainer.step_timing_report_dir=${REPORT_DIR}

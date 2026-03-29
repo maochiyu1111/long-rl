@@ -1115,6 +1115,12 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         all_log_probs: list[torch.Tensor] = []
         all_vq_rewards: list[torch.Tensor] = []
         all_mq_rewards: list[torch.Tensor] = []
+        rollout_stage_total_s = {
+            "sampling_loop_s": 0.0,
+            "vae_decode_s": 0.0,
+            "video_export_s": 0.0,
+            "videoalign_reward_s": 0.0,
+        }
         os.makedirs("./videos", exist_ok=True)
 
         batch_indices = torch.chunk(torch.arange(encoder_hidden_states.shape[0], device=encoder_hidden_states.device), encoder_hidden_states.shape[0])
@@ -1144,33 +1150,38 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 z = input_latents.clone()
                 latents_path = [z]
                 log_probs_path = []
-                for i in range(sample_steps):
-                    sigma = sigma_schedule[i]
-                    timestep_value = int(float(sigma) * 1000)
-                    timesteps = torch.full([batch_encoder_hidden_states.shape[0]], timestep_value, device=z.device, dtype=torch.long)
-                    rollout_model.eval()
-                    with torch.autocast(device_type=get_device_name(), dtype=torch.bfloat16):
-                        model_pred = rollout_model(
-                            hidden_states=z,
-                            encoder_hidden_states=batch_encoder_hidden_states,
-                            timestep=timesteps,
-                            guidance=torch.tensor([6018.0], device=z.device, dtype=torch.bfloat16),
-                            encoder_attention_mask=batch_encoder_attention_mask,
-                            return_dict=False,
-                        )[0]
-                    z, pred_original, log_prob = flux_step(
-                        model_output=model_pred,
-                        latents=z.to(torch.float32),
-                        eta=float(self.config.rollout.eta),
-                        sigmas=sigma_schedule,
-                        index=i,
-                        prev_sample=None,
-                        grpo=True,
-                        sde_solver=True,
-                    )
-                    z = z.to(torch.bfloat16)
-                    latents_path.append(z)
-                    log_probs_path.append(log_prob)
+                sample_timing_raw: dict[str, float] = {}
+                with simple_timer("sampling_loop_s", sample_timing_raw):
+                    for i in range(sample_steps):
+                        sigma = sigma_schedule[i]
+                        timestep_value = int(float(sigma) * 1000)
+                        timesteps = torch.full(
+                            [batch_encoder_hidden_states.shape[0]], timestep_value, device=z.device, dtype=torch.long
+                        )
+                        rollout_model.eval()
+                        with torch.autocast(device_type=get_device_name(), dtype=torch.bfloat16):
+                            model_pred = rollout_model(
+                                hidden_states=z,
+                                encoder_hidden_states=batch_encoder_hidden_states,
+                                timestep=timesteps,
+                                guidance=torch.tensor([6018.0], device=z.device, dtype=torch.bfloat16),
+                                encoder_attention_mask=batch_encoder_attention_mask,
+                                return_dict=False,
+                            )[0]
+                        z, pred_original, log_prob = flux_step(
+                            model_output=model_pred,
+                            latents=z.to(torch.float32),
+                            eta=float(self.config.rollout.eta),
+                            sigmas=sigma_schedule,
+                            index=i,
+                            prev_sample=None,
+                            grpo=True,
+                            sde_solver=True,
+                        )
+                        z = z.to(torch.bfloat16)
+                        latents_path.append(z)
+                        log_probs_path.append(log_prob)
+                rollout_stage_total_s["sampling_loop_s"] += sample_timing_raw["sampling_loop_s"]
                 latents = pred_original.to(torch.float32) / 0.476986
 
             batch_latents = torch.stack(latents_path, dim=1)
@@ -1180,25 +1191,34 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
             self.vae.enable_tiling()
             video_processor = VideoProcessor(vae_scale_factor=8)
-            with torch.inference_mode():
-                with torch.autocast(device_type=get_device_name(), dtype=torch.bfloat16):
-                    video = self.vae.decode(latents, return_dict=False)[0]
-                    videos = video_processor.postprocess_video(video)
+            sample_timing_raw = {}
+            with simple_timer("vae_decode_s", sample_timing_raw):
+                with torch.inference_mode():
+                    with torch.autocast(device_type=get_device_name(), dtype=torch.bfloat16):
+                        video = self.vae.decode(latents, return_dict=False)[0]
+                        videos = video_processor.postprocess_video(video)
+            rollout_stage_total_s["vae_decode_s"] += sample_timing_raw["vae_decode_s"]
 
             rank = int(os.environ.get("RANK", 0))
             video_path = os.path.abspath(f"./videos/hunyuan_{rank}_{index}.mp4")
-            export_to_video(videos[0], video_path, fps=self.rollout_fps)
+            sample_timing_raw = {}
+            with simple_timer("video_export_s", sample_timing_raw):
+                export_to_video(videos[0], video_path, fps=self.rollout_fps)
+            rollout_stage_total_s["video_export_s"] += sample_timing_raw["video_export_s"]
 
             vq_reward = torch.tensor(-1.0, device=encoder_hidden_states.device)
             mq_reward = torch.tensor(-1.0, device=encoder_hidden_states.device)
             if use_videoalign and self.inferencer is not None:
+                sample_timing_raw = {}
                 try:
-                    with torch.no_grad():
-                        reward = self.inferencer.reward([video_path], [batch_caption[0]], use_norm=True)
+                    with simple_timer("videoalign_reward_s", sample_timing_raw):
+                        with torch.no_grad():
+                            reward = self.inferencer.reward([video_path], [batch_caption[0]], use_norm=True)
                     vq_reward = torch.tensor(reward[0]["VQ"], device=encoder_hidden_states.device)
                     mq_reward = torch.tensor(reward[0]["MQ"], device=encoder_hidden_states.device)
                 except Exception:
                     logger.exception("[dance_case] videoalign reward failed, fallback to -1 reward")
+                rollout_stage_total_s["videoalign_reward_s"] += sample_timing_raw.get("videoalign_reward_s", 0.0)
             all_vq_rewards.append(vq_reward.unsqueeze(0))
             all_mq_rewards.append(mq_reward.unsqueeze(0))
 
@@ -1221,9 +1241,18 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             "encoder_hidden_states": encoder_hidden_states,
             "encoder_attention_mask": encoder_attention_mask,
         }
+        rollout_num_samples = int(encoder_hidden_states.shape[0])
+        rollout_stage_mean_s = {
+            key: value / max(1, rollout_num_samples) for key, value in rollout_stage_total_s.items()
+        }
         return DataProto.from_dict(
             tensors=samples,
-            meta_info={"sigma_schedule": sigma_schedule.detach().cpu().numpy()},
+            meta_info={
+                "sigma_schedule": sigma_schedule.detach().cpu().numpy(),
+                "rollout_num_samples": rollout_num_samples,
+                "rollout_stage_total_s": rollout_stage_total_s,
+                "rollout_stage_mean_s": rollout_stage_mean_s,
+            },
         ).to("cpu")
 
     def _update_actor_dance(self, data: DataProto) -> DataProto:

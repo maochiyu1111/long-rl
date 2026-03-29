@@ -526,6 +526,8 @@ class RayWorkerGroup(WorkerGroup):
                 profile_steps=self.profile_steps,
                 worker_nsight_options=self.worker_nsight_options,
             )
+            new_worker_group._master_addr = self._master_addr
+            new_worker_group._master_port = self._master_port
 
             _rebind_actor_methods(new_worker_group, prefix)
             new_worker_group_dict[prefix] = new_worker_group

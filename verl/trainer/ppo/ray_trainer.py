@@ -2011,6 +2011,8 @@ class RayPPOTrainer:
     def _log_step_timing(self, timing_raw: dict[str, float], step: int, epoch: int):
         """Print per-step timing to help debug large variance between steps."""
         stage_order = [
+            "rollout",
+            "actor_update",
             "gen",
             "gen_max",
             "reward",
@@ -2043,6 +2045,521 @@ class RayPPOTrainer:
             print(f"{header} | " + ", ".join(stage_msgs))
         else:
             print(header)
+
+    def _get_step_timing_report_dir(self, report_name: str = "step_timing") -> str:
+        configured_dir = OmegaConf.select(self.config, "trainer.step_timing_report_dir")
+        if configured_dir:
+            return os.path.abspath(str(configured_dir))
+
+        project_name = OmegaConf.select(self.config, "trainer.project_name") or "default_project"
+        experiment_name = OmegaConf.select(self.config, "trainer.experiment_name") or "default_experiment"
+        return os.path.abspath(os.path.join("outputs", str(project_name), str(experiment_name), report_name))
+
+    @staticmethod
+    def _compute_step_timing_stats(values: list[float]) -> dict[str, float]:
+        if not values:
+            return {
+                "count": 0,
+                "min_s": 0.0,
+                "mean_s": 0.0,
+                "p50_s": 0.0,
+                "p90_s": 0.0,
+                "max_s": 0.0,
+            }
+
+        arr = np.asarray(values, dtype=np.float64)
+        return {
+            "count": int(arr.size),
+            "min_s": float(arr.min()),
+            "mean_s": float(arr.mean()),
+            "p50_s": float(np.quantile(arr, 0.5)),
+            "p90_s": float(np.quantile(arr, 0.9)),
+            "max_s": float(arr.max()),
+        }
+
+    def _init_dance_case4_step_timing(self):
+        report_dir = self._get_step_timing_report_dir(report_name="dance_case4_step_timing")
+        os.makedirs(report_dir, exist_ok=True)
+
+        self._dance_case4_step_timing_dir = report_dir
+        self._dance_case4_step_timing_jsonl_path = os.path.join(report_dir, "step_timing.jsonl")
+        self._dance_case4_step_timing_json_path = os.path.join(report_dir, "step_timing_summary.json")
+        self._dance_case4_step_timing_md_path = os.path.join(report_dir, "step_timing_report.md")
+        self._dance_case4_step_timing_records: list[dict[str, Any]] = []
+
+        for path in [
+            self._dance_case4_step_timing_jsonl_path,
+            self._dance_case4_step_timing_json_path,
+            self._dance_case4_step_timing_md_path,
+        ]:
+            with open(path, "w", encoding="utf-8"):
+                pass
+
+    def _write_dance_case4_step_timing_report(self):
+        records = getattr(self, "_dance_case4_step_timing_records", [])
+        if not records:
+            return
+
+        total_values = [record["step_total_s"] for record in records]
+        rollout_values = [record["rollout_s"] for record in records]
+        actor_values = [record["actor_update_s"] for record in records]
+        overhead_values = [record["other_overhead_s"] for record in records]
+
+        summary = {
+            "generated_at": str(np.datetime64("now")),
+            "project_name": OmegaConf.select(self.config, "trainer.project_name"),
+            "experiment_name": OmegaConf.select(self.config, "trainer.experiment_name"),
+            "report_dir": self._dance_case4_step_timing_dir,
+            "num_steps": len(records),
+            "config": {
+                "max_train_steps": OmegaConf.select(self.config, "trainer.max_train_steps"),
+                "n_gpus_per_node": OmegaConf.select(self.config, "trainer.n_gpus_per_node"),
+                "train_batch_size": OmegaConf.select(self.config, "data.train_batch_size"),
+                "gen_batch_size": OmegaConf.select(self.config, "data.gen_batch_size"),
+                "sampling_steps": OmegaConf.select(self.config, "actor_rollout_ref.rollout.sampling_steps"),
+                "num_generations": OmegaConf.select(self.config, "actor_rollout_ref.rollout.num_generations"),
+                "bestofn": OmegaConf.select(self.config, "actor_rollout_ref.rollout.bestofn"),
+            },
+            "stages": {
+                "step_total_s": self._compute_step_timing_stats(total_values),
+                "rollout_s": self._compute_step_timing_stats(rollout_values),
+                "actor_update_s": self._compute_step_timing_stats(actor_values),
+                "other_overhead_s": self._compute_step_timing_stats(overhead_values),
+            },
+            "steps": records,
+        }
+
+        step_total_mean = summary["stages"]["step_total_s"]["mean_s"] or 1e-12
+        for stage_name in ["rollout_s", "actor_update_s", "other_overhead_s"]:
+            stage_mean = summary["stages"][stage_name]["mean_s"]
+            summary["stages"][stage_name]["share_of_step_mean"] = float(stage_mean / step_total_mean)
+
+        rollout_stage_names = [
+            "sampling_loop_s",
+            "vae_decode_s",
+            "video_export_s",
+            "videoalign_reward_s",
+        ]
+        rollout_stage_summary = []
+        rollout_mean = summary["stages"]["rollout_s"]["mean_s"] or 1e-12
+        for stage_name in rollout_stage_names:
+            values = [
+                float(record.get("rollout_stage_total_s", {}).get(stage_name, 0.0))
+                for record in records
+            ]
+            stats = self._compute_step_timing_stats(values)
+            stats["share_of_rollout_mean"] = float(stats["mean_s"] / rollout_mean)
+            rollout_stage_summary.append({"rollout_stage": stage_name, **stats})
+        summary["rollout_stage_total_s"] = rollout_stage_summary
+
+        with open(self._dance_case4_step_timing_json_path, "w", encoding="utf-8") as f:
+            json.dump(summary, f, indent=2)
+
+        def _fmt(value: float) -> str:
+            return f"{value:.4f}"
+
+        stage_rows = []
+        for stage_name, stats in summary["stages"].items():
+            share = stats.get("share_of_step_mean")
+            share_text = f"{share * 100:.2f}%" if share is not None else "-"
+            stage_rows.append(
+                "| "
+                + " | ".join(
+                    [
+                        stage_name,
+                        str(stats["count"]),
+                        _fmt(stats["min_s"]),
+                        _fmt(stats["mean_s"]),
+                        _fmt(stats["p50_s"]),
+                        _fmt(stats["p90_s"]),
+                        _fmt(stats["max_s"]),
+                        share_text,
+                    ]
+                )
+                + " |"
+            )
+
+        step_rows = []
+        for record in records:
+            actor_loss = record["actor_metrics"].get("actor/loss")
+            actor_loss_text = "-" if actor_loss is None else f"{actor_loss:.6f}"
+            rollout_stage_total_s = record.get("rollout_stage_total_s", {})
+            rollout_stage_text = ", ".join(
+                [
+                    f"sampling={rollout_stage_total_s.get('sampling_loop_s', 0.0):.4f}",
+                    f"vae={rollout_stage_total_s.get('vae_decode_s', 0.0):.4f}",
+                    f"export={rollout_stage_total_s.get('video_export_s', 0.0):.4f}",
+                    f"reward={rollout_stage_total_s.get('videoalign_reward_s', 0.0):.4f}",
+                ]
+            )
+            step_rows.append(
+                "| "
+                + " | ".join(
+                    [
+                        str(record["step"]),
+                        str(record["epoch"]),
+                        _fmt(record["step_total_s"]),
+                        _fmt(record["rollout_s"]),
+                        _fmt(record["actor_update_s"]),
+                        _fmt(record["other_overhead_s"]),
+                        actor_loss_text,
+                        rollout_stage_text,
+                    ]
+                )
+                + " |"
+            )
+
+        rollout_stage_rows = []
+        for item in rollout_stage_summary:
+            rollout_stage_rows.append(
+                "| "
+                + " | ".join(
+                    [
+                        str(item["rollout_stage"]),
+                        str(item["count"]),
+                        _fmt(item["min_s"]),
+                        _fmt(item["mean_s"]),
+                        _fmt(item["p50_s"]),
+                        _fmt(item["p90_s"]),
+                        _fmt(item["max_s"]),
+                        f"{item['share_of_rollout_mean'] * 100:.2f}%",
+                    ]
+                )
+                + " |"
+            )
+
+        report_lines = [
+            "# Dance Case4 Step Timing Report",
+            "",
+            f"- project: `{summary['project_name']}`",
+            f"- experiment: `{summary['experiment_name']}`",
+            f"- report_dir: `{summary['report_dir']}`",
+            f"- generated_at: `{summary['generated_at']}`",
+            f"- num_steps: `{summary['num_steps']}`",
+            "",
+            "## Config",
+            "",
+            f"- max_train_steps: `{summary['config']['max_train_steps']}`",
+            f"- n_gpus_per_node: `{summary['config']['n_gpus_per_node']}`",
+            f"- train_batch_size: `{summary['config']['train_batch_size']}`",
+            f"- gen_batch_size: `{summary['config']['gen_batch_size']}`",
+            f"- sampling_steps: `{summary['config']['sampling_steps']}`",
+            f"- num_generations: `{summary['config']['num_generations']}`",
+            f"- bestofn: `{summary['config']['bestofn']}`",
+            "",
+            "## Stage Summary",
+            "",
+            "| stage | count | min_s | mean_s | p50_s | p90_s | max_s | share_of_step_mean |",
+            "| --- | --- | --- | --- | --- | --- | --- | --- |",
+            *stage_rows,
+            "",
+            "## Rollout Breakdown",
+            "",
+            "| rollout_stage | count | min_s | mean_s | p50_s | p90_s | max_s | share_of_rollout_mean |",
+            "| --- | --- | --- | --- | --- | --- | --- | --- |",
+            *rollout_stage_rows,
+            "",
+            "## Step Details",
+            "",
+            "| step | epoch | step_total_s | rollout_s | actor_update_s | other_overhead_s | actor_loss | rollout_breakdown_s |",
+            "| --- | --- | --- | --- | --- | --- | --- | --- |",
+            *step_rows,
+            "",
+        ]
+
+        with open(self._dance_case4_step_timing_md_path, "w", encoding="utf-8") as f:
+            f.write("\n".join(report_lines))
+
+    def _record_dance_case4_step_timing(
+        self,
+        epoch: int,
+        step: int,
+        timing_raw: dict[str, float],
+        actor_metrics: Optional[dict[str, Any]] = None,
+        rollout_meta_info: Optional[dict[str, Any]] = None,
+    ):
+        actor_metrics = actor_metrics or {}
+        rollout_meta_info = rollout_meta_info or {}
+        step_total = float(timing_raw.get("step", 0.0))
+        rollout_time = float(timing_raw.get("rollout", 0.0))
+        actor_update_time = float(timing_raw.get("actor_update", 0.0))
+        other_overhead = max(0.0, step_total - rollout_time - actor_update_time)
+
+        numeric_actor_metrics = {
+            key: float(value)
+            for key, value in actor_metrics.items()
+            if isinstance(value, (int, float, np.integer, np.floating))
+        }
+
+        record = {
+            "epoch": int(epoch),
+            "step": int(step),
+            "step_total_s": step_total,
+            "rollout_s": rollout_time,
+            "actor_update_s": actor_update_time,
+            "other_overhead_s": other_overhead,
+            "actor_metrics": numeric_actor_metrics,
+            "rollout_num_samples": int(rollout_meta_info.get("rollout_num_samples", 0) or 0),
+            "rollout_stage_total_s": {
+                key: float(value) for key, value in rollout_meta_info.get("rollout_stage_total_s", {}).items()
+            },
+            "rollout_stage_mean_s": {
+                key: float(value) for key, value in rollout_meta_info.get("rollout_stage_mean_s", {}).items()
+            },
+        }
+        self._dance_case4_step_timing_records.append(record)
+
+        with open(self._dance_case4_step_timing_jsonl_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record) + "\n")
+
+        self._write_dance_case4_step_timing_report()
+
+    def _init_dance_case3_step_timing(self):
+        report_dir = self._get_step_timing_report_dir(report_name="dance_case3_step_timing")
+        os.makedirs(report_dir, exist_ok=True)
+
+        self._dance_case3_step_timing_dir = report_dir
+        self._dance_case3_step_timing_jsonl_path = os.path.join(report_dir, "step_timing.jsonl")
+        self._dance_case3_step_timing_json_path = os.path.join(report_dir, "step_timing_summary.json")
+        self._dance_case3_step_timing_md_path = os.path.join(report_dir, "step_timing_report.md")
+        self._dance_case3_step_timing_records: list[dict[str, Any]] = []
+
+        for path in [
+            self._dance_case3_step_timing_jsonl_path,
+            self._dance_case3_step_timing_json_path,
+            self._dance_case3_step_timing_md_path,
+        ]:
+            with open(path, "w", encoding="utf-8"):
+                pass
+
+    def _write_dance_case3_step_timing_report(self):
+        records = getattr(self, "_dance_case3_step_timing_records", [])
+        if not records:
+            return
+
+        total_values = [record["step_total_s"] for record in records]
+        rollout_values = [record["rollout_s"] for record in records]
+        actor_values = [record["actor_update_s"] for record in records]
+        overhead_values = [record["other_overhead_s"] for record in records]
+
+        summary = {
+            "generated_at": str(np.datetime64("now")),
+            "project_name": OmegaConf.select(self.config, "trainer.project_name"),
+            "experiment_name": OmegaConf.select(self.config, "trainer.experiment_name"),
+            "report_dir": self._dance_case3_step_timing_dir,
+            "num_steps": len(records),
+            "config": {
+                "max_train_steps": OmegaConf.select(self.config, "trainer.max_train_steps"),
+                "nnodes": OmegaConf.select(self.config, "trainer.nnodes"),
+                "n_gpus_per_node": OmegaConf.select(self.config, "trainer.n_gpus_per_node"),
+                "disaggregate_actor_n_gpus_per_node": OmegaConf.select(
+                    self.config, "trainer.disaggregate_actor_n_gpus_per_node"
+                ),
+                "disaggregate_rollout_ref_n_gpus_per_node": OmegaConf.select(
+                    self.config, "trainer.disaggregate_rollout_ref_n_gpus_per_node"
+                ),
+                "train_batch_size": OmegaConf.select(self.config, "data.train_batch_size"),
+                "gen_batch_size": OmegaConf.select(self.config, "data.gen_batch_size"),
+                "sampling_steps": OmegaConf.select(self.config, "actor_rollout_ref.rollout.sampling_steps"),
+                "num_generations": OmegaConf.select(self.config, "actor_rollout_ref.rollout.num_generations"),
+                "bestofn": OmegaConf.select(self.config, "actor_rollout_ref.rollout.bestofn"),
+            },
+            "stages": {
+                "step_total_s": self._compute_step_timing_stats(total_values),
+                "rollout_s": self._compute_step_timing_stats(rollout_values),
+                "actor_update_s": self._compute_step_timing_stats(actor_values),
+                "other_overhead_s": self._compute_step_timing_stats(overhead_values),
+            },
+            "steps": records,
+        }
+
+        step_total_mean = summary["stages"]["step_total_s"]["mean_s"] or 1e-12
+        for stage_name in ["rollout_s", "actor_update_s", "other_overhead_s"]:
+            stage_mean = summary["stages"][stage_name]["mean_s"]
+            summary["stages"][stage_name]["share_of_step_mean"] = float(stage_mean / step_total_mean)
+
+        rollout_stage_names = [
+            "sampling_loop_s",
+            "vae_decode_s",
+            "video_export_s",
+            "videoalign_reward_s",
+        ]
+        rollout_stage_summary = []
+        rollout_mean = summary["stages"]["rollout_s"]["mean_s"] or 1e-12
+        for stage_name in rollout_stage_names:
+            values = [
+                float(record.get("rollout_stage_total_s", {}).get(stage_name, 0.0))
+                for record in records
+            ]
+            stats = self._compute_step_timing_stats(values)
+            stats["share_of_rollout_mean"] = float(stats["mean_s"] / rollout_mean)
+            rollout_stage_summary.append({"rollout_stage": stage_name, **stats})
+        summary["rollout_stage_total_s"] = rollout_stage_summary
+
+        with open(self._dance_case3_step_timing_json_path, "w", encoding="utf-8") as f:
+            json.dump(summary, f, indent=2)
+
+        def _fmt(value: float) -> str:
+            return f"{value:.4f}"
+
+        stage_rows = []
+        for stage_name, stats in summary["stages"].items():
+            share = stats.get("share_of_step_mean")
+            share_text = f"{share * 100:.2f}%" if share is not None else "-"
+            stage_rows.append(
+                "| "
+                + " | ".join(
+                    [
+                        stage_name,
+                        str(stats["count"]),
+                        _fmt(stats["min_s"]),
+                        _fmt(stats["mean_s"]),
+                        _fmt(stats["p50_s"]),
+                        _fmt(stats["p90_s"]),
+                        _fmt(stats["max_s"]),
+                        share_text,
+                    ]
+                )
+                + " |"
+            )
+
+        step_rows = []
+        for record in records:
+            actor_loss = record["actor_metrics"].get("actor/loss")
+            actor_loss_text = "-" if actor_loss is None else f"{actor_loss:.6f}"
+            rollout_stage_total_s = record.get("rollout_stage_total_s", {})
+            rollout_stage_text = ", ".join(
+                [
+                    f"sampling={rollout_stage_total_s.get('sampling_loop_s', 0.0):.4f}",
+                    f"vae={rollout_stage_total_s.get('vae_decode_s', 0.0):.4f}",
+                    f"export={rollout_stage_total_s.get('video_export_s', 0.0):.4f}",
+                    f"reward={rollout_stage_total_s.get('videoalign_reward_s', 0.0):.4f}",
+                ]
+            )
+            step_rows.append(
+                "| "
+                + " | ".join(
+                    [
+                        str(record["step"]),
+                        str(record["epoch"]),
+                        _fmt(record["step_total_s"]),
+                        _fmt(record["rollout_s"]),
+                        _fmt(record["actor_update_s"]),
+                        _fmt(record["other_overhead_s"]),
+                        actor_loss_text,
+                        rollout_stage_text,
+                    ]
+                )
+                + " |"
+            )
+
+        rollout_stage_rows = []
+        for item in rollout_stage_summary:
+            rollout_stage_rows.append(
+                "| "
+                + " | ".join(
+                    [
+                        str(item["rollout_stage"]),
+                        str(item["count"]),
+                        _fmt(item["min_s"]),
+                        _fmt(item["mean_s"]),
+                        _fmt(item["p50_s"]),
+                        _fmt(item["p90_s"]),
+                        _fmt(item["max_s"]),
+                        f"{item['share_of_rollout_mean'] * 100:.2f}%",
+                    ]
+                )
+                + " |"
+            )
+
+        report_lines = [
+            "# Dance Case3 Step Timing Report",
+            "",
+            f"- project: `{summary['project_name']}`",
+            f"- experiment: `{summary['experiment_name']}`",
+            f"- report_dir: `{summary['report_dir']}`",
+            f"- generated_at: `{summary['generated_at']}`",
+            f"- num_steps: `{summary['num_steps']}`",
+            "",
+            "## Config",
+            "",
+            f"- max_train_steps: `{summary['config']['max_train_steps']}`",
+            f"- nnodes: `{summary['config']['nnodes']}`",
+            f"- n_gpus_per_node: `{summary['config']['n_gpus_per_node']}`",
+            f"- disaggregate_actor_n_gpus_per_node: `{summary['config']['disaggregate_actor_n_gpus_per_node']}`",
+            f"- disaggregate_rollout_ref_n_gpus_per_node: `{summary['config']['disaggregate_rollout_ref_n_gpus_per_node']}`",
+            f"- train_batch_size: `{summary['config']['train_batch_size']}`",
+            f"- gen_batch_size: `{summary['config']['gen_batch_size']}`",
+            f"- sampling_steps: `{summary['config']['sampling_steps']}`",
+            f"- num_generations: `{summary['config']['num_generations']}`",
+            f"- bestofn: `{summary['config']['bestofn']}`",
+            "",
+            "## Stage Summary",
+            "",
+            "| stage | count | min_s | mean_s | p50_s | p90_s | max_s | share_of_step_mean |",
+            "| --- | --- | --- | --- | --- | --- | --- | --- |",
+            *stage_rows,
+            "",
+            "## Rollout Breakdown",
+            "",
+            "| rollout_stage | count | min_s | mean_s | p50_s | p90_s | max_s | share_of_rollout_mean |",
+            "| --- | --- | --- | --- | --- | --- | --- | --- |",
+            *rollout_stage_rows,
+            "",
+            "## Step Details",
+            "",
+            "| step | epoch | step_total_s | rollout_s | actor_update_s | other_overhead_s | actor_loss | rollout_breakdown_s |",
+            "| --- | --- | --- | --- | --- | --- | --- | --- |",
+            *step_rows,
+            "",
+        ]
+
+        with open(self._dance_case3_step_timing_md_path, "w", encoding="utf-8") as f:
+            f.write("\n".join(report_lines))
+
+    def _record_dance_case3_step_timing(
+        self,
+        epoch: int,
+        step: int,
+        timing_raw: dict[str, float],
+        actor_metrics: Optional[dict[str, Any]] = None,
+        rollout_meta_info: Optional[dict[str, Any]] = None,
+    ):
+        actor_metrics = actor_metrics or {}
+        rollout_meta_info = rollout_meta_info or {}
+        step_total = float(timing_raw.get("step", 0.0))
+        rollout_time = float(timing_raw.get("rollout", 0.0))
+        actor_update_time = float(timing_raw.get("actor_update", 0.0))
+        other_overhead = max(0.0, step_total - rollout_time - actor_update_time)
+
+        numeric_actor_metrics = {
+            key: float(value)
+            for key, value in actor_metrics.items()
+            if isinstance(value, (int, float, np.integer, np.floating))
+        }
+
+        record = {
+            "epoch": int(epoch),
+            "step": int(step),
+            "step_total_s": step_total,
+            "rollout_s": rollout_time,
+            "actor_update_s": actor_update_time,
+            "other_overhead_s": other_overhead,
+            "actor_metrics": numeric_actor_metrics,
+            "rollout_num_samples": int(rollout_meta_info.get("rollout_num_samples", 0) or 0),
+            "rollout_stage_total_s": {
+                key: float(value) for key, value in rollout_meta_info.get("rollout_stage_total_s", {}).items()
+            },
+            "rollout_stage_mean_s": {
+                key: float(value) for key, value in rollout_meta_info.get("rollout_stage_mean_s", {}).items()
+            },
+        }
+        self._dance_case3_step_timing_records.append(record)
+
+        with open(self._dance_case3_step_timing_jsonl_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record) + "\n")
+
+        self._write_dance_case3_step_timing_report()
 
     def _is_dance_case3_enabled(self) -> bool:
         return bool(self.config.actor_rollout_ref.actor.get("dance_case3_mode", False))
@@ -2094,13 +2611,17 @@ class RayPPOTrainer:
 
         self.global_steps = 0
         data_iterator = iter(self.train_dataloader)
+        fit_epoch = 0
         progress_bar = tqdm(total=max_train_steps, initial=self.global_steps, desc="Dance Case3")
+        self._init_dance_case3_step_timing()
+        print(f"[dance_case3_timing] writing step timing report to {self._dance_case3_step_timing_dir}")
 
         while self.global_steps < max_train_steps:
             try:
                 batch = next(data_iterator)
             except StopIteration:
                 data_iterator = iter(self.train_dataloader)
+                fit_epoch += 1
                 batch = next(data_iterator)
 
             if not isinstance(batch, (list, tuple)) or len(batch) != 3:
@@ -2118,16 +2639,32 @@ class RayPPOTrainer:
                 meta_info={"caption": caption},
             )
 
-            rollout_batch = self.rollout_ref_wg.generate_sequences(new_batch)
-            actor_output = self.actor_wg.update_actor(rollout_batch)
+            timing_raw: dict[str, float] = {}
+            with marked_timer("step", timing_raw):
+                with marked_timer("rollout", timing_raw, color="red"):
+                    rollout_batch = self.rollout_ref_wg.generate_sequences(new_batch)
+                with marked_timer("actor_update", timing_raw, color="blue"):
+                    actor_output = self.actor_wg.update_actor(rollout_batch)
+
             actor_metrics = actor_output.meta_info.get("metrics", {}) if actor_output is not None else {}
+            current_step = self.global_steps + 1
+            self._log_step_timing(timing_raw=timing_raw, step=current_step, epoch=fit_epoch)
+            self._record_dance_case3_step_timing(
+                epoch=fit_epoch,
+                step=current_step,
+                timing_raw=timing_raw,
+                actor_metrics=actor_metrics,
+                rollout_meta_info=rollout_batch.meta_info,
+            )
             if actor_metrics:
                 progress_bar.set_postfix({k: f"{v:.4f}" for k, v in actor_metrics.items() if isinstance(v, (int, float))})
 
-            self.global_steps += 1
+            self.global_steps = current_step
             progress_bar.update(1)
 
         progress_bar.close()
+        print(f"[dance_case3_timing] markdown report: {self._dance_case3_step_timing_md_path}")
+        print(f"[dance_case3_timing] summary json: {self._dance_case3_step_timing_json_path}")
         return None
 
     def fit_dance_case4(self):
@@ -2140,13 +2677,17 @@ class RayPPOTrainer:
 
         self.global_steps = 0
         data_iterator = iter(self.train_dataloader)
+        fit_epoch = 0
         progress_bar = tqdm(total=max_train_steps, initial=self.global_steps, desc="Dance Case4")
+        self._init_dance_case4_step_timing()
+        print(f"[dance_case4_timing] writing step timing report to {self._dance_case4_step_timing_dir}")
 
         while self.global_steps < max_train_steps:
             try:
                 batch = next(data_iterator)
             except StopIteration:
                 data_iterator = iter(self.train_dataloader)
+                fit_epoch += 1
                 batch = next(data_iterator)
 
             if not isinstance(batch, (list, tuple)) or len(batch) != 3:
@@ -2164,16 +2705,32 @@ class RayPPOTrainer:
                 meta_info={"caption": caption},
             )
 
-            rollout_batch = self.actor_rollout_wg.generate_sequences(new_batch)
-            actor_output = self.actor_rollout_wg.update_actor(rollout_batch)
+            timing_raw: dict[str, float] = {}
+            with marked_timer("step", timing_raw):
+                with marked_timer("rollout", timing_raw, color="red"):
+                    rollout_batch = self.actor_rollout_wg.generate_sequences(new_batch)
+                with marked_timer("actor_update", timing_raw, color="blue"):
+                    actor_output = self.actor_rollout_wg.update_actor(rollout_batch)
+
             actor_metrics = actor_output.meta_info.get("metrics", {}) if actor_output is not None else {}
+            current_step = self.global_steps + 1
+            self._log_step_timing(timing_raw=timing_raw, step=current_step, epoch=fit_epoch)
+            self._record_dance_case4_step_timing(
+                epoch=fit_epoch,
+                step=current_step,
+                timing_raw=timing_raw,
+                actor_metrics=actor_metrics,
+                rollout_meta_info=rollout_batch.meta_info,
+            )
             if actor_metrics:
                 progress_bar.set_postfix({k: f"{v:.4f}" for k, v in actor_metrics.items() if isinstance(v, (int, float))})
 
-            self.global_steps += 1
+            self.global_steps = current_step
             progress_bar.update(1)
 
         progress_bar.close()
+        print(f"[dance_case4_timing] markdown report: {self._dance_case4_step_timing_md_path}")
+        print(f"[dance_case4_timing] summary json: {self._dance_case4_step_timing_json_path}")
         return None
 
     def fit(self):

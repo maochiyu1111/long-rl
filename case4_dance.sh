@@ -10,6 +10,7 @@ MODEL_PATH=/share/models/dancegrpo/HunyuanVideo
 VIDEOALIGN_CKPT_PATH=/share/models/dancegrpo/videoalign_ckpt
 VIDEOALIGN_BASE_MODEL_PATH=/workspace/models/Qwen2-VL-2B-Instruct
 DATA_JSON_PATH=/share/models/dancegrpo/rl_embeddings/videos2caption.json
+REPORT_DIR=${REPORT_DIR:-/workspace/projects/long-rl/outputs/single/dance_case4_step_timing}
 
 python3 -m verl.trainer.main_ppo \
   --config-path=/workspace/projects/long-rl/examples/diffusion \
@@ -19,7 +20,7 @@ python3 -m verl.trainer.main_ppo \
   trainer.experiment_name=case4_dance \
   trainer.nnodes=1 \
   trainer.n_gpus_per_node=8 \
-  trainer.max_train_steps=4 \
+  trainer.max_train_steps=3 \
   data.train_batch_size=16 \
   data.gen_batch_size=16 \
   data.data_json_path=${DATA_JSON_PATH} \
@@ -29,4 +30,5 @@ python3 -m verl.trainer.main_ppo \
   actor_rollout_ref.actor.extra.dance.pretrained_model_name_or_path=${MODEL_PATH} \
   actor_rollout_ref.actor.extra.dance.vae_model_path=${MODEL_PATH} \
   actor_rollout_ref.actor.extra.dance.videoalign_ckpt_path=${VIDEOALIGN_CKPT_PATH} \
-  +actor_rollout_ref.actor.extra.dance.videoalign_base_model_name_or_path=${VIDEOALIGN_BASE_MODEL_PATH}
+  +actor_rollout_ref.actor.extra.dance.videoalign_base_model_name_or_path=${VIDEOALIGN_BASE_MODEL_PATH} \
+  +trainer.step_timing_report_dir=${REPORT_DIR}
