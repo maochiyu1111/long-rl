@@ -1256,9 +1256,38 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             "sanitize_export_video": _cfg_bool("sanitize_export_video", "VERL_DANCE_SANITIZE_EXPORT_VIDEO", True),
             "sanitize_reward_nan": _cfg_bool("sanitize_reward_nan", "VERL_DANCE_SANITIZE_REWARD_NAN", True),
             "stabilize_ratio": _cfg_bool("stabilize_ratio", "VERL_DANCE_STABILIZE_RATIO", True),
+            "materialize_cpu_batch_after_transfer": _cfg_bool(
+                "materialize_cpu_batch_after_transfer",
+                "VERL_DANCE_MATERIALIZE_CPU_BATCH_AFTER_TRANSFER",
+                False,
+            ),
             "ratio_log_prob_clip": _cfg_float("ratio_log_prob_clip", "VERL_DANCE_RATIO_LOG_PROB_CLIP", 20.0),
         }
         return self._dance_case4_debug_cfg_cache
+
+    def _materialize_dance_case4_cpu_batch_after_transfer(self, data_proto: DataProto) -> None:
+        if not self._get_dance_case4_debug_cfg()["materialize_cpu_batch_after_transfer"]:
+            return
+        if data_proto.batch is None:
+            return
+
+        for key, tensor in data_proto.batch.items():
+            if not torch.is_tensor(tensor):
+                continue
+            if tensor.device.type != "cpu":
+                raise RuntimeError(
+                    f"[dance_case4] expected CPU tensor after transfer for key={key}, got device={tensor.device}"
+                )
+            if tensor.numel() == 0:
+                continue
+
+            flattened = tensor.detach().reshape(-1)
+            if torch.is_floating_point(flattened) or flattened.dtype == torch.bfloat16:
+                _ = flattened.to(torch.float32).sum().item()
+            elif flattened.dtype == torch.bool:
+                _ = flattened.to(torch.int64).sum().item()
+            else:
+                _ = flattened.sum().item()
 
     def _dance_case4_context(self, extra: dict[str, Any] | None = None) -> dict[str, Any]:
         if self._dance_case4_trace_run_id is None:
@@ -2145,6 +2174,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             },
         )
         data_proto = data_proto.to("cpu")
+        self._materialize_dance_case4_cpu_batch_after_transfer(data_proto)
         self._trace_dance_case4_batch_snapshot(
             "rollout_return_cpu",
             dict(data_proto.batch.items()),
