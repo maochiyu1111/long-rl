@@ -835,6 +835,30 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             grad_clip = self.config.actor.get("max_grad_norm", 1.0)
         return float(grad_clip)
 
+    def _materialize_batch_after_transfer(self, data_proto: DataProto) -> None:
+        # Work around the NaN bug observed on NPU by eagerly materializing tensors
+        # after transfer. We keep this enabled on both GPU and NPU for consistency.
+        if data_proto.batch is None:
+            return
+
+        for key, tensor in data_proto.batch.items():
+            if not torch.is_tensor(tensor):
+                continue
+            if tensor.device.type != "cpu":
+                raise RuntimeError(
+                    f"[dance_case4] expected CPU tensor after transfer for key={key}, got device={tensor.device}"
+                )
+            if tensor.numel() == 0:
+                continue
+
+            flattened = tensor.detach().reshape(-1)
+            if torch.is_floating_point(flattened) or flattened.dtype == torch.bfloat16:
+                _ = flattened.to(torch.float32).sum().item()
+            elif flattened.dtype == torch.bool:
+                _ = flattened.to(torch.int64).sum().item()
+            else:
+                _ = flattened.sum().item()
+
     def _build_model_optimizer_dance_dis(self) -> None:
         from accelerate.utils import set_seed
         from diffusers.optimization import get_scheduler
@@ -1245,7 +1269,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         rollout_stage_mean_s = {
             key: value / max(1, rollout_num_samples) for key, value in rollout_stage_total_s.items()
         }
-        return DataProto.from_dict(
+        data_proto = DataProto.from_dict(
             tensors=samples,
             meta_info={
                 "sigma_schedule": sigma_schedule.detach().cpu().numpy(),
@@ -1254,6 +1278,8 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 "rollout_stage_mean_s": rollout_stage_mean_s,
             },
         ).to("cpu")
+        self._materialize_batch_after_transfer(data_proto)
+        return data_proto
 
     def _update_actor_dance(self, data: DataProto) -> DataProto:
         device = torch.device(get_device_name(), get_device_id())
