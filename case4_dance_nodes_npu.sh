@@ -5,7 +5,20 @@ set -x
 export PYTHONUNBUFFERED=1
 export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
-export VERL_SOCKET_IFACE_PREFIX=192.168.0.
+export VERL_SOCKET_IFACE_PREFIX=${VERL_SOCKET_IFACE_PREFIX:-192.168.0.}
+
+if [ -n "${HCCL_SOCKET_IFNAME:-}" ]; then
+  export HCCL_SOCKET_IFNAME
+fi
+if [ -n "${HCCL_IF_IP:-}" ]; then
+  export HCCL_IF_IP
+fi
+if [ -n "${HCCL_SOCKET_FAMILY:-}" ]; then
+  export HCCL_SOCKET_FAMILY
+fi
+if [ -n "${HCCL_IF_BASE_PORT:-}" ]; then
+  export HCCL_IF_BASE_PORT
+fi
 
 RAY_ADDRESS=http://192.168.0.85:8265
 RAY_HEAD_HOST=192.168.0.85

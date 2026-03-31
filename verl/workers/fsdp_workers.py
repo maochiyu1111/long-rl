@@ -100,33 +100,80 @@ def _pick_iface_by_subnet(prefix: str = "192.168.0.") -> str | None:
     return None
 
 
+def _pick_iface_and_ip_by_subnet(prefix: str = "192.168.0.") -> tuple[str | None, str | None]:
+    import socket
+
+    for name, addrs in psutil.net_if_addrs().items():
+        for a in addrs:
+            if a.family == socket.AF_INET and a.address.startswith(prefix):
+                return name, a.address
+    return None, None
+
+
+def _pick_ipv4_by_iface(iface: str) -> str | None:
+    import socket
+
+    for a in psutil.net_if_addrs().get(iface, []):
+        if a.family == socket.AF_INET:
+            return a.address
+    return None
+
+
 def _setup_nic_env(prefix: str | None = None) -> None:
     # Respect explicit user settings first. If only one backend is specified,
     # mirror it to the other so Gloo/NCCL stay on the same NIC.
     nccl_iface = os.environ.get("NCCL_SOCKET_IFNAME")
     gloo_iface = os.environ.get("GLOO_SOCKET_IFNAME")
-    if nccl_iface or gloo_iface:
-        if nccl_iface and not gloo_iface:
-            os.environ["GLOO_SOCKET_IFNAME"] = nccl_iface
-        elif gloo_iface and not nccl_iface:
-            os.environ["NCCL_SOCKET_IFNAME"] = gloo_iface
+    hccl_iface = os.environ.get("HCCL_SOCKET_IFNAME")
+    hccl_if_ip = os.environ.get("HCCL_IF_IP")
+
+    if nccl_iface and not gloo_iface:
+        os.environ["GLOO_SOCKET_IFNAME"] = nccl_iface
+    elif gloo_iface and not nccl_iface:
+        os.environ["NCCL_SOCKET_IFNAME"] = gloo_iface
+
+    prefix = prefix or os.environ.get("VERL_SOCKET_IFACE_PREFIX", "192.168.0.")
+    iface, iface_ip = _pick_iface_and_ip_by_subnet(prefix)
+
+    if hccl_iface and not hccl_if_ip:
+        hccl_if_ip = _pick_ipv4_by_iface(hccl_iface)
+        if hccl_if_ip:
+            os.environ["HCCL_IF_IP"] = hccl_if_ip
+
+    if iface is not None:
+        if not os.environ.get("NCCL_SOCKET_IFNAME"):
+            os.environ["NCCL_SOCKET_IFNAME"] = iface
+        if not os.environ.get("GLOO_SOCKET_IFNAME"):
+            os.environ["GLOO_SOCKET_IFNAME"] = iface
+        if not os.environ.get("HCCL_SOCKET_IFNAME"):
+            os.environ["HCCL_SOCKET_IFNAME"] = iface
+        if iface_ip and not os.environ.get("HCCL_IF_IP"):
+            os.environ["HCCL_IF_IP"] = iface_ip
+        os.environ.setdefault("HCCL_SOCKET_FAMILY", "AF_INET")
         logger.debug(
-            "[net] keep preconfigured NCCL/GLOO iface, NCCL=%s GLOO=%s",
+            "[net] selected iface=%s ip=%s NCCL=%s GLOO=%s HCCL_IFACE=%s HCCL_IF_IP=%s",
+            iface,
+            iface_ip,
             os.environ.get("NCCL_SOCKET_IFNAME"),
             os.environ.get("GLOO_SOCKET_IFNAME"),
+            os.environ.get("HCCL_SOCKET_IFNAME"),
+            os.environ.get("HCCL_IF_IP"),
         )
         return
 
-    prefix = prefix or os.environ.get("VERL_SOCKET_IFACE_PREFIX", "192.168.0.")
-    iface = _pick_iface_by_subnet(prefix)
     if iface is None:
-        os.environ["NCCL_SOCKET_IFNAME"] = "^lo,docker0,flannel,cni0,veth"
-        os.environ["GLOO_SOCKET_IFNAME"] = os.environ["NCCL_SOCKET_IFNAME"]
-        logger.debug("[net] no iface with %s; use exclude list for NCCL/GLOO", prefix)
-    else:
-        os.environ["NCCL_SOCKET_IFNAME"] = iface
-        os.environ["GLOO_SOCKET_IFNAME"] = iface
-        logger.debug("[net] use iface %s for NCCL/GLOO", iface)
+        if not os.environ.get("NCCL_SOCKET_IFNAME"):
+            os.environ["NCCL_SOCKET_IFNAME"] = "^lo,docker0,flannel,cni0,veth"
+        if not os.environ.get("GLOO_SOCKET_IFNAME"):
+            os.environ["GLOO_SOCKET_IFNAME"] = os.environ["NCCL_SOCKET_IFNAME"]
+        logger.debug(
+            "[net] no iface with prefix=%s; NCCL=%s GLOO=%s HCCL_IFACE=%s HCCL_IF_IP=%s",
+            prefix,
+            os.environ.get("NCCL_SOCKET_IFNAME"),
+            os.environ.get("GLOO_SOCKET_IFNAME"),
+            os.environ.get("HCCL_SOCKET_IFNAME"),
+            os.environ.get("HCCL_IF_IP"),
+        )
 
 
 def _bcast_cuda_chunks_into_(flat_tensor: torch.Tensor, *, src_group_rank: int, group, chunk_mb: int = 256) -> None:
@@ -457,26 +504,35 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         os.environ["WORLD_SIZE"] = str(world_size)
         os.environ["LOCAL_RANK"] = str(local_rank)
 
-        os.environ["NCCL_DEBUG"] = os.environ.get("NCCL_DEBUG", "INFO")
-        os.environ["NCCL_IB_DISABLE"] = "1"  # 强制禁用 RDMA
-        os.environ["NCCL_NET"] = "Socket"  # 强制走 TCP
-        os.environ["NCCL_COLLNET_ENABLE"] = "0"  # 关 SHARP/CollNet 等 IB 相关
-        os.environ["NCCL_SHARP_DISABLE"] = "1"
-        visible_gpu_count = torch.cuda.device_count()
+        if get_device_name() == "cuda":
+            os.environ["NCCL_DEBUG"] = os.environ.get("NCCL_DEBUG", "INFO")
+            os.environ["NCCL_IB_DISABLE"] = "1"  # 强制禁用 RDMA
+            os.environ["NCCL_NET"] = "Socket"  # 强制走 TCP
+            os.environ["NCCL_COLLNET_ENABLE"] = "0"  # 关 SHARP/CollNet 等 IB 相关
+            os.environ["NCCL_SHARP_DISABLE"] = "1"
+
+        torch_device = get_torch_device()
+        visible_device_count = torch_device.device_count()
         target_device = 0
-        if visible_gpu_count > 1:
-            target_device = int(local_rank) % visible_gpu_count
-        torch.cuda.set_device(target_device)
+        if visible_device_count > 1:
+            target_device = int(local_rank) % visible_device_count
+        torch_device.set_device(target_device)
         logger.debug(
-            "[setup_dist] global_rank=%s local_rank=%s visible_gpu_count=%s cuda_visible_devices=%s target_device=%s",
+            "[setup_dist] global_rank=%s local_rank=%s device=%s visible_device_count=%s visible_devices=%s "
+            "target_device=%s master=%s:%s HCCL_IFACE=%s HCCL_IF_IP=%s",
             rank,
             local_rank,
-            visible_gpu_count,
-            os.environ.get("CUDA_VISIBLE_DEVICES", "unset"),
+            get_device_name(),
+            visible_device_count,
+            os.environ.get("CUDA_VISIBLE_DEVICES", os.environ.get("ASCEND_RT_VISIBLE_DEVICES", "unset")),
             target_device,
+            os.environ.get("MASTER_ADDR"),
+            os.environ.get("MASTER_PORT"),
+            os.environ.get("HCCL_SOCKET_IFNAME", "unset"),
+            os.environ.get("HCCL_IF_IP", "unset"),
         )
         if not dist.is_initialized():
-            dist.init_process_group(backend="nccl", init_method="env://", timeout=_get_dist_timeout())
+            dist.init_process_group(backend=get_nccl_backend(), init_method="env://", timeout=_get_dist_timeout())
 
         # 验证：这里打印的一定是全局 rank
         self.global_rank = rank
