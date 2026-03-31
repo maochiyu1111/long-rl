@@ -90,7 +90,7 @@ def _get_dist_timeout() -> timedelta:
         timeout_s = 60
     return timedelta(seconds=timeout_s)
 
-def _pick_iface_by_subnet(prefix: str = "192.158.0.") -> str | None:
+def _pick_iface_by_subnet(prefix: str = "192.168.0.") -> str | None:
     import socket
 
     for name, addrs in psutil.net_if_addrs().items():
@@ -117,7 +117,7 @@ def _setup_nic_env(prefix: str | None = None) -> None:
         )
         return
 
-    prefix = prefix or os.environ.get("VERL_SOCKET_IFACE_PREFIX", "192.158.0.")
+    prefix = prefix or os.environ.get("VERL_SOCKET_IFACE_PREFIX", "192.168.0.")
     iface = _pick_iface_by_subnet(prefix)
     if iface is None:
         os.environ["NCCL_SOCKET_IFNAME"] = "^lo,docker0,flannel,cni0,veth"
