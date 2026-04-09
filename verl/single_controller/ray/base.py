@@ -32,6 +32,16 @@ from verl.utils.py_functional import temp_env_var
 __all__ = ["Worker"]
 
 
+_RAY_WORKER_ENV_PASSTHROUGH = (
+    "GLOO_SOCKET_IFNAME",
+    "HCCL_SOCKET_IFNAME",
+    "HCCL_SOCKET_FAMILY",
+    "HCCL_IF_BASE_PORT",
+    "NCCL_SOCKET_IFNAME",
+    "VERL_SOCKET_IFACE_PREFIX",
+)
+
+
 def get_random_string(length: int) -> str:
     import random
     import string
@@ -378,6 +388,10 @@ class RayWorkerGroup(WorkerGroup):
                     "RAY_LOCAL_WORLD_SIZE": str(local_world_size),
                     "RAY_LOCAL_RANK": str(local_rank),
                 }
+                for key in _RAY_WORKER_ENV_PASSTHROUGH:
+                    value = os.environ.get(key)
+                    if value is not None:
+                        env_vars[key] = value
                 if rank != 0:
                     env_vars["MASTER_ADDR"] = self._master_addr
                     env_vars["MASTER_PORT"] = self._master_port

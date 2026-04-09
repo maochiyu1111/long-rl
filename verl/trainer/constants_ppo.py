@@ -24,6 +24,15 @@ PPO_RAY_RUNTIME_ENV = {
     },
 }
 
+_PPO_RAY_ENV_PASSTHROUGH = (
+    "GLOO_SOCKET_IFNAME",
+    "HCCL_SOCKET_IFNAME",
+    "HCCL_SOCKET_FAMILY",
+    "HCCL_IF_BASE_PORT",
+    "NCCL_SOCKET_IFNAME",
+    "VERL_SOCKET_IFACE_PREFIX",
+)
+
 
 def get_ppo_ray_runtime_env():
     """
@@ -31,7 +40,13 @@ def get_ppo_ray_runtime_env():
     To avoid repeat of some environment variables that are already set.
     """
     runtime_env = {"env_vars": PPO_RAY_RUNTIME_ENV["env_vars"].copy()}
+    for key in _PPO_RAY_ENV_PASSTHROUGH:
+        value = os.environ.get(key)
+        if value is not None:
+            runtime_env["env_vars"][key] = value
     for key in list(runtime_env["env_vars"].keys()):
+        if key in _PPO_RAY_ENV_PASSTHROUGH:
+            continue
         if os.environ.get(key) is not None:
             runtime_env["env_vars"].pop(key, None)
     return runtime_env
