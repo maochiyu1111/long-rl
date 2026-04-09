@@ -844,6 +844,28 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     def _is_dance_case3_enabled(self) -> bool:
         return bool(self.config.actor.get("dance_case3_mode", False))
 
+    def _is_dance_case2_enabled(self) -> bool:
+        return bool(self.config.actor.get("dance_case2_mode", False))
+
+    def _dance_case2_mismatch_reasons(self) -> list[str]:
+        reasons: list[str] = []
+        if not self.diffusion:
+            reasons.append("trainer.diffusion must be true")
+        if not self.disaggregate:
+            reasons.append("trainer.disaggregate must be true")
+
+        trainer_pipelined = OmegaConf.select(self.config, "trainer.pipelined_micro_batch")
+        if trainer_pipelined is not None and bool(trainer_pipelined):
+            reasons.append("trainer.pipelined_micro_batch must be false")
+
+        adv_estimator = OmegaConf.select(self.config, "algorithm.adv_estimator")
+        if adv_estimator is not None and str(adv_estimator).lower() != "grpo":
+            reasons.append("algorithm.adv_estimator must be grpo")
+        return reasons
+
+    def _is_dance_case2_mode(self) -> bool:
+        return self._is_dance_case2_enabled() and len(self._dance_case2_mismatch_reasons()) == 0
+
     def _dance_case3_mismatch_reasons(self) -> list[str]:
         reasons: list[str] = []
         if not self.diffusion:
@@ -946,21 +968,27 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             self.config.model.get("enable_gradient_checkpointing", False)
             or actor_extra.get("gradient_checkpointing", False)
         )
+        dance_case2_mode = self._is_dance_case2_mode()
+
+        def _build_videoalign_inferencer():
+            use_videoalign = bool(_cfg_get(dance_cfg, "use_videoalign", False))
+            if not use_videoalign:
+                return None
+
+            from fastvideo.models.videoalign.inference import VideoVLMRewardInference
+
+            ckpt_path = _cfg_get(dance_cfg, "videoalign_ckpt_path", "/share/models/dancegrpo/videoalign_ckpt")
+            base_model_name_or_path = _cfg_get(dance_cfg, "videoalign_base_model_name_or_path", None)
+            return VideoVLMRewardInference(
+                load_from_pretrained=ckpt_path,
+                device=torch.device(get_device_name(), get_device_id()),
+                dtype=torch.bfloat16,
+                base_model_name_or_path=base_model_name_or_path,
+            )
 
         self.inferencer = None
         if self.role == "rollout_ref":
-            use_videoalign = bool(_cfg_get(dance_cfg, "use_videoalign", False))
-            if use_videoalign:
-                from fastvideo.models.videoalign.inference import VideoVLMRewardInference
-
-                ckpt_path = _cfg_get(dance_cfg, "videoalign_ckpt_path", "/share/models/dancegrpo/videoalign_ckpt")
-                base_model_name_or_path = _cfg_get(dance_cfg, "videoalign_base_model_name_or_path", None)
-                self.inferencer = VideoVLMRewardInference(
-                    load_from_pretrained=ckpt_path,
-                    device=torch.device(get_device_name(), get_device_id()),
-                    dtype=torch.bfloat16,
-                    base_model_name_or_path=base_model_name_or_path,
-                )
+            self.inferencer = _build_videoalign_inferencer()
 
             self.rollout = load_transformer(
                 model_type=model_type,
@@ -976,7 +1004,9 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             return
 
         if self.role != "actor":
-            raise ValueError(f"dance_case3_mode only supports role='actor' or role='rollout_ref', got {self.role}")
+            raise ValueError(
+                f"dance_case2_mode/dance_case3_mode only supports role='actor' or role='rollout_ref', got {self.role}"
+            )
 
         transformer = load_transformer(
             model_type=model_type,
@@ -1016,6 +1046,12 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             power=float(self.config.actor.optim.get("power", 1.0)),
             last_epoch=-1,
         )
+
+        if dance_case2_mode:
+            self.inferencer = _build_videoalign_inferencer()
+            vae_model_path = _cfg_get(dance_cfg, "vae_model_path", pretrained_model_name_or_path)
+            self.vae, _, fps = load_vae(model_type, vae_model_path)
+            self.rollout_fps = int(_cfg_get(self.config.rollout, "fps", fps))
 
     def _build_model_optimizer_dance(self) -> None:
         from accelerate.utils import set_seed
@@ -1117,15 +1153,16 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         dance_cfg = actor_extra.get("dance", {}) if hasattr(actor_extra, "get") else {}
         use_videoalign = bool(dance_cfg.get("use_videoalign", False))
         device = torch.device(get_device_name(), get_device_id())
-        rollout_model = self.rollout if self._is_dance_case3_mode() else self.transformer
+        rollout_model = self.rollout if self.role == "rollout_ref" else self.transformer
         if rollout_model is None:
             raise RuntimeError("dance rollout model is not initialized")
 
         encoder_hidden_states = prompts.batch["encoder_hidden_states"].to(device)
         encoder_attention_mask = prompts.batch["encoder_attention_mask"].to(device)
         caption = prompts.meta_info.get("caption")
+        use_seed = bool(prompts.meta_info.get("use_seed", False))
 
-        if self.config.rollout.get("use_group", False):
+        if self.config.rollout.get("use_group", False) and not use_seed:
             encoder_hidden_states = torch.repeat_interleave(
                 encoder_hidden_states, self.config.rollout.num_generations, dim=0
             )
@@ -1408,23 +1445,29 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             return log_prob
 
         num_generations = int(self.config.rollout.num_generations)
-        n_groups = len(samples["vq_rewards"]) // max(1, num_generations)
-        vq_advantages = torch.zeros_like(samples["vq_rewards"])
-        mq_advantages = torch.zeros_like(samples["mq_rewards"])
-        for i in range(n_groups):
-            start_idx = i * num_generations
-            end_idx = (i + 1) * num_generations
-            group_vq = samples["vq_rewards"][start_idx:end_idx]
-            vq_advantages[start_idx:end_idx] = (group_vq - group_vq.mean()) / (group_vq.std() + 1e-8)
-            group_mq = samples["mq_rewards"][start_idx:end_idx]
-            mq_advantages[start_idx:end_idx] = (group_mq - group_mq.mean()) / (group_mq.std() + 1e-8)
-        samples["vq_advantages"] = vq_advantages
-        samples["mq_advantages"] = mq_advantages
+        if bool(data.meta_info.get("use_precomputed_advantages", False)):
+            if "vq_advantages" not in samples or "mq_advantages" not in samples:
+                raise ValueError("dance update expected precomputed vq_advantages/mq_advantages")
+            vq_advantages = samples["vq_advantages"]
+            mq_advantages = samples["mq_advantages"]
+        else:
+            n_groups = len(samples["vq_rewards"]) // max(1, num_generations)
+            vq_advantages = torch.zeros_like(samples["vq_rewards"])
+            mq_advantages = torch.zeros_like(samples["mq_rewards"])
+            for i in range(n_groups):
+                start_idx = i * num_generations
+                end_idx = (i + 1) * num_generations
+                group_vq = samples["vq_rewards"][start_idx:end_idx]
+                vq_advantages[start_idx:end_idx] = (group_vq - group_vq.mean()) / (group_vq.std() + 1e-8)
+                group_mq = samples["mq_rewards"][start_idx:end_idx]
+                mq_advantages[start_idx:end_idx] = (group_mq - group_mq.mean()) / (group_mq.std() + 1e-8)
+            samples["vq_advantages"] = vq_advantages
+            samples["mq_advantages"] = mq_advantages
 
         total_scores = self.config.rollout.vq_coef * vq_advantages + self.config.rollout.mq_coef * mq_advantages
         batch_size = int(samples["timesteps"].shape[0])
         bestofn = int(self.config.rollout.bestofn)
-        if num_generations != bestofn and bestofn > 0 and bestofn <= batch_size:
+        if (not bool(data.meta_info.get("skip_bestofn", False))) and num_generations != bestofn and bestofn > 0 and bestofn <= batch_size:
             sorted_indices = torch.argsort(total_scores)
             top_indices = sorted_indices[-bestofn // 2 :]
             bottom_indices = sorted_indices[: bestofn // 2]
@@ -2067,6 +2110,14 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         # This is used to import external_lib into the huggingface systems
         import_external_libs(self.config.model.get("external_lib", None))
 
+        if self._is_dance_case2_enabled():
+            reasons = self._dance_case2_mismatch_reasons()
+            if reasons:
+                reason_text = "; ".join(reasons)
+                raise ValueError(f"[dance_case2] dance_case2_mode=true but case2 conditions are not met: {reason_text}")
+            self._build_model_optimizer_dance_dis()
+            return
+
         if self._is_dance_case3_enabled():
             reasons = self._dance_case3_mismatch_reasons()
             if reasons:
@@ -2207,6 +2258,14 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         # Support all hardwares
         data = data.to(get_device_id())
 
+        if self._is_dance_case2_enabled() and not self._is_dance_case2_mode():
+            reasons = "; ".join(self._dance_case2_mismatch_reasons())
+            raise ValueError(f"[dance_case2] worker update_actor rejected due to case2 condition mismatch: {reasons}")
+        if self._is_dance_case2_mode():
+            if self.role != "actor":
+                raise ValueError(f"[dance_case2] update_actor is only valid on role='actor', got {self.role}")
+            return self._update_actor_dance(data)
+
         if self._is_dance_case3_enabled() and not self._is_dance_case3_mode():
             reasons = "; ".join(self._dance_case3_mismatch_reasons())
             raise ValueError(f"[dance_case3] worker update_actor rejected due to case3 condition mismatch: {reasons}")
@@ -2269,6 +2328,16 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         # Support all hardwares
         prompts = prompts.to(get_device_id())
 
+        if self._is_dance_case2_enabled() and not self._is_dance_case2_mode():
+            reasons = "; ".join(self._dance_case2_mismatch_reasons())
+            raise ValueError(f"[dance_case2] worker generate_sequences rejected due to case2 condition mismatch: {reasons}")
+        if self._is_dance_case2_mode():
+            if self.role not in {"actor", "rollout_ref"}:
+                raise ValueError(
+                    f"[dance_case2] generate_sequences is only valid on role='actor' or role='rollout_ref', got {self.role}"
+                )
+            return self._generate_sequences_dance(prompts)
+
         if self._is_dance_case3_enabled() and not self._is_dance_case3_mode():
             reasons = "; ".join(self._dance_case3_mismatch_reasons())
             raise ValueError(f"[dance_case3] worker generate_sequences rejected due to case3 condition mismatch: {reasons}")
@@ -2323,6 +2392,30 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         # clear kv cache
         get_torch_device().empty_cache()
         return output
+
+    @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO, blocking=False)
+    def generate_sequences_dance_async(self, prompts: DataProto):
+        prompts = prompts.to(get_device_id())
+
+        if not self._is_dance_case2_mode():
+            reasons = "; ".join(self._dance_case2_mismatch_reasons())
+            raise ValueError(f"[dance_case2] async generate_sequences rejected due to case2 condition mismatch: {reasons}")
+        if self.role not in {"actor", "rollout_ref"}:
+            raise ValueError(
+                f"[dance_case2] async generate_sequences is only valid on role='actor' or role='rollout_ref', got {self.role}"
+            )
+        return self._generate_sequences_dance(prompts)
+
+    @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO, blocking=False)
+    def update_actor_dance_async(self, data: DataProto):
+        data = data.to(get_device_id())
+
+        if not self._is_dance_case2_mode():
+            reasons = "; ".join(self._dance_case2_mismatch_reasons())
+            raise ValueError(f"[dance_case2] async update_actor rejected due to case2 condition mismatch: {reasons}")
+        if self.role != "actor":
+            raise ValueError(f"[dance_case2] async update_actor is only valid on role='actor', got {self.role}")
+        return self._update_actor_dance(data)
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     #@DistProfiler.annotate(color="blue", role="actor_compute_log_prob")

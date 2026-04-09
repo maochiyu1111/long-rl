@@ -621,6 +621,17 @@ class RayPPOTrainer:
 
     def fit_dis(self):
         """Disaggregate training entry (diffusion path)."""
+        if self._is_dance_case2_enabled():
+            reasons = self._dance_case2_mismatch_reasons()
+            if reasons:
+                reason_text = "; ".join(reasons)
+                raise ValueError(
+                    f"dance_case2_mode=true but Case2 conditions are not met ({reason_text}). "
+                    "Expected: diffusion=true, disaggregate=true, pipelined_micro_batch=false, adv_estimator=grpo."
+                )
+            self.init_workers_dis()
+            return self.fit_dance_dual_rollout_dis_async(schedule="plain_async")
+
         if self._is_dance_case3_enabled():
             reasons = self._dance_case3_mismatch_reasons()
             if reasons:
@@ -919,7 +930,7 @@ class RayPPOTrainer:
         if hasattr(actor_cfg_raw, "keys") and "disco" in actor_cfg_raw.keys():
             raise ValueError(
                 "actor_rollout_ref.actor.disco is obsolete and unsupported. "
-                "Remove this key; Dance Case4 no longer uses it."
+                "Remove this key; migrated Dance cases now use dance_case2_mode/dance_case3_mode/dance_case4_mode."
             )
 
         # number of GPUs total
@@ -1138,6 +1149,9 @@ class RayPPOTrainer:
     def _create_dance_case3_dataloader(self) -> None:
         self._create_dance_latent_dataloader("dance_case3_mode")
 
+    def _create_dance_case2_dataloader(self) -> None:
+        self._create_dance_latent_dataloader("dance_case2_mode")
+
     def _create_dance_case4_dataloader(self) -> None:
         self._create_dance_latent_dataloader("dance_case4_mode")
 
@@ -1145,6 +1159,9 @@ class RayPPOTrainer:
         """
         Creates the train and validation dataloaders.
         """
+        if self._is_dance_case2_enabled():
+            self._create_dance_case2_dataloader()
+            return
         if self._is_dance_case3_enabled():
             self._create_dance_case3_dataloader()
             return
@@ -2564,6 +2581,41 @@ class RayPPOTrainer:
     def _is_dance_case3_enabled(self) -> bool:
         return bool(self.config.actor_rollout_ref.actor.get("dance_case3_mode", False))
 
+    def _is_dance_case2_enabled(self) -> bool:
+        return bool(self.config.actor_rollout_ref.actor.get("dance_case2_mode", False))
+
+    def _dance_dual_rollout_mismatch_reasons(
+        self, mode_name: str, *, expect_pipelined_micro_batch: bool = False
+    ) -> list[str]:
+        reasons: list[str] = []
+        if not self.diffusion:
+            reasons.append("trainer.diffusion must be true")
+        if not self.diffusion_disaggregate:
+            reasons.append("trainer.disaggregate must be true")
+
+        pipelined_micro_batch = bool(self.config.trainer.get("pipelined_micro_batch", False))
+        if pipelined_micro_batch != expect_pipelined_micro_batch:
+            reasons.append(f"trainer.pipelined_micro_batch must be {str(expect_pipelined_micro_batch).lower()}")
+
+        adv_estimator = str(self.config.algorithm.adv_estimator).lower()
+        if adv_estimator not in {"grpo", "advantageestimator.grpo"}:
+            reasons.append("algorithm.adv_estimator must be grpo")
+        return reasons
+
+    def _is_dance_dual_rollout_mode(self, mode_name: str, *, expect_pipelined_micro_batch: bool = False) -> bool:
+        actor_cfg = self.config.actor_rollout_ref.actor
+        return bool(actor_cfg.get(mode_name, False)) and len(
+            self._dance_dual_rollout_mismatch_reasons(
+                mode_name, expect_pipelined_micro_batch=expect_pipelined_micro_batch
+            )
+        ) == 0
+
+    def _dance_case2_mismatch_reasons(self) -> list[str]:
+        return self._dance_dual_rollout_mismatch_reasons("dance_case2_mode", expect_pipelined_micro_batch=False)
+
+    def _is_dance_case2_mode(self) -> bool:
+        return self._is_dance_dual_rollout_mode("dance_case2_mode", expect_pipelined_micro_batch=False)
+
     def _dance_case3_mismatch_reasons(self) -> list[str]:
         reasons: list[str] = []
         if not self.diffusion:
@@ -2600,6 +2652,210 @@ class RayPPOTrainer:
 
     def _is_dance_case4_mode(self) -> bool:
         return self._is_dance_case4_enabled() and len(self._dance_case4_mismatch_reasons()) == 0
+
+    def _make_dance_dual_rollout_prompt_batches(self, schedule: str) -> list[DataProto]:
+        if schedule != "plain_async":
+            raise ValueError(f"Unsupported dance dual-rollout schedule: {schedule}")
+
+        if not hasattr(self, "_dance_case2_data_iterator") or self._dance_case2_data_iterator is None:
+            self._dance_case2_data_iterator = iter(self.train_dataloader)
+            self._dance_case2_fit_epoch = 0
+
+        try:
+            batch = next(self._dance_case2_data_iterator)
+        except StopIteration:
+            self._dance_case2_data_iterator = iter(self.train_dataloader)
+            self._dance_case2_fit_epoch += 1
+            batch = next(self._dance_case2_data_iterator)
+
+        if not isinstance(batch, (list, tuple)) or len(batch) != 3:
+            raise ValueError(
+                "dance_case2_mode requires dataloader to return "
+                "(encoder_hidden_states, encoder_attention_mask, caption)"
+            )
+
+        encoder_hidden_states, encoder_attention_mask, caption = batch
+        prompt_batches: list[DataProto] = []
+        batch_size = int(encoder_hidden_states.shape[0])
+        num_generations = int(self.config.actor_rollout_ref.rollout.num_generations)
+        actor_world_size = max(1, int(getattr(self.actor_wg, "world_size", 1)))
+        rollout_world_size = max(1, int(getattr(self.rollout_ref_wg, "world_size", 1)))
+        target_world_size = max(actor_world_size, rollout_world_size)
+
+        if num_generations > 0 and num_generations % target_world_size == 0:
+            device = encoder_hidden_states.device
+            for i in range(batch_size):
+                prompt_batches.append(
+                    DataProto.from_single_dict(
+                        {
+                            "encoder_hidden_states": encoder_hidden_states[i : i + 1].repeat(num_generations, 1, 1),
+                            "encoder_attention_mask": encoder_attention_mask[i : i + 1].repeat(num_generations, 1),
+                            "seed": torch.arange(42, 42 + num_generations, device=device, dtype=torch.long),
+                        },
+                        meta_info={
+                            "caption": [caption[i]] * num_generations,
+                            "use_seed": True,
+                            "global_step": self.global_steps,
+                        },
+                    )
+                )
+            return prompt_batches
+
+        if batch_size % target_world_size != 0:
+            raise ValueError(
+                "dance_case2_mode could not divide latent batch for async rollout: "
+                f"batch_size={batch_size}, target_world_size={target_world_size}, num_generations={num_generations}"
+            )
+
+        for start in range(0, batch_size, target_world_size):
+            end = start + target_world_size
+            prompt_batches.append(
+                DataProto.from_single_dict(
+                    {
+                        "encoder_hidden_states": encoder_hidden_states[start:end],
+                        "encoder_attention_mask": encoder_attention_mask[start:end],
+                    },
+                    meta_info={
+                        "caption": list(caption[start:end]),
+                        "use_seed": False,
+                        "global_step": self.global_steps,
+                    },
+                )
+            )
+
+        return prompt_batches
+
+    def _prepare_dance_case2_rollout_batch(self, samples: DataProto) -> DataProto:
+        samples = samples.to("cpu")
+        if "vq_rewards" not in samples.batch.keys() or "mq_rewards" not in samples.batch.keys():
+            raise ValueError("dance_case2 rollout batch must contain vq_rewards and mq_rewards")
+
+        num_generations = int(self.config.actor_rollout_ref.rollout.num_generations)
+        batch_size = len(samples)
+        vq_advantages = torch.zeros_like(samples.batch["vq_rewards"])
+        mq_advantages = torch.zeros_like(samples.batch["mq_rewards"])
+
+        if num_generations > 0 and batch_size % num_generations == 0:
+            n_groups = batch_size // num_generations
+            for i in range(n_groups):
+                start_idx = i * num_generations
+                end_idx = (i + 1) * num_generations
+                group_vq = samples.batch["vq_rewards"][start_idx:end_idx]
+                group_mq = samples.batch["mq_rewards"][start_idx:end_idx]
+                vq_advantages[start_idx:end_idx] = (group_vq - group_vq.mean()) / (group_vq.std() + 1e-8)
+                mq_advantages[start_idx:end_idx] = (group_mq - group_mq.mean()) / (group_mq.std() + 1e-8)
+        else:
+            vq_advantages = (samples.batch["vq_rewards"] - samples.batch["vq_rewards"].mean()) / (
+                samples.batch["vq_rewards"].std() + 1e-8
+            )
+            mq_advantages = (samples.batch["mq_rewards"] - samples.batch["mq_rewards"].mean()) / (
+                samples.batch["mq_rewards"].std() + 1e-8
+            )
+
+        samples.batch["vq_advantages"] = vq_advantages
+        samples.batch["mq_advantages"] = mq_advantages
+
+        bestofn = int(self.config.actor_rollout_ref.rollout.bestofn)
+        if bestofn > 0 and bestofn < batch_size:
+            total_scores = (
+                float(self.config.actor_rollout_ref.rollout.vq_coef) * vq_advantages
+                + float(self.config.actor_rollout_ref.rollout.mq_coef) * mq_advantages
+            )
+            sorted_indices = torch.argsort(total_scores)
+            if bestofn >= 2 and bestofn % 2 == 0:
+                top_indices = sorted_indices[-bestofn // 2 :]
+                bottom_indices = sorted_indices[: bestofn // 2]
+                selected_indices = torch.cat([top_indices, bottom_indices])
+            else:
+                selected_indices = sorted_indices[-bestofn:]
+            selected_indices = selected_indices[torch.randperm(len(selected_indices), device=selected_indices.device)]
+            samples = samples[selected_indices.cpu()]
+
+        samples.meta_info = dict(samples.meta_info)
+        samples.meta_info["use_precomputed_advantages"] = True
+        samples.meta_info["skip_bestofn"] = True
+        return samples
+
+    def fit_dance_dual_rollout_dis_async(self, schedule: str):
+        if schedule != "plain_async":
+            raise ValueError(f"Unsupported dance dual-rollout schedule: {schedule}")
+
+        max_train_steps = self.config.trainer.get("max_train_steps", None)
+        if max_train_steps is None:
+            max_train_steps = self.total_training_steps
+        max_train_steps = int(max_train_steps)
+        if max_train_steps <= 0:
+            raise ValueError(f"Invalid max_train_steps for dance case2: {max_train_steps}")
+
+        @ray.remote
+        def _materialize_data_proto(data_future):
+            return data_future.get()
+
+        self.global_steps = 0
+        self._dance_case2_data_iterator = iter(self.train_dataloader)
+        self._dance_case2_fit_epoch = 0
+        progress_bar = tqdm(total=max_train_steps, initial=self.global_steps, desc="Dance Case2")
+
+        while self.global_steps < max_train_steps:
+            prompt_batches = self._make_dance_dual_rollout_prompt_batches(schedule=schedule)
+            if not prompt_batches:
+                raise ValueError("dance_case2_mode produced no prompt batches")
+
+            actor_world_size = max(1, int(getattr(self.actor_wg, "world_size", 1)))
+            rollout_world_size = max(1, int(getattr(self.rollout_ref_wg, "world_size", 1)))
+            total_world_size = actor_world_size + rollout_world_size
+            actor_prompt_count = max(1, round(len(prompt_batches) * actor_world_size / total_world_size))
+            if len(prompt_batches) > 1:
+                actor_prompt_count = min(actor_prompt_count, len(prompt_batches) - 1)
+            actor_prompt_count = min(actor_prompt_count, len(prompt_batches))
+
+            rollout_refs: list[Any] = []
+            for idx, prompt_batch in enumerate(prompt_batches):
+                prompt_batch.meta_info["round"] = idx
+                if idx < actor_prompt_count:
+                    prompt_batch.meta_info["dispatch_role"] = "actor"
+                    future = self.actor_wg.generate_sequences_dance_async(prompt_batch)
+                else:
+                    prompt_batch.meta_info["dispatch_role"] = "rollout_ref"
+                    future = self.rollout_ref_wg.generate_sequences_dance_async(prompt_batch)
+                rollout_refs.append(_materialize_data_proto.remote(future))
+
+            pending = list(rollout_refs)
+            staged_batches: list[DataProto] = []
+            staged_batch_size = 0
+            update_futures = []
+            update_metrics: dict[str, Any] = {}
+            update_threshold = max(1, actor_world_size)
+
+            while pending:
+                done, pending = ray.wait(pending, num_returns=1)
+                samples = ray.get(done[0])
+                prepared = self._prepare_dance_case2_rollout_batch(samples)
+                staged_batches.append(prepared)
+                staged_batch_size += len(prepared)
+
+                if staged_batch_size >= update_threshold:
+                    update_futures.append(self.actor_wg.update_actor_dance_async(DataProto.concat(staged_batches)))
+                    staged_batches = []
+                    staged_batch_size = 0
+
+            if staged_batches:
+                update_futures.append(self.actor_wg.update_actor_dance_async(DataProto.concat(staged_batches)))
+
+            for update_future in update_futures:
+                update_output = update_future.get()
+                if update_output is not None:
+                    update_metrics.update(update_output.meta_info.get("metrics", {}))
+
+            self.global_steps += 1
+            if update_metrics:
+                progress_bar.set_postfix(
+                    {k: f"{v:.4f}" for k, v in update_metrics.items() if isinstance(v, (int, float))}
+                )
+            progress_bar.update(1)
+
+        progress_bar.close()
+        return None
 
     def fit_dance_case3_dis(self):
         max_train_steps = self.config.trainer.get("max_train_steps", None)

@@ -77,8 +77,14 @@ use_kl_loss: false
 # Enable hard-migrated DanceGRPO Case3 disaggregate path.
 dance_case3_mode: false
 
+# Enable hard-migrated DanceGRPO Case2 async dual-rollout path.
+dance_case2_mode: false
+
 # Enable hard-migrated DanceGRPO Case4 path.
 dance_case4_mode: false
+
+# Gradient accumulation steps for hard-migrated Dance diffusion updates.
+gradient_accumulation_steps: 1
 
 # Whether to use torch.compile()
 # oc.select: the default val for ref.use_torch_compile

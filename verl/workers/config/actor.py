@@ -86,8 +86,10 @@ class ActorConfig(BaseConfig):
         "ppo_micro_batch_size",
         "ppo_micro_batch_size_per_gpu",
         "diffusion",
+        "dance_case2_mode",
         "dance_case3_mode",
         "dance_case4_mode",
+        "gradient_accumulation_steps",
         "guidance_scale",
         "scheduler",
         "diffusion_scheduler",
@@ -118,8 +120,10 @@ class ActorConfig(BaseConfig):
     optim: OptimizerConfig = field(default_factory=OptimizerConfig)
     use_fused_kernels: bool = False
     diffusion: bool = False
+    dance_case2_mode: bool = False
     dance_case3_mode: bool = False
     dance_case4_mode: bool = False
+    gradient_accumulation_steps: int = 1
     guidance_scale: float = 5.0
     scheduler: Optional[str] = None
     diffusion_scheduler: Optional[str] = None
