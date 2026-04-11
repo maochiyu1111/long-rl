@@ -45,6 +45,11 @@ def _is_dance_case4_enabled(config) -> bool:
     return bool(actor_config.get("dance_case4_mode", False))
 
 
+def _is_dance_case1_enabled(config) -> bool:
+    actor_config = getattr(config.actor_rollout_ref, "actor", {})
+    return bool(actor_config.get("dance_case1_mode", False))
+
+
 def _is_dance_case2_enabled(config) -> bool:
     actor_config = getattr(config.actor_rollout_ref, "actor", {})
     return bool(actor_config.get("dance_case2_mode", False))
@@ -62,7 +67,12 @@ def _build_tokenizer_and_processor(config):
     tokenizer/processor initialization here only blocks the dedicated hard-fork
     path before trainer-side fail-fast checks can run.
     """
-    if _is_dance_case2_enabled(config) or _is_dance_case3_enabled(config) or _is_dance_case4_enabled(config):
+    if (
+        _is_dance_case1_enabled(config)
+        or _is_dance_case2_enabled(config)
+        or _is_dance_case3_enabled(config)
+        or _is_dance_case4_enabled(config)
+    ):
         return None, None
 
     from verl.utils import hf_processor, hf_tokenizer
@@ -311,10 +321,11 @@ class TaskRunner:
                 mapping[Role.EncoderRef] = ref_encoder_id
                 mapping[Role.LLMRef] = ref_llm_id
 
+        dance_case1_mode = _is_dance_case1_enabled(config)
         dance_case2_mode = _is_dance_case2_enabled(config)
         dance_case3_mode = _is_dance_case3_enabled(config)
         dance_case4_mode = _is_dance_case4_enabled(config)
-        if dance_case2_mode or dance_case3_mode or dance_case4_mode:
+        if dance_case1_mode or dance_case2_mode or dance_case3_mode or dance_case4_mode:
             reward_fn = None
             val_reward_fn = None
         else:
@@ -327,7 +338,7 @@ class TaskRunner:
             )
         resource_pool_manager = ResourcePoolManager(resource_pool_spec=resource_pool_spec, mapping=mapping)
 
-        if dance_case2_mode or dance_case3_mode or dance_case4_mode:
+        if dance_case1_mode or dance_case2_mode or dance_case3_mode or dance_case4_mode:
             collate_fn = None
             train_dataset = None
             val_dataset = None

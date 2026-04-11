@@ -621,6 +621,17 @@ class RayPPOTrainer:
 
     def fit_dis(self):
         """Disaggregate training entry (diffusion path)."""
+        if self._is_dance_case1_enabled():
+            reasons = self._dance_case1_mismatch_reasons()
+            if reasons:
+                reason_text = "; ".join(reasons)
+                raise ValueError(
+                    f"dance_case1_mode=true but Case1 conditions are not met ({reason_text}). "
+                    "Expected: diffusion=true, disaggregate=true, pipelined_micro_batch=true, adv_estimator=grpo."
+                )
+            self.init_workers_dis()
+            return self.fit_dance_dual_rollout_dis_async(schedule="pipelined_micro_batch")
+
         if self._is_dance_case2_enabled():
             reasons = self._dance_case2_mismatch_reasons()
             if reasons:
@@ -930,7 +941,8 @@ class RayPPOTrainer:
         if hasattr(actor_cfg_raw, "keys") and "disco" in actor_cfg_raw.keys():
             raise ValueError(
                 "actor_rollout_ref.actor.disco is obsolete and unsupported. "
-                "Remove this key; migrated Dance cases now use dance_case2_mode/dance_case3_mode/dance_case4_mode."
+                "Remove this key; migrated Dance cases now use dance_case1_mode/dance_case2_mode/"
+                "dance_case3_mode/dance_case4_mode."
             )
 
         # number of GPUs total
@@ -1149,6 +1161,9 @@ class RayPPOTrainer:
     def _create_dance_case3_dataloader(self) -> None:
         self._create_dance_latent_dataloader("dance_case3_mode")
 
+    def _create_dance_case1_dataloader(self) -> None:
+        self._create_dance_latent_dataloader("dance_case1_mode")
+
     def _create_dance_case2_dataloader(self) -> None:
         self._create_dance_latent_dataloader("dance_case2_mode")
 
@@ -1159,6 +1174,9 @@ class RayPPOTrainer:
         """
         Creates the train and validation dataloaders.
         """
+        if self._is_dance_case1_enabled():
+            self._create_dance_case1_dataloader()
+            return
         if self._is_dance_case2_enabled():
             self._create_dance_case2_dataloader()
             return
@@ -2581,6 +2599,9 @@ class RayPPOTrainer:
     def _is_dance_case3_enabled(self) -> bool:
         return bool(self.config.actor_rollout_ref.actor.get("dance_case3_mode", False))
 
+    def _is_dance_case1_enabled(self) -> bool:
+        return bool(self.config.actor_rollout_ref.actor.get("dance_case1_mode", False))
+
     def _is_dance_case2_enabled(self) -> bool:
         return bool(self.config.actor_rollout_ref.actor.get("dance_case2_mode", False))
 
@@ -2609,6 +2630,17 @@ class RayPPOTrainer:
                 mode_name, expect_pipelined_micro_batch=expect_pipelined_micro_batch
             )
         ) == 0
+
+    def _active_dance_dual_rollout_mode_name(self) -> str:
+        if self._is_dance_case1_enabled():
+            return "dance_case1_mode"
+        return "dance_case2_mode"
+
+    def _dance_case1_mismatch_reasons(self) -> list[str]:
+        return self._dance_dual_rollout_mismatch_reasons("dance_case1_mode", expect_pipelined_micro_batch=True)
+
+    def _is_dance_case1_mode(self) -> bool:
+        return self._is_dance_dual_rollout_mode("dance_case1_mode", expect_pipelined_micro_batch=True)
 
     def _dance_case2_mismatch_reasons(self) -> list[str]:
         return self._dance_dual_rollout_mismatch_reasons("dance_case2_mode", expect_pipelined_micro_batch=False)
@@ -2654,7 +2686,7 @@ class RayPPOTrainer:
         return self._is_dance_case4_enabled() and len(self._dance_case4_mismatch_reasons()) == 0
 
     def _make_dance_dual_rollout_prompt_batches(self, schedule: str) -> list[DataProto]:
-        if schedule != "plain_async":
+        if schedule not in {"plain_async", "pipelined_micro_batch"}:
             raise ValueError(f"Unsupported dance dual-rollout schedule: {schedule}")
 
         if not hasattr(self, "_dance_case2_data_iterator") or self._dance_case2_data_iterator is None:
@@ -2670,7 +2702,7 @@ class RayPPOTrainer:
 
         if not isinstance(batch, (list, tuple)) or len(batch) != 3:
             raise ValueError(
-                "dance_case2_mode requires dataloader to return "
+                f"{self._active_dance_dual_rollout_mode_name()} requires dataloader to return "
                 "(encoder_hidden_states, encoder_attention_mask, caption)"
             )
 
@@ -2685,45 +2717,79 @@ class RayPPOTrainer:
         if num_generations > 0 and num_generations % target_world_size == 0:
             device = encoder_hidden_states.device
             for i in range(batch_size):
-                prompt_batches.append(
-                    DataProto.from_single_dict(
-                        {
-                            "encoder_hidden_states": encoder_hidden_states[i : i + 1].repeat(num_generations, 1, 1),
-                            "encoder_attention_mask": encoder_attention_mask[i : i + 1].repeat(num_generations, 1),
-                            "seed": torch.arange(42, 42 + num_generations, device=device, dtype=torch.long),
-                        },
-                        meta_info={
-                            "caption": [caption[i]] * num_generations,
-                            "use_seed": True,
-                            "global_step": self.global_steps,
-                        },
-                    )
+                prompt_batch = DataProto.from_single_dict(
+                    {
+                        "encoder_hidden_states": encoder_hidden_states[i : i + 1].repeat(num_generations, 1, 1),
+                        "encoder_attention_mask": encoder_attention_mask[i : i + 1].repeat(num_generations, 1),
+                        "seed": torch.arange(42, 42 + num_generations, device=device, dtype=torch.long),
+                    },
+                    meta_info={
+                        "caption": [caption[i]] * num_generations,
+                        "use_seed": True,
+                        "global_step": self.global_steps,
+                    },
                 )
+                prompt_batches.append(prompt_batch)
+            if schedule == "pipelined_micro_batch":
+                for idx, prompt_batch in enumerate(prompt_batches):
+                    prompt_batch.meta_info["window_id"] = self.global_steps
+                    prompt_batch.meta_info["micro_batch_id"] = idx
+                    prompt_batch.meta_info["is_last_micro_batch"] = idx == len(prompt_batches) - 1
             return prompt_batches
 
         if batch_size % target_world_size != 0:
             raise ValueError(
-                "dance_case2_mode could not divide latent batch for async rollout: "
+                f"{self._active_dance_dual_rollout_mode_name()} could not divide latent batch for async rollout: "
                 f"batch_size={batch_size}, target_world_size={target_world_size}, num_generations={num_generations}"
             )
 
         for start in range(0, batch_size, target_world_size):
             end = start + target_world_size
-            prompt_batches.append(
-                DataProto.from_single_dict(
-                    {
-                        "encoder_hidden_states": encoder_hidden_states[start:end],
-                        "encoder_attention_mask": encoder_attention_mask[start:end],
-                    },
-                    meta_info={
-                        "caption": list(caption[start:end]),
-                        "use_seed": False,
-                        "global_step": self.global_steps,
-                    },
-                )
+            prompt_batch = DataProto.from_single_dict(
+                {
+                    "encoder_hidden_states": encoder_hidden_states[start:end],
+                    "encoder_attention_mask": encoder_attention_mask[start:end],
+                },
+                meta_info={
+                    "caption": list(caption[start:end]),
+                    "use_seed": False,
+                    "global_step": self.global_steps,
+                },
             )
+            prompt_batches.append(prompt_batch)
+
+        if schedule == "pipelined_micro_batch":
+            for idx, prompt_batch in enumerate(prompt_batches):
+                prompt_batch.meta_info["window_id"] = self.global_steps
+                prompt_batch.meta_info["micro_batch_id"] = idx
+                prompt_batch.meta_info["is_last_micro_batch"] = idx == len(prompt_batches) - 1
 
         return prompt_batches
+
+    def _get_dance_dual_rollout_actor_prompt_count(self, prompt_batches: list[DataProto], schedule: str) -> int:
+        if not prompt_batches:
+            return 0
+
+        if schedule == "pipelined_micro_batch":
+            configured = OmegaConf.select(
+                self.config, "actor_rollout_ref.actor.extra.dance.actor_prompt_batch_count"
+            )
+            actor_prompt_count = int(configured if configured is not None else 2)
+            if actor_prompt_count <= 0:
+                raise ValueError(
+                    "dance_case1_mode requires actor.extra.dance.actor_prompt_batch_count to be a positive integer"
+                )
+            if len(prompt_batches) > 1:
+                actor_prompt_count = min(actor_prompt_count, len(prompt_batches) - 1)
+            return min(actor_prompt_count, len(prompt_batches))
+
+        actor_world_size = max(1, int(getattr(self.actor_wg, "world_size", 1)))
+        rollout_world_size = max(1, int(getattr(self.rollout_ref_wg, "world_size", 1)))
+        total_world_size = actor_world_size + rollout_world_size
+        actor_prompt_count = max(1, round(len(prompt_batches) * actor_world_size / total_world_size))
+        if len(prompt_batches) > 1:
+            actor_prompt_count = min(actor_prompt_count, len(prompt_batches) - 1)
+        return min(actor_prompt_count, len(prompt_batches))
 
     def _prepare_dance_case2_rollout_batch(self, samples: DataProto) -> DataProto:
         samples = samples.to("cpu")
@@ -2777,7 +2843,7 @@ class RayPPOTrainer:
         return samples
 
     def fit_dance_dual_rollout_dis_async(self, schedule: str):
-        if schedule != "plain_async":
+        if schedule not in {"plain_async", "pipelined_micro_batch"}:
             raise ValueError(f"Unsupported dance dual-rollout schedule: {schedule}")
 
         max_train_steps = self.config.trainer.get("max_train_steps", None)
@@ -2794,20 +2860,16 @@ class RayPPOTrainer:
         self.global_steps = 0
         self._dance_case2_data_iterator = iter(self.train_dataloader)
         self._dance_case2_fit_epoch = 0
-        progress_bar = tqdm(total=max_train_steps, initial=self.global_steps, desc="Dance Case2")
+        progress_label = "Dance Case1" if schedule == "pipelined_micro_batch" else "Dance Case2"
+        progress_bar = tqdm(total=max_train_steps, initial=self.global_steps, desc=progress_label)
 
         while self.global_steps < max_train_steps:
             prompt_batches = self._make_dance_dual_rollout_prompt_batches(schedule=schedule)
             if not prompt_batches:
-                raise ValueError("dance_case2_mode produced no prompt batches")
+                raise ValueError(f"{self._active_dance_dual_rollout_mode_name()} produced no prompt batches")
 
             actor_world_size = max(1, int(getattr(self.actor_wg, "world_size", 1)))
-            rollout_world_size = max(1, int(getattr(self.rollout_ref_wg, "world_size", 1)))
-            total_world_size = actor_world_size + rollout_world_size
-            actor_prompt_count = max(1, round(len(prompt_batches) * actor_world_size / total_world_size))
-            if len(prompt_batches) > 1:
-                actor_prompt_count = min(actor_prompt_count, len(prompt_batches) - 1)
-            actor_prompt_count = min(actor_prompt_count, len(prompt_batches))
+            actor_prompt_count = self._get_dance_dual_rollout_actor_prompt_count(prompt_batches, schedule)
 
             rollout_refs: list[Any] = []
             for idx, prompt_batch in enumerate(prompt_batches):
@@ -2821,25 +2883,65 @@ class RayPPOTrainer:
                 rollout_refs.append(_materialize_data_proto.remote(future))
 
             pending = list(rollout_refs)
-            staged_batches: list[DataProto] = []
-            staged_batch_size = 0
             update_futures = []
             update_metrics: dict[str, Any] = {}
-            update_threshold = max(1, actor_world_size)
+            staged_batches: list[DataProto] = []
+            staged_batch_size = 0
+            pipelined_batches_wait: list[DataProto] = []
+            accumulation_count = 0
+            gradient_accumulation_steps = max(
+                1, int(self.config.actor_rollout_ref.actor.get("gradient_accumulation_steps", 1))
+            )
 
             while pending:
                 done, pending = ray.wait(pending, num_returns=1)
                 samples = ray.get(done[0])
                 prepared = self._prepare_dance_case2_rollout_batch(samples)
-                staged_batches.append(prepared)
-                staged_batch_size += len(prepared)
+                if schedule == "pipelined_micro_batch":
+                    prepared_batch_size = len(prepared)
+                    if prepared_batch_size <= 0:
+                        raise ValueError("dance_case1_mode received an empty rollout batch")
+                    if prepared_batch_size > actor_world_size:
+                        raise ValueError(
+                            "dance_case1_mode requires best-of-n selected batch size to be <= actor worker world size: "
+                            f"prepared_batch_size={prepared_batch_size}, actor_world_size={actor_world_size}"
+                        )
+                    if actor_world_size % prepared_batch_size != 0:
+                        raise ValueError(
+                            "dance_case1_mode requires actor worker world size to be divisible by prepared batch size: "
+                            f"prepared_batch_size={prepared_batch_size}, actor_world_size={actor_world_size}"
+                        )
 
-                if staged_batch_size >= update_threshold:
-                    update_futures.append(self.actor_wg.update_actor_dance_async(DataProto.concat(staged_batches)))
-                    staged_batches = []
-                    staged_batch_size = 0
+                    pipelined_batches_wait.append(prepared)
+                    required_batches = actor_world_size // prepared_batch_size
+                    if len(pipelined_batches_wait) == required_batches:
+                        accumulation_count += 1
+                        update_batch = DataProto.concat(pipelined_batches_wait)
+                        update_batch.meta_info = dict(update_batch.meta_info)
+                        update_batch.meta_info["step_weight"] = accumulation_count == gradient_accumulation_steps
+                        update_batch.meta_info["window_id"] = self.global_steps
+                        update_batch.meta_info["micro_batch_id"] = accumulation_count - 1
+                        update_batch.meta_info["is_last_micro_batch"] = accumulation_count == gradient_accumulation_steps
+                        update_futures.append(self.actor_wg.update_actor_dance_async(update_batch))
+                        pipelined_batches_wait = []
+                        if accumulation_count == gradient_accumulation_steps:
+                            accumulation_count = 0
+                else:
+                    staged_batches.append(prepared)
+                    staged_batch_size += len(prepared)
+                    update_threshold = max(1, actor_world_size)
+                    if staged_batch_size >= update_threshold:
+                        update_futures.append(self.actor_wg.update_actor_dance_async(DataProto.concat(staged_batches)))
+                        staged_batches = []
+                        staged_batch_size = 0
 
-            if staged_batches:
+            if schedule == "pipelined_micro_batch":
+                if pipelined_batches_wait:
+                    raise ValueError(
+                        "dance_case1_mode ended a step with an incomplete pipelined micro-batch; "
+                        "adjust bestofn/num_generations or actor world size."
+                    )
+            elif staged_batches:
                 update_futures.append(self.actor_wg.update_actor_dance_async(DataProto.concat(staged_batches)))
 
             for update_future in update_futures:

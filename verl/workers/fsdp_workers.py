@@ -844,8 +844,30 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     def _is_dance_case3_enabled(self) -> bool:
         return bool(self.config.actor.get("dance_case3_mode", False))
 
+    def _is_dance_case1_enabled(self) -> bool:
+        return bool(self.config.actor.get("dance_case1_mode", False))
+
     def _is_dance_case2_enabled(self) -> bool:
         return bool(self.config.actor.get("dance_case2_mode", False))
+
+    def _dance_case1_mismatch_reasons(self) -> list[str]:
+        reasons: list[str] = []
+        if not self.diffusion:
+            reasons.append("trainer.diffusion must be true")
+        if not self.disaggregate:
+            reasons.append("trainer.disaggregate must be true")
+
+        trainer_pipelined = OmegaConf.select(self.config, "trainer.pipelined_micro_batch")
+        if trainer_pipelined is not None and not bool(trainer_pipelined):
+            reasons.append("trainer.pipelined_micro_batch must be true")
+
+        adv_estimator = OmegaConf.select(self.config, "algorithm.adv_estimator")
+        if adv_estimator is not None and str(adv_estimator).lower() != "grpo":
+            reasons.append("algorithm.adv_estimator must be grpo")
+        return reasons
+
+    def _is_dance_case1_mode(self) -> bool:
+        return self._is_dance_case1_enabled() and len(self._dance_case1_mismatch_reasons()) == 0
 
     def _dance_case2_mismatch_reasons(self) -> list[str]:
         reasons: list[str] = []
@@ -968,7 +990,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             self.config.model.get("enable_gradient_checkpointing", False)
             or actor_extra.get("gradient_checkpointing", False)
         )
-        dance_case2_mode = self._is_dance_case2_mode()
+        dance_dual_rollout_mode = self._is_dance_case1_mode() or self._is_dance_case2_mode()
 
         def _build_videoalign_inferencer():
             use_videoalign = bool(_cfg_get(dance_cfg, "use_videoalign", False))
@@ -1005,7 +1027,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         if self.role != "actor":
             raise ValueError(
-                f"dance_case2_mode/dance_case3_mode only supports role='actor' or role='rollout_ref', got {self.role}"
+                f"dance_case1_mode/dance_case2_mode/dance_case3_mode only supports role='actor' or role='rollout_ref', got {self.role}"
             )
 
         transformer = load_transformer(
@@ -1047,7 +1069,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             last_epoch=-1,
         )
 
-        if dance_case2_mode:
+        if dance_dual_rollout_mode:
             self.inferencer = _build_videoalign_inferencer()
             vae_model_path = _cfg_get(dance_cfg, "vae_model_path", pretrained_model_name_or_path)
             self.vae, _, fps = load_vae(model_type, vae_model_path)
@@ -1379,6 +1401,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         samples = {k: data.batch[k].to(device) for k in data.batch.keys()}
         sigma_schedule = torch.as_tensor(data.meta_info["sigma_schedule"], device=device, dtype=torch.float32)
         self.optimizer.zero_grad()
+        step_weight = bool(data.meta_info.get("step_weight", True))
 
         def flux_step(
             model_output: torch.Tensor,
@@ -1523,10 +1546,11 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 final_loss.backward()
                 avg_loss = final_loss.detach()
 
-            self.transformer.clip_grad_norm_(self._get_dance_case4_grad_clip())
-            self.optimizer.step()
-            self.lr_scheduler.step()
-            self.optimizer.zero_grad()
+            if step_weight:
+                self.transformer.clip_grad_norm_(self._get_dance_case4_grad_clip())
+                self.optimizer.step()
+                self.lr_scheduler.step()
+                self.optimizer.zero_grad()
 
         output = DataProto(meta_info={"metrics": {"actor/loss": float(avg_loss.item())}})
         return output.to("cpu")
@@ -2110,6 +2134,14 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         # This is used to import external_lib into the huggingface systems
         import_external_libs(self.config.model.get("external_lib", None))
 
+        if self._is_dance_case1_enabled():
+            reasons = self._dance_case1_mismatch_reasons()
+            if reasons:
+                reason_text = "; ".join(reasons)
+                raise ValueError(f"[dance_case1] dance_case1_mode=true but case1 conditions are not met: {reason_text}")
+            self._build_model_optimizer_dance_dis()
+            return
+
         if self._is_dance_case2_enabled():
             reasons = self._dance_case2_mismatch_reasons()
             if reasons:
@@ -2258,6 +2290,14 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         # Support all hardwares
         data = data.to(get_device_id())
 
+        if self._is_dance_case1_enabled() and not self._is_dance_case1_mode():
+            reasons = "; ".join(self._dance_case1_mismatch_reasons())
+            raise ValueError(f"[dance_case1] worker update_actor rejected due to case1 condition mismatch: {reasons}")
+        if self._is_dance_case1_mode():
+            if self.role != "actor":
+                raise ValueError(f"[dance_case1] update_actor is only valid on role='actor', got {self.role}")
+            return self._update_actor_dance(data)
+
         if self._is_dance_case2_enabled() and not self._is_dance_case2_mode():
             reasons = "; ".join(self._dance_case2_mismatch_reasons())
             raise ValueError(f"[dance_case2] worker update_actor rejected due to case2 condition mismatch: {reasons}")
@@ -2328,6 +2368,16 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         # Support all hardwares
         prompts = prompts.to(get_device_id())
 
+        if self._is_dance_case1_enabled() and not self._is_dance_case1_mode():
+            reasons = "; ".join(self._dance_case1_mismatch_reasons())
+            raise ValueError(f"[dance_case1] worker generate_sequences rejected due to case1 condition mismatch: {reasons}")
+        if self._is_dance_case1_mode():
+            if self.role not in {"actor", "rollout_ref"}:
+                raise ValueError(
+                    f"[dance_case1] generate_sequences is only valid on role='actor' or role='rollout_ref', got {self.role}"
+                )
+            return self._generate_sequences_dance(prompts)
+
         if self._is_dance_case2_enabled() and not self._is_dance_case2_mode():
             reasons = "; ".join(self._dance_case2_mismatch_reasons())
             raise ValueError(f"[dance_case2] worker generate_sequences rejected due to case2 condition mismatch: {reasons}")
@@ -2397,12 +2447,16 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     def generate_sequences_dance_async(self, prompts: DataProto):
         prompts = prompts.to(get_device_id())
 
-        if not self._is_dance_case2_mode():
+        if self._is_dance_case1_enabled():
+            if not self._is_dance_case1_mode():
+                reasons = "; ".join(self._dance_case1_mismatch_reasons())
+                raise ValueError(f"[dance_case1] async generate_sequences rejected due to case1 condition mismatch: {reasons}")
+        elif not self._is_dance_case2_mode():
             reasons = "; ".join(self._dance_case2_mismatch_reasons())
             raise ValueError(f"[dance_case2] async generate_sequences rejected due to case2 condition mismatch: {reasons}")
         if self.role not in {"actor", "rollout_ref"}:
             raise ValueError(
-                f"[dance_case2] async generate_sequences is only valid on role='actor' or role='rollout_ref', got {self.role}"
+                f"[dance_case1/case2] async generate_sequences is only valid on role='actor' or role='rollout_ref', got {self.role}"
             )
         return self._generate_sequences_dance(prompts)
 
@@ -2410,11 +2464,15 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     def update_actor_dance_async(self, data: DataProto):
         data = data.to(get_device_id())
 
-        if not self._is_dance_case2_mode():
+        if self._is_dance_case1_enabled():
+            if not self._is_dance_case1_mode():
+                reasons = "; ".join(self._dance_case1_mismatch_reasons())
+                raise ValueError(f"[dance_case1] async update_actor rejected due to case1 condition mismatch: {reasons}")
+        elif not self._is_dance_case2_mode():
             reasons = "; ".join(self._dance_case2_mismatch_reasons())
             raise ValueError(f"[dance_case2] async update_actor rejected due to case2 condition mismatch: {reasons}")
         if self.role != "actor":
-            raise ValueError(f"[dance_case2] async update_actor is only valid on role='actor', got {self.role}")
+            raise ValueError(f"[dance_case1/case2] async update_actor is only valid on role='actor', got {self.role}")
         return self._update_actor_dance(data)
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)

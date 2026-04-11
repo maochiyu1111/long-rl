@@ -77,6 +77,9 @@ use_kl_loss: false
 # Enable hard-migrated DanceGRPO Case3 disaggregate path.
 dance_case3_mode: false
 
+# Enable hard-migrated DanceGRPO Case1 pipelined dual-rollout path.
+dance_case1_mode: false
+
 # Enable hard-migrated DanceGRPO Case2 async dual-rollout path.
 dance_case2_mode: false
 
