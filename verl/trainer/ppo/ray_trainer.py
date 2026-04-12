@@ -20,6 +20,7 @@ This trainer supports model-agonistic model initialization with huggingface
 
 import json
 import os
+import time
 import uuid
 import warnings
 from collections import defaultdict
@@ -2142,6 +2143,10 @@ class RayPPOTrainer:
         rollout_values = [record["rollout_collect_s"] for record in records]
         update_values = [record["update_wait_s"] for record in records]
         overhead_values = [record["other_overhead_s"] for record in records]
+        update_count_values = [record["update_submit_count"] for record in records]
+        update_input_values = [record["update_input_samples_total"] for record in records]
+        update_tail_values = [record["update_tail_after_rollout_s"] for record in records]
+        max_wait_values = [record["max_update_wait_duration_s"] for record in records]
 
         summary = {
             "generated_at": str(np.datetime64("now")),
@@ -2173,6 +2178,12 @@ class RayPPOTrainer:
                 "rollout_collect_s": self._compute_step_timing_stats(rollout_values),
                 "update_wait_s": self._compute_step_timing_stats(update_values),
                 "other_overhead_s": self._compute_step_timing_stats(overhead_values),
+            },
+            "async_update": {
+                "updates_per_step": self._compute_step_timing_stats(update_count_values),
+                "input_samples_per_step": self._compute_step_timing_stats(update_input_values),
+                "tail_after_rollout_s": self._compute_step_timing_stats(update_tail_values),
+                "max_wait_duration_s": self._compute_step_timing_stats(max_wait_values),
             },
             "steps": records,
         }
@@ -2209,10 +2220,41 @@ class RayPPOTrainer:
                 + " |"
             )
 
+        async_update_rows = []
+        for metric_name, stats in summary["async_update"].items():
+            async_update_rows.append(
+                "| "
+                + " | ".join(
+                    [
+                        metric_name,
+                        str(stats["count"]),
+                        _fmt(stats["min_s"]),
+                        _fmt(stats["mean_s"]),
+                        _fmt(stats["p50_s"]),
+                        _fmt(stats["p90_s"]),
+                        _fmt(stats["max_s"]),
+                    ]
+                )
+                + " |"
+            )
+
         step_rows = []
         for record in records:
             actor_loss = record["actor_metrics"].get("actor/loss")
             actor_loss_text = "-" if actor_loss is None else f"{actor_loss:.6f}"
+            update_timeline_text = ", ".join(
+                [
+                    (
+                        f"id={event['update_id']}"
+                        f"/batch={event['input_batch_size']}"
+                        f"/submit={event['submit_offset_s']:.4f}"
+                        f"/finish={event['finish_offset_s']:.4f}"
+                        f"/wait={event['wait_duration_s']:.4f}"
+                        f"/step_weight={event['step_weight']}"
+                    )
+                    for event in record["update_events"]
+                ]
+            )
             step_rows.append(
                 "| "
                 + " | ".join(
@@ -2227,7 +2269,9 @@ class RayPPOTrainer:
                         str(record["prompt_batch_count"]),
                         str(record["actor_prompt_count"]),
                         str(record["update_count"]),
+                        _fmt(record["update_tail_after_rollout_s"]),
                         actor_loss_text,
+                        update_timeline_text or "-",
                     ]
                 )
                 + " |"
@@ -2263,10 +2307,16 @@ class RayPPOTrainer:
             "| --- | --- | --- | --- | --- | --- | --- | --- |",
             *stage_rows,
             "",
+            "## Async Update Summary",
+            "",
+            "| metric | count | min | mean | p50 | p90 | max |",
+            "| --- | --- | --- | --- | --- | --- | --- |",
+            *async_update_rows,
+            "",
             "## Step Details",
             "",
-            "| step | epoch | step_total_s | prompt_prepare_s | rollout_collect_s | update_wait_s | other_overhead_s | prompt_batches | actor_prompt_batches | update_count | actor_loss |",
-            "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
+            "| step | epoch | step_total_s | prompt_prepare_s | rollout_collect_s | update_wait_s | other_overhead_s | prompt_batches | actor_prompt_batches | update_count | update_tail_after_rollout_s | actor_loss | update_timeline_s |",
+            "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
             *step_rows,
             "",
         ]
@@ -2310,7 +2360,33 @@ class RayPPOTrainer:
             "actor_world_size": int(step_meta_info.get("actor_world_size", 0) or 0),
             "rollout_rounds": int(step_meta_info.get("rollout_rounds", 0) or 0),
             "update_count": int(step_meta_info.get("update_count", 0) or 0),
+            "rollout_collect_end_offset_s": float(step_meta_info.get("rollout_collect_end_offset_s", 0.0) or 0.0),
         }
+        update_events = []
+        for idx, event in enumerate(step_meta_info.get("update_events", []) or []):
+            update_event = {
+                "update_id": int(event.get("update_id", idx)),
+                "input_batch_size": int(event.get("input_batch_size", 0) or 0),
+                "prepared_batch_count": int(event.get("prepared_batch_count", 0) or 0),
+                "step_weight": bool(event.get("step_weight", False)),
+                "submit_offset_s": float(event.get("submit_offset_s", 0.0) or 0.0),
+                "wait_start_offset_s": float(event.get("wait_start_offset_s", 0.0) or 0.0),
+                "finish_offset_s": float(event.get("finish_offset_s", 0.0) or 0.0),
+                "wait_duration_s": float(event.get("wait_duration_s", 0.0) or 0.0),
+            }
+            update_events.append(update_event)
+        record["update_events"] = update_events
+        record["update_submit_count"] = len(update_events)
+        record["update_input_samples_total"] = int(sum(event["input_batch_size"] for event in update_events))
+        record["last_update_finish_offset_s"] = float(
+            max((event["finish_offset_s"] for event in update_events), default=0.0)
+        )
+        record["update_tail_after_rollout_s"] = float(
+            max(0.0, record["last_update_finish_offset_s"] - record["rollout_collect_end_offset_s"])
+        )
+        record["max_update_wait_duration_s"] = float(
+            max((event["wait_duration_s"] for event in update_events), default=0.0)
+        )
         self._dance_dual_rollout_step_timing_records.append(record)
 
         with open(self._dance_dual_rollout_step_timing_jsonl_path, "a", encoding="utf-8") as f:
@@ -3074,6 +3150,12 @@ class RayPPOTrainer:
 
         while self.global_steps < max_train_steps:
             timing_raw: dict[str, float] = {}
+            step_wall_start = time.perf_counter()
+            update_events: list[dict[str, Any]] = []
+
+            def _step_offset_s() -> float:
+                return time.perf_counter() - step_wall_start
+
             with marked_timer("step", timing_raw):
                 with marked_timer("prompt_prepare", timing_raw):
                     prompt_batches = self._make_dance_dual_rollout_prompt_batches(schedule=schedule)
@@ -3083,7 +3165,7 @@ class RayPPOTrainer:
                     actor_world_size = max(1, int(getattr(self.actor_wg, "world_size", 1)))
                     actor_prompt_count = self._get_dance_dual_rollout_actor_prompt_count(prompt_batches, schedule)
 
-                update_futures = []
+                update_futures: list[dict[str, Any]] = []
                 update_metrics: dict[str, Any] = {}
                 rollout_refs: list[Any] = []
                 staged_batches: list[DataProto] = []
@@ -3139,7 +3221,20 @@ class RayPPOTrainer:
                                 update_batch.meta_info["is_last_micro_batch"] = (
                                     accumulation_count == gradient_accumulation_steps
                                 )
-                                update_futures.append(self.actor_wg.update_actor_dance_async(update_batch))
+                                update_event = {
+                                    "update_id": len(update_events),
+                                    "input_batch_size": len(update_batch),
+                                    "prepared_batch_count": len(pipelined_batches_wait),
+                                    "step_weight": bool(update_batch.meta_info["step_weight"]),
+                                    "submit_offset_s": _step_offset_s(),
+                                }
+                                update_events.append(update_event)
+                                update_futures.append(
+                                    {
+                                        "future": self.actor_wg.update_actor_dance_async(update_batch),
+                                        "event": update_event,
+                                    }
+                                )
                                 pipelined_batches_wait = []
                                 if accumulation_count == gradient_accumulation_steps:
                                     accumulation_count = 0
@@ -3148,12 +3243,25 @@ class RayPPOTrainer:
                             staged_batch_size += len(prepared)
                             update_threshold = max(1, actor_world_size)
                             if staged_batch_size >= update_threshold:
+                                update_batch = DataProto.concat(staged_batches)
+                                update_event = {
+                                    "update_id": len(update_events),
+                                    "input_batch_size": len(update_batch),
+                                    "prepared_batch_count": len(staged_batches),
+                                    "step_weight": bool(update_batch.meta_info.get("step_weight", True)),
+                                    "submit_offset_s": _step_offset_s(),
+                                }
+                                update_events.append(update_event)
                                 update_futures.append(
-                                    self.actor_wg.update_actor_dance_async(DataProto.concat(staged_batches))
+                                    {
+                                        "future": self.actor_wg.update_actor_dance_async(update_batch),
+                                        "event": update_event,
+                                    }
                                 )
                                 staged_batches = []
                                 staged_batch_size = 0
 
+                    rollout_collect_end_offset_s = _step_offset_s()
                     if schedule == "pipelined_micro_batch":
                         if pipelined_batches_wait:
                             raise ValueError(
@@ -3161,11 +3269,31 @@ class RayPPOTrainer:
                                 "adjust bestofn/num_generations or actor world size."
                             )
                     elif staged_batches:
-                        update_futures.append(self.actor_wg.update_actor_dance_async(DataProto.concat(staged_batches)))
+                        update_batch = DataProto.concat(staged_batches)
+                        update_event = {
+                            "update_id": len(update_events),
+                            "input_batch_size": len(update_batch),
+                            "prepared_batch_count": len(staged_batches),
+                            "step_weight": bool(update_batch.meta_info.get("step_weight", True)),
+                            "submit_offset_s": _step_offset_s(),
+                        }
+                        update_events.append(update_event)
+                        update_futures.append(
+                            {
+                                "future": self.actor_wg.update_actor_dance_async(update_batch),
+                                "event": update_event,
+                            }
+                        )
 
                 with marked_timer("update_wait", timing_raw):
-                    for update_future in update_futures:
-                        update_output = update_future.get()
+                    for update_future_entry in update_futures:
+                        update_event = update_future_entry["event"]
+                        update_event["wait_start_offset_s"] = _step_offset_s()
+                        update_output = update_future_entry["future"].get()
+                        update_event["finish_offset_s"] = _step_offset_s()
+                        update_event["wait_duration_s"] = (
+                            update_event["finish_offset_s"] - update_event["wait_start_offset_s"]
+                        )
                         if update_output is not None:
                             update_metrics.update(update_output.meta_info.get("metrics", {}))
 
@@ -3182,6 +3310,8 @@ class RayPPOTrainer:
                     "actor_world_size": actor_world_size,
                     "rollout_rounds": len(rollout_refs),
                     "update_count": len(update_futures),
+                    "rollout_collect_end_offset_s": rollout_collect_end_offset_s,
+                    "update_events": update_events,
                 },
             )
 

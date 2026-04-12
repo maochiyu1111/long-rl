@@ -12,6 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
+from pathlib import Path
+
 import pytest
 import torch
 from omegaconf import OmegaConf
@@ -374,3 +377,98 @@ def test_create_dataloader_dance_case4_skips_validation_construction(monkeypatch
     assert trainer.val_dataset is None
     assert trainer.val_dataloader is None
     assert len(created_dataloaders) == 1
+
+
+def test_record_dance_case1_step_timing_persists_async_update_timeline(tmp_path):
+    trainer = RayPPOTrainer.__new__(RayPPOTrainer)
+    trainer.config = OmegaConf.create(
+        {
+            "trainer": {
+                "project_name": "dance_case1_test",
+                "experiment_name": "timing",
+                "step_timing_report_dir": str(tmp_path),
+            },
+            "data": {
+                "train_batch_size": 16,
+                "gen_batch_size": 16,
+            },
+            "actor_rollout_ref": {
+                "rollout": {
+                    "sampling_steps": 28,
+                    "num_generations": 4,
+                    "bestofn": 4,
+                },
+            },
+        }
+    )
+
+    trainer._init_dance_dual_rollout_step_timing(case_name="dance_case1", schedule="pipelined_micro_batch")
+    trainer._record_dance_dual_rollout_step_timing(
+        epoch=0,
+        step=1,
+        timing_raw={
+            "step": 10.0,
+            "prompt_prepare": 0.5,
+            "rollout_collect": 8.0,
+            "update_wait": 1.5,
+        },
+        actor_metrics={"actor/loss": 0.123},
+        step_meta_info={
+            "prompt_batch_count": 8,
+            "actor_prompt_count": 1,
+            "actor_world_size": 8,
+            "rollout_rounds": 8,
+            "update_count": 2,
+            "rollout_collect_end_offset_s": 8.5,
+            "update_events": [
+                {
+                    "update_id": 0,
+                    "input_batch_size": 8,
+                    "prepared_batch_count": 2,
+                    "step_weight": False,
+                    "submit_offset_s": 3.0,
+                    "wait_start_offset_s": 8.6,
+                    "finish_offset_s": 8.7,
+                    "wait_duration_s": 0.1,
+                },
+                {
+                    "update_id": 1,
+                    "input_batch_size": 8,
+                    "prepared_batch_count": 2,
+                    "step_weight": True,
+                    "submit_offset_s": 6.0,
+                    "wait_start_offset_s": 9.0,
+                    "finish_offset_s": 9.4,
+                    "wait_duration_s": 0.4,
+                },
+            ],
+        },
+    )
+
+    summary = json.loads((tmp_path / "step_timing_summary.json").read_text(encoding="utf-8"))
+    record = summary["steps"][0]
+    assert record["update_submit_count"] == 2
+    assert record["update_input_samples_total"] == 16
+    assert record["update_tail_after_rollout_s"] == pytest.approx(0.9)
+    assert record["max_update_wait_duration_s"] == pytest.approx(0.4)
+    assert record["update_events"][1]["step_weight"] is True
+    assert summary["async_update"]["tail_after_rollout_s"]["mean_s"] == pytest.approx(0.9)
+
+
+@pytest.mark.parametrize(
+    ("config_path", "expected_master_weight_type"),
+    [
+        ("examples/diffusion/config_video_diffusion_case1_dance.yaml", "bf16"),
+        ("examples/diffusion/config_video_diffusion_case2_dance.yaml", "bf16"),
+        ("examples/diffusion/config_video_diffusion_case3_dance.yaml", "bf16"),
+        ("examples/diffusion/config_video_diffusion_case3_dance_nodes.yaml", "bf16"),
+        ("examples/diffusion/config_video_diffusion_case3_dance_npu.yaml", "bf16"),
+        ("examples/diffusion/config_video_diffusion_case4_dance.yaml", "bf16"),
+        ("examples/diffusion/config_video_diffusion_case4_dance_nodes.yaml", "bf16"),
+        ("examples/diffusion/config_video_diffusion_case4_dance_npu.yaml", "bf16"),
+        ("examples/diffusion/config_video_diffusion_case4_dance_nodes_npu.yaml", "bf16"),
+    ],
+)
+def test_dance_configs_align_master_weight_precision(config_path, expected_master_weight_type):
+    config = OmegaConf.load(Path(config_path))
+    assert config.actor_rollout_ref.actor.extra.dance.master_weight_type == expected_master_weight_type

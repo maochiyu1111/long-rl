@@ -46,7 +46,7 @@ actor_rollout_ref:
         pretrained_model_name_or_path: /home/qzy/models/HunyuanVideo
         vae_model_path: /home/qzy/models/HunyuanVideo
         model_type: hunyuan_hf
-        master_weight_type: fp32
+        master_weight_type: bf16
         use_videoalign: true
         videoalign_ckpt_path: /home/qzy/models/videoalign_ckpt
         videoalign_base_model_name_or_path: /home/qzy/models/Qwen2-VL-2B-Instruct
