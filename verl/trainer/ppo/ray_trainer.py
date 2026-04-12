@@ -2112,6 +2112,212 @@ class RayPPOTrainer:
             "max_s": float(arr.max()),
         }
 
+    def _init_dance_dual_rollout_step_timing(self, case_name: str, schedule: str):
+        report_dir = self._get_step_timing_report_dir(report_name=f"{case_name}_step_timing")
+        os.makedirs(report_dir, exist_ok=True)
+
+        self._dance_dual_rollout_step_timing_case_name = case_name
+        self._dance_dual_rollout_step_timing_schedule = schedule
+        self._dance_dual_rollout_step_timing_dir = report_dir
+        self._dance_dual_rollout_step_timing_jsonl_path = os.path.join(report_dir, "step_timing.jsonl")
+        self._dance_dual_rollout_step_timing_json_path = os.path.join(report_dir, "step_timing_summary.json")
+        self._dance_dual_rollout_step_timing_md_path = os.path.join(report_dir, "step_timing_report.md")
+        self._dance_dual_rollout_step_timing_records: list[dict[str, Any]] = []
+
+        for path in [
+            self._dance_dual_rollout_step_timing_jsonl_path,
+            self._dance_dual_rollout_step_timing_json_path,
+            self._dance_dual_rollout_step_timing_md_path,
+        ]:
+            with open(path, "w", encoding="utf-8"):
+                pass
+
+    def _write_dance_dual_rollout_step_timing_report(self):
+        records = getattr(self, "_dance_dual_rollout_step_timing_records", [])
+        if not records:
+            return
+
+        total_values = [record["step_total_s"] for record in records]
+        prompt_prepare_values = [record["prompt_prepare_s"] for record in records]
+        rollout_values = [record["rollout_collect_s"] for record in records]
+        update_values = [record["update_wait_s"] for record in records]
+        overhead_values = [record["other_overhead_s"] for record in records]
+
+        summary = {
+            "generated_at": str(np.datetime64("now")),
+            "project_name": OmegaConf.select(self.config, "trainer.project_name"),
+            "experiment_name": OmegaConf.select(self.config, "trainer.experiment_name"),
+            "report_dir": self._dance_dual_rollout_step_timing_dir,
+            "case_name": self._dance_dual_rollout_step_timing_case_name,
+            "schedule": self._dance_dual_rollout_step_timing_schedule,
+            "num_steps": len(records),
+            "config": {
+                "max_train_steps": OmegaConf.select(self.config, "trainer.max_train_steps"),
+                "nnodes": OmegaConf.select(self.config, "trainer.nnodes"),
+                "n_gpus_per_node": OmegaConf.select(self.config, "trainer.n_gpus_per_node"),
+                "disaggregate_actor_n_gpus_per_node": OmegaConf.select(
+                    self.config, "trainer.disaggregate_actor_n_gpus_per_node"
+                ),
+                "disaggregate_rollout_ref_n_gpus_per_node": OmegaConf.select(
+                    self.config, "trainer.disaggregate_rollout_ref_n_gpus_per_node"
+                ),
+                "train_batch_size": OmegaConf.select(self.config, "data.train_batch_size"),
+                "gen_batch_size": OmegaConf.select(self.config, "data.gen_batch_size"),
+                "sampling_steps": OmegaConf.select(self.config, "actor_rollout_ref.rollout.sampling_steps"),
+                "num_generations": OmegaConf.select(self.config, "actor_rollout_ref.rollout.num_generations"),
+                "bestofn": OmegaConf.select(self.config, "actor_rollout_ref.rollout.bestofn"),
+            },
+            "stages": {
+                "step_total_s": self._compute_step_timing_stats(total_values),
+                "prompt_prepare_s": self._compute_step_timing_stats(prompt_prepare_values),
+                "rollout_collect_s": self._compute_step_timing_stats(rollout_values),
+                "update_wait_s": self._compute_step_timing_stats(update_values),
+                "other_overhead_s": self._compute_step_timing_stats(overhead_values),
+            },
+            "steps": records,
+        }
+
+        step_total_mean = summary["stages"]["step_total_s"]["mean_s"] or 1e-12
+        for stage_name in ["prompt_prepare_s", "rollout_collect_s", "update_wait_s", "other_overhead_s"]:
+            stage_mean = summary["stages"][stage_name]["mean_s"]
+            summary["stages"][stage_name]["share_of_step_mean"] = float(stage_mean / step_total_mean)
+
+        with open(self._dance_dual_rollout_step_timing_json_path, "w", encoding="utf-8") as f:
+            json.dump(summary, f, indent=2)
+
+        def _fmt(value: float) -> str:
+            return f"{value:.4f}"
+
+        stage_rows = []
+        for stage_name, stats in summary["stages"].items():
+            share = stats.get("share_of_step_mean")
+            share_text = f"{share * 100:.2f}%" if share is not None else "-"
+            stage_rows.append(
+                "| "
+                + " | ".join(
+                    [
+                        stage_name,
+                        str(stats["count"]),
+                        _fmt(stats["min_s"]),
+                        _fmt(stats["mean_s"]),
+                        _fmt(stats["p50_s"]),
+                        _fmt(stats["p90_s"]),
+                        _fmt(stats["max_s"]),
+                        share_text,
+                    ]
+                )
+                + " |"
+            )
+
+        step_rows = []
+        for record in records:
+            actor_loss = record["actor_metrics"].get("actor/loss")
+            actor_loss_text = "-" if actor_loss is None else f"{actor_loss:.6f}"
+            step_rows.append(
+                "| "
+                + " | ".join(
+                    [
+                        str(record["step"]),
+                        str(record["epoch"]),
+                        _fmt(record["step_total_s"]),
+                        _fmt(record["prompt_prepare_s"]),
+                        _fmt(record["rollout_collect_s"]),
+                        _fmt(record["update_wait_s"]),
+                        _fmt(record["other_overhead_s"]),
+                        str(record["prompt_batch_count"]),
+                        str(record["actor_prompt_count"]),
+                        str(record["update_count"]),
+                        actor_loss_text,
+                    ]
+                )
+                + " |"
+            )
+
+        case_title = self._dance_dual_rollout_step_timing_case_name.replace("_", " ").title()
+        report_lines = [
+            f"# {case_title} Step Timing Report",
+            "",
+            f"- project: `{summary['project_name']}`",
+            f"- experiment: `{summary['experiment_name']}`",
+            f"- report_dir: `{summary['report_dir']}`",
+            f"- generated_at: `{summary['generated_at']}`",
+            f"- schedule: `{summary['schedule']}`",
+            f"- num_steps: `{summary['num_steps']}`",
+            "",
+            "## Config",
+            "",
+            f"- max_train_steps: `{summary['config']['max_train_steps']}`",
+            f"- nnodes: `{summary['config']['nnodes']}`",
+            f"- n_gpus_per_node: `{summary['config']['n_gpus_per_node']}`",
+            f"- disaggregate_actor_n_gpus_per_node: `{summary['config']['disaggregate_actor_n_gpus_per_node']}`",
+            f"- disaggregate_rollout_ref_n_gpus_per_node: `{summary['config']['disaggregate_rollout_ref_n_gpus_per_node']}`",
+            f"- train_batch_size: `{summary['config']['train_batch_size']}`",
+            f"- gen_batch_size: `{summary['config']['gen_batch_size']}`",
+            f"- sampling_steps: `{summary['config']['sampling_steps']}`",
+            f"- num_generations: `{summary['config']['num_generations']}`",
+            f"- bestofn: `{summary['config']['bestofn']}`",
+            "",
+            "## Stage Summary",
+            "",
+            "| stage | count | min_s | mean_s | p50_s | p90_s | max_s | share_of_step_mean |",
+            "| --- | --- | --- | --- | --- | --- | --- | --- |",
+            *stage_rows,
+            "",
+            "## Step Details",
+            "",
+            "| step | epoch | step_total_s | prompt_prepare_s | rollout_collect_s | update_wait_s | other_overhead_s | prompt_batches | actor_prompt_batches | update_count | actor_loss |",
+            "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
+            *step_rows,
+            "",
+        ]
+
+        with open(self._dance_dual_rollout_step_timing_md_path, "w", encoding="utf-8") as f:
+            f.write("\n".join(report_lines))
+
+    def _record_dance_dual_rollout_step_timing(
+        self,
+        epoch: int,
+        step: int,
+        timing_raw: dict[str, float],
+        actor_metrics: Optional[dict[str, Any]] = None,
+        step_meta_info: Optional[dict[str, Any]] = None,
+    ):
+        actor_metrics = actor_metrics or {}
+        step_meta_info = step_meta_info or {}
+        step_total = float(timing_raw.get("step", 0.0))
+        prompt_prepare_time = float(timing_raw.get("prompt_prepare", 0.0))
+        rollout_time = float(timing_raw.get("rollout_collect", 0.0))
+        update_time = float(timing_raw.get("update_wait", 0.0))
+        other_overhead = max(0.0, step_total - prompt_prepare_time - rollout_time - update_time)
+
+        numeric_actor_metrics = {
+            key: float(value)
+            for key, value in actor_metrics.items()
+            if isinstance(value, (int, float, np.integer, np.floating))
+        }
+
+        record = {
+            "epoch": int(epoch),
+            "step": int(step),
+            "step_total_s": step_total,
+            "prompt_prepare_s": prompt_prepare_time,
+            "rollout_collect_s": rollout_time,
+            "update_wait_s": update_time,
+            "other_overhead_s": other_overhead,
+            "actor_metrics": numeric_actor_metrics,
+            "prompt_batch_count": int(step_meta_info.get("prompt_batch_count", 0) or 0),
+            "actor_prompt_count": int(step_meta_info.get("actor_prompt_count", 0) or 0),
+            "actor_world_size": int(step_meta_info.get("actor_world_size", 0) or 0),
+            "rollout_rounds": int(step_meta_info.get("rollout_rounds", 0) or 0),
+            "update_count": int(step_meta_info.get("update_count", 0) or 0),
+        }
+        self._dance_dual_rollout_step_timing_records.append(record)
+
+        with open(self._dance_dual_rollout_step_timing_jsonl_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record) + "\n")
+
+        self._write_dance_dual_rollout_step_timing_report()
+
     def _init_dance_case4_step_timing(self):
         report_dir = self._get_step_timing_report_dir(report_name="dance_case4_step_timing")
         os.makedirs(report_dir, exist_ok=True)
@@ -2860,96 +3066,126 @@ class RayPPOTrainer:
         self.global_steps = 0
         self._dance_case2_data_iterator = iter(self.train_dataloader)
         self._dance_case2_fit_epoch = 0
+        case_name = "dance_case1" if schedule == "pipelined_micro_batch" else "dance_case2"
         progress_label = "Dance Case1" if schedule == "pipelined_micro_batch" else "Dance Case2"
         progress_bar = tqdm(total=max_train_steps, initial=self.global_steps, desc=progress_label)
+        self._init_dance_dual_rollout_step_timing(case_name=case_name, schedule=schedule)
+        print(f"[{case_name}_timing] writing step timing report to {self._dance_dual_rollout_step_timing_dir}")
 
         while self.global_steps < max_train_steps:
-            prompt_batches = self._make_dance_dual_rollout_prompt_batches(schedule=schedule)
-            if not prompt_batches:
-                raise ValueError(f"{self._active_dance_dual_rollout_mode_name()} produced no prompt batches")
+            timing_raw: dict[str, float] = {}
+            with marked_timer("step", timing_raw):
+                with marked_timer("prompt_prepare", timing_raw):
+                    prompt_batches = self._make_dance_dual_rollout_prompt_batches(schedule=schedule)
+                    if not prompt_batches:
+                        raise ValueError(f"{self._active_dance_dual_rollout_mode_name()} produced no prompt batches")
 
-            actor_world_size = max(1, int(getattr(self.actor_wg, "world_size", 1)))
-            actor_prompt_count = self._get_dance_dual_rollout_actor_prompt_count(prompt_batches, schedule)
+                    actor_world_size = max(1, int(getattr(self.actor_wg, "world_size", 1)))
+                    actor_prompt_count = self._get_dance_dual_rollout_actor_prompt_count(prompt_batches, schedule)
 
-            rollout_refs: list[Any] = []
-            for idx, prompt_batch in enumerate(prompt_batches):
-                prompt_batch.meta_info["round"] = idx
-                if idx < actor_prompt_count:
-                    prompt_batch.meta_info["dispatch_role"] = "actor"
-                    future = self.actor_wg.generate_sequences_dance_async(prompt_batch)
-                else:
-                    prompt_batch.meta_info["dispatch_role"] = "rollout_ref"
-                    future = self.rollout_ref_wg.generate_sequences_dance_async(prompt_batch)
-                rollout_refs.append(_materialize_data_proto.remote(future))
+                update_futures = []
+                update_metrics: dict[str, Any] = {}
+                rollout_refs: list[Any] = []
+                staged_batches: list[DataProto] = []
+                staged_batch_size = 0
+                pipelined_batches_wait: list[DataProto] = []
+                accumulation_count = 0
+                gradient_accumulation_steps = max(
+                    1, int(self.config.actor_rollout_ref.actor.get("gradient_accumulation_steps", 1))
+                )
 
-            pending = list(rollout_refs)
-            update_futures = []
-            update_metrics: dict[str, Any] = {}
-            staged_batches: list[DataProto] = []
-            staged_batch_size = 0
-            pipelined_batches_wait: list[DataProto] = []
-            accumulation_count = 0
-            gradient_accumulation_steps = max(
-                1, int(self.config.actor_rollout_ref.actor.get("gradient_accumulation_steps", 1))
+                with marked_timer("rollout_collect", timing_raw):
+                    for idx, prompt_batch in enumerate(prompt_batches):
+                        prompt_batch.meta_info["round"] = idx
+                        if idx < actor_prompt_count:
+                            prompt_batch.meta_info["dispatch_role"] = "actor"
+                            future = self.actor_wg.generate_sequences_dance_async(prompt_batch)
+                        else:
+                            prompt_batch.meta_info["dispatch_role"] = "rollout_ref"
+                            future = self.rollout_ref_wg.generate_sequences_dance_async(prompt_batch)
+                        rollout_refs.append(_materialize_data_proto.remote(future))
+
+                    pending = list(rollout_refs)
+                    while pending:
+                        done, pending = ray.wait(pending, num_returns=1)
+                        samples = ray.get(done[0])
+                        prepared = self._prepare_dance_case2_rollout_batch(samples)
+                        if schedule == "pipelined_micro_batch":
+                            prepared_batch_size = len(prepared)
+                            if prepared_batch_size <= 0:
+                                raise ValueError("dance_case1_mode received an empty rollout batch")
+                            if prepared_batch_size > actor_world_size:
+                                raise ValueError(
+                                    "dance_case1_mode requires best-of-n selected batch size to be <= actor worker "
+                                    f"world size: prepared_batch_size={prepared_batch_size}, "
+                                    f"actor_world_size={actor_world_size}"
+                                )
+                            if actor_world_size % prepared_batch_size != 0:
+                                raise ValueError(
+                                    "dance_case1_mode requires actor worker world size to be divisible by prepared "
+                                    f"batch size: prepared_batch_size={prepared_batch_size}, "
+                                    f"actor_world_size={actor_world_size}"
+                                )
+
+                            pipelined_batches_wait.append(prepared)
+                            required_batches = actor_world_size // prepared_batch_size
+                            if len(pipelined_batches_wait) == required_batches:
+                                accumulation_count += 1
+                                update_batch = DataProto.concat(pipelined_batches_wait)
+                                update_batch.meta_info = dict(update_batch.meta_info)
+                                update_batch.meta_info["step_weight"] = accumulation_count == gradient_accumulation_steps
+                                update_batch.meta_info["window_id"] = self.global_steps
+                                update_batch.meta_info["micro_batch_id"] = accumulation_count - 1
+                                update_batch.meta_info["is_last_micro_batch"] = (
+                                    accumulation_count == gradient_accumulation_steps
+                                )
+                                update_futures.append(self.actor_wg.update_actor_dance_async(update_batch))
+                                pipelined_batches_wait = []
+                                if accumulation_count == gradient_accumulation_steps:
+                                    accumulation_count = 0
+                        else:
+                            staged_batches.append(prepared)
+                            staged_batch_size += len(prepared)
+                            update_threshold = max(1, actor_world_size)
+                            if staged_batch_size >= update_threshold:
+                                update_futures.append(
+                                    self.actor_wg.update_actor_dance_async(DataProto.concat(staged_batches))
+                                )
+                                staged_batches = []
+                                staged_batch_size = 0
+
+                    if schedule == "pipelined_micro_batch":
+                        if pipelined_batches_wait:
+                            raise ValueError(
+                                "dance_case1_mode ended a step with an incomplete pipelined micro-batch; "
+                                "adjust bestofn/num_generations or actor world size."
+                            )
+                    elif staged_batches:
+                        update_futures.append(self.actor_wg.update_actor_dance_async(DataProto.concat(staged_batches)))
+
+                with marked_timer("update_wait", timing_raw):
+                    for update_future in update_futures:
+                        update_output = update_future.get()
+                        if update_output is not None:
+                            update_metrics.update(update_output.meta_info.get("metrics", {}))
+
+            current_step = self.global_steps + 1
+            self._log_step_timing(timing_raw=timing_raw, step=current_step, epoch=self._dance_case2_fit_epoch)
+            self._record_dance_dual_rollout_step_timing(
+                epoch=self._dance_case2_fit_epoch,
+                step=current_step,
+                timing_raw=timing_raw,
+                actor_metrics=update_metrics,
+                step_meta_info={
+                    "prompt_batch_count": len(prompt_batches),
+                    "actor_prompt_count": actor_prompt_count,
+                    "actor_world_size": actor_world_size,
+                    "rollout_rounds": len(rollout_refs),
+                    "update_count": len(update_futures),
+                },
             )
 
-            while pending:
-                done, pending = ray.wait(pending, num_returns=1)
-                samples = ray.get(done[0])
-                prepared = self._prepare_dance_case2_rollout_batch(samples)
-                if schedule == "pipelined_micro_batch":
-                    prepared_batch_size = len(prepared)
-                    if prepared_batch_size <= 0:
-                        raise ValueError("dance_case1_mode received an empty rollout batch")
-                    if prepared_batch_size > actor_world_size:
-                        raise ValueError(
-                            "dance_case1_mode requires best-of-n selected batch size to be <= actor worker world size: "
-                            f"prepared_batch_size={prepared_batch_size}, actor_world_size={actor_world_size}"
-                        )
-                    if actor_world_size % prepared_batch_size != 0:
-                        raise ValueError(
-                            "dance_case1_mode requires actor worker world size to be divisible by prepared batch size: "
-                            f"prepared_batch_size={prepared_batch_size}, actor_world_size={actor_world_size}"
-                        )
-
-                    pipelined_batches_wait.append(prepared)
-                    required_batches = actor_world_size // prepared_batch_size
-                    if len(pipelined_batches_wait) == required_batches:
-                        accumulation_count += 1
-                        update_batch = DataProto.concat(pipelined_batches_wait)
-                        update_batch.meta_info = dict(update_batch.meta_info)
-                        update_batch.meta_info["step_weight"] = accumulation_count == gradient_accumulation_steps
-                        update_batch.meta_info["window_id"] = self.global_steps
-                        update_batch.meta_info["micro_batch_id"] = accumulation_count - 1
-                        update_batch.meta_info["is_last_micro_batch"] = accumulation_count == gradient_accumulation_steps
-                        update_futures.append(self.actor_wg.update_actor_dance_async(update_batch))
-                        pipelined_batches_wait = []
-                        if accumulation_count == gradient_accumulation_steps:
-                            accumulation_count = 0
-                else:
-                    staged_batches.append(prepared)
-                    staged_batch_size += len(prepared)
-                    update_threshold = max(1, actor_world_size)
-                    if staged_batch_size >= update_threshold:
-                        update_futures.append(self.actor_wg.update_actor_dance_async(DataProto.concat(staged_batches)))
-                        staged_batches = []
-                        staged_batch_size = 0
-
-            if schedule == "pipelined_micro_batch":
-                if pipelined_batches_wait:
-                    raise ValueError(
-                        "dance_case1_mode ended a step with an incomplete pipelined micro-batch; "
-                        "adjust bestofn/num_generations or actor world size."
-                    )
-            elif staged_batches:
-                update_futures.append(self.actor_wg.update_actor_dance_async(DataProto.concat(staged_batches)))
-
-            for update_future in update_futures:
-                update_output = update_future.get()
-                if update_output is not None:
-                    update_metrics.update(update_output.meta_info.get("metrics", {}))
-
-            self.global_steps += 1
+            self.global_steps = current_step
             if update_metrics:
                 progress_bar.set_postfix(
                     {k: f"{v:.4f}" for k, v in update_metrics.items() if isinstance(v, (int, float))}
@@ -2957,6 +3193,8 @@ class RayPPOTrainer:
             progress_bar.update(1)
 
         progress_bar.close()
+        print(f"[{case_name}_timing] markdown report: {self._dance_dual_rollout_step_timing_md_path}")
+        print(f"[{case_name}_timing] summary json: {self._dance_dual_rollout_step_timing_json_path}")
         return None
 
     def fit_dance_case3_dis(self):
