@@ -66,11 +66,11 @@ actor_rollout_ref:
     n: 1
     log_prob_micro_batch_size_per_gpu: 1
     guidance_scale: 4.5
-    num_steps: 12
+    num_steps: 28
     num_frames: 33
     height: 256
     width: 256
-    sampling_steps: 12
+    sampling_steps: 28
     shift: 5.0
     eta: 1.0
     fps: 24
