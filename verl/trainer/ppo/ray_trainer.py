@@ -1141,7 +1141,7 @@ class RayPPOTrainer:
         num_latent_t = int(self.config.data.get("t", 1))
         cfg_rate = float(self.config.data.get("cfg", 0.0))
         num_workers = int(self.config.data.get("dataloader_num_workers", 0))
-        train_batch_size = int(self.config.data.get("gen_batch_size", self.config.data.get("train_batch_size", 1)))
+        train_batch_size = int(self.config.data.get("train_batch_size", 1))
 
         self.train_dataset = LatentDataset(data_json_path, num_latent_t=num_latent_t, cfg_rate=cfg_rate)
         self.val_dataset = None

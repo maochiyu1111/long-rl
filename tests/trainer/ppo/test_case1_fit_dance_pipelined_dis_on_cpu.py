@@ -227,6 +227,7 @@ def test_create_dataloader_dance_case1_skips_validation_construction(monkeypatch
                 "data_json_path": "/tmp/dance_case1.json",
                 "t": 28,
                 "cfg": 0.0,
+                "train_batch_size": 2,
                 "gen_batch_size": 4,
                 "dataloader_num_workers": 0,
             },
@@ -249,3 +250,4 @@ def test_create_dataloader_dance_case1_skips_validation_construction(monkeypatch
     assert trainer.val_dataset is None
     assert trainer.val_dataloader is None
     assert len(created_dataloaders) == 1
+    assert created_dataloaders[0]["batch_size"] == 2

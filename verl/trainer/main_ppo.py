@@ -88,6 +88,85 @@ def _build_tokenizer_and_processor(config):
     return tokenizer, processor
 
 
+def _build_fit_dis_resource_pool_spec(config, actor_pool_id: str, rollout_ref_pool_id: str) -> dict[str, list[int]]:
+    """Build fit_dis() resource pools for actor and rollout_ref.
+
+    By default, both pools share every training node and split GPUs within each node.
+    When `trainer.disaggregate_actor_nnodes` and/or `trainer.disaggregate_rollout_ref_nnodes`
+    are set, they describe dedicated node counts per pool, so each pool gets its own nodes.
+    """
+    total_gpus_per_node = int(config.trainer.n_gpus_per_node)
+    total_nodes = int(config.trainer.nnodes)
+
+    actor_gpus_per_node = config.trainer.get("disaggregate_actor_n_gpus_per_node", None)
+    rollout_ref_gpus_per_node = config.trainer.get("disaggregate_rollout_ref_n_gpus_per_node", None)
+
+    if actor_gpus_per_node is None and rollout_ref_gpus_per_node is None:
+        if total_gpus_per_node < 2:
+            raise ValueError(
+                "trainer.disaggregate=true requires at least 2 GPUs per node by default; "
+                "or explicitly set trainer.disaggregate_actor_n_gpus_per_node and "
+                "trainer.disaggregate_rollout_ref_n_gpus_per_node."
+            )
+        actor_gpus_per_node = total_gpus_per_node // 2
+        rollout_ref_gpus_per_node = total_gpus_per_node - actor_gpus_per_node
+    elif actor_gpus_per_node is None:
+        rollout_ref_gpus_per_node = int(rollout_ref_gpus_per_node)
+        actor_gpus_per_node = total_gpus_per_node - rollout_ref_gpus_per_node
+    elif rollout_ref_gpus_per_node is None:
+        actor_gpus_per_node = int(actor_gpus_per_node)
+        rollout_ref_gpus_per_node = total_gpus_per_node - actor_gpus_per_node
+    else:
+        actor_gpus_per_node = int(actor_gpus_per_node)
+        rollout_ref_gpus_per_node = int(rollout_ref_gpus_per_node)
+
+    if actor_gpus_per_node <= 0 or rollout_ref_gpus_per_node <= 0:
+        raise ValueError(
+            "Invalid fit_dis() GPU split: "
+            f"{actor_gpus_per_node=}, {rollout_ref_gpus_per_node=}"
+        )
+
+    actor_nodes = config.trainer.get("disaggregate_actor_nnodes", None)
+    rollout_ref_nodes = config.trainer.get("disaggregate_rollout_ref_nnodes", None)
+    use_dedicated_nodes = actor_nodes is not None or rollout_ref_nodes is not None
+
+    if use_dedicated_nodes:
+        actor_nodes = total_nodes if actor_nodes is None else int(actor_nodes)
+        rollout_ref_nodes = total_nodes if rollout_ref_nodes is None else int(rollout_ref_nodes)
+
+        if actor_nodes <= 0 or rollout_ref_nodes <= 0:
+            raise ValueError(
+                "Invalid fit_dis() node split: "
+                f"{actor_nodes=}, {rollout_ref_nodes=}"
+            )
+        if actor_nodes + rollout_ref_nodes > total_nodes:
+            raise ValueError(
+                "fit_dis() dedicated node split exceeds available nodes: "
+                f"{actor_nodes=}, {rollout_ref_nodes=}, {total_nodes=}"
+            )
+        if actor_gpus_per_node > total_gpus_per_node or rollout_ref_gpus_per_node > total_gpus_per_node:
+            raise ValueError(
+                "fit_dis() dedicated node split exceeds available GPUs per dedicated node: "
+                f"{actor_gpus_per_node=}, {rollout_ref_gpus_per_node=}, {total_gpus_per_node=}"
+            )
+
+        return {
+            actor_pool_id: [actor_gpus_per_node] * actor_nodes,
+            rollout_ref_pool_id: [rollout_ref_gpus_per_node] * rollout_ref_nodes,
+        }
+
+    if actor_gpus_per_node + rollout_ref_gpus_per_node > total_gpus_per_node:
+        raise ValueError(
+            "fit_dis() GPU split exceeds available GPUs per shared node: "
+            f"{actor_gpus_per_node=}, {rollout_ref_gpus_per_node=}, {total_gpus_per_node=}"
+        )
+
+    return {
+        actor_pool_id: [actor_gpus_per_node] * total_nodes,
+        rollout_ref_pool_id: [rollout_ref_gpus_per_node] * total_nodes,
+    }
+
+
 # Define a function to run the PPO-like training process
 def run_ppo(config) -> None:
     """Initialize Ray cluster and run distributed PPO training process.
@@ -204,50 +283,16 @@ class TaskRunner:
         # Map roles to the resource pool.
         if placement == "colocated":
             if fit_disaggregate:
-                # fit_dis() uses separate WorkerGroups (actor + rollout_ref). By default, split GPUs evenly.
-                total_gpus_per_node = int(config.trainer.n_gpus_per_node)
-                actor_gpus_per_node = config.trainer.get("disaggregate_actor_n_gpus_per_node", None)
-                rollout_ref_gpus_per_node = config.trainer.get("disaggregate_rollout_ref_n_gpus_per_node", None)
-
-                if actor_gpus_per_node is None and rollout_ref_gpus_per_node is None:
-                    if total_gpus_per_node < 2:
-                        raise ValueError(
-                            "trainer.disaggregate=true requires at least 2 GPUs per node by default; "
-                            "or explicitly set trainer.disaggregate_actor_n_gpus_per_node and "
-                            "trainer.disaggregate_rollout_ref_n_gpus_per_node."
-                        )
-                    actor_gpus_per_node = total_gpus_per_node // 2
-                    rollout_ref_gpus_per_node = total_gpus_per_node - actor_gpus_per_node
-                elif actor_gpus_per_node is None:
-                    rollout_ref_gpus_per_node = int(rollout_ref_gpus_per_node)
-                    actor_gpus_per_node = total_gpus_per_node - rollout_ref_gpus_per_node
-                elif rollout_ref_gpus_per_node is None:
-                    actor_gpus_per_node = int(actor_gpus_per_node)
-                    rollout_ref_gpus_per_node = total_gpus_per_node - actor_gpus_per_node
-                else:
-                    actor_gpus_per_node = int(actor_gpus_per_node)
-                    rollout_ref_gpus_per_node = int(rollout_ref_gpus_per_node)
-
-                if actor_gpus_per_node <= 0 or rollout_ref_gpus_per_node <= 0:
-                    raise ValueError(
-                        "Invalid fit_dis() GPU split: "
-                        f"{actor_gpus_per_node=}, {rollout_ref_gpus_per_node=}"
-                    )
-                if actor_gpus_per_node + rollout_ref_gpus_per_node > total_gpus_per_node:
-                    raise ValueError(
-                        "fit_dis() GPU split exceeds available GPUs per node: "
-                        f"{actor_gpus_per_node=}, {rollout_ref_gpus_per_node=}, {total_gpus_per_node=}"
-                    )
-
                 role_worker_mapping = {
                     Role.Actor: ray.remote(actor_rollout_cls),
                     Role.RolloutRef: ray.remote(actor_rollout_cls),
                     Role.Critic: ray.remote(CriticWorker),
                 }
-                resource_pool_spec = {
-                    actor_pool_id: [actor_gpus_per_node] * config.trainer.nnodes,
-                    rollout_ref_pool_id: [rollout_ref_gpus_per_node] * config.trainer.nnodes,
-                }
+                resource_pool_spec = _build_fit_dis_resource_pool_spec(
+                    config=config,
+                    actor_pool_id=actor_pool_id,
+                    rollout_ref_pool_id=rollout_ref_pool_id,
+                )
                 mapping = {
                     Role.Actor: actor_pool_id,
                     Role.RolloutRef: rollout_ref_pool_id,

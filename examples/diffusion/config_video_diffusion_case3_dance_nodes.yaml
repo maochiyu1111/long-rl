@@ -100,8 +100,10 @@ trainer:
   save_freq: -1
   diffusion: true
   disaggregate: true
-  disaggregate_actor_n_gpus_per_node: 4
-  disaggregate_rollout_ref_n_gpus_per_node: 4
+  disaggregate_actor_n_gpus_per_node: 8
+  disaggregate_rollout_ref_n_gpus_per_node: 8
+  disaggregate_actor_nnodes: 1
+  disaggregate_rollout_ref_nnodes: 1
   dist_master_addr: 192.158.0.14
   dist_master_port: 29400
   pipelined_micro_batch: false

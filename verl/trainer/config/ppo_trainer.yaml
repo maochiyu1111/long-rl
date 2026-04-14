@@ -215,6 +215,14 @@ trainer:
   # Disaggregate pool size for rollout_ref workers (GPUs per node). null means auto-split from n_gpus_per_node.
   disaggregate_rollout_ref_n_gpus_per_node: null
 
+  # Optional dedicated node count for actor workers in fit_dis().
+  # null means actor shares all trainer.nnodes with rollout_ref and only splits GPUs within each node.
+  disaggregate_actor_nnodes: null
+
+  # Optional dedicated node count for rollout_ref workers in fit_dis().
+  # null means rollout_ref shares all trainer.nnodes with actor and only splits GPUs within each node.
+  disaggregate_rollout_ref_nnodes: null
+
   # Distributed init master address for fit_dis() global process group. null means using driver node IP.
   dist_master_addr: 192.158.0.11
 
