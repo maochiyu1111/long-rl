@@ -5,10 +5,10 @@ set -x
 export PYTHONUNBUFFERED=1
 export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
-export VERL_SOCKET_IFACE_PREFIX=192.158.0.
+export VERL_SOCKET_IFACE_PREFIX=${VERL_SOCKET_IFACE_PREFIX:-192.158.0.}
 
-RAY_ADDRESS=http://192.158.0.14:8265
-RAY_HEAD_HOST=192.158.0.14
+RAY_ADDRESS=192.158.0.11:6379
+RAY_HEAD_HOST=192.158.0.11
 WORKING_DIR=/workspace/projects/long-rl
 RUNTIME_ENV=/workspace/projects/long-rl/verl/trainer/runtime_env.yaml
 
@@ -16,7 +16,7 @@ MODEL_PATH=/share/models/dancegrpo/HunyuanVideo
 VIDEOALIGN_CKPT_PATH=/share/models/dancegrpo/videoalign_ckpt
 VIDEOALIGN_BASE_MODEL_PATH=/workspace/models/Qwen2-VL-2B-Instruct
 DATA_JSON_PATH=/share/models/dancegrpo/rl_embeddings/videos2caption.json
-REPORT_DIR=${REPORT_DIR:-/workspace/projects/long-rl/outputs/nodes/dance_case4_step_timing}
+REPORT_DIR=${REPORT_DIR:-/workspace/projects/long-rl/outputs/nodes_gpu/dance_case4_step_timing}
 
 export NO_PROXY="${RAY_HEAD_HOST},127.0.0.1,localhost${NO_PROXY:+,${NO_PROXY}}"
 export no_proxy="${RAY_HEAD_HOST},127.0.0.1,localhost${no_proxy:+,${no_proxy}}"
@@ -35,8 +35,8 @@ ray job submit --address="${RAY_ADDRESS}" \
     trainer.nnodes=2 \
     trainer.n_gpus_per_node=8 \
     trainer.max_train_steps=1 \
-    data.train_batch_size=32 \
-    data.gen_batch_size=32 \
+    data.train_batch_size=64 \
+    data.gen_batch_size=64 \
     data.data_json_path=${DATA_JSON_PATH} \
     actor_rollout_ref.model.path=${MODEL_PATH} \
     actor_rollout_ref.actor.ppo_mini_batch_size=32 \
