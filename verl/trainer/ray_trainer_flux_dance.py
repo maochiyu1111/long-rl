@@ -20,9 +20,9 @@ placing Flux-only dataloader and Case4 batch assembly in an isolated file.
 from typing import Optional
 
 from torch.utils.data import Sampler
+from torchdata.stateful_dataloader import StatefulDataLoader
 from verl import DataProto
 from verl.trainer.ppo.ray_trainer import RayPPOTrainer, ResourcePoolManager, Role
-from verl.utils.dataset.dataloader import StatefulDataLoader
 
 
 class RayPPOTrainerDance(RayPPOTrainer):

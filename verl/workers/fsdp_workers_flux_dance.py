@@ -23,7 +23,6 @@ import math
 import os
 from typing import Any
 
-import numpy as np
 import torch
 from omegaconf import DictConfig, OmegaConf
 from torch.profiler import record_function
@@ -104,7 +103,12 @@ class FSDPWorkerDance(ActorRolloutRefWorker):
             use_hpsv2 = bool(self._cfg_get(dance_cfg, "use_hpsv2", True))
             use_pickscore = bool(self._cfg_get(dance_cfg, "use_pickscore", False))
             if use_hpsv2:
-                from HPSv2.hpsv2.src.open_clip import create_model_and_transforms, get_tokenizer
+                try:
+                    # DIscoRL worker source uses this package layout.
+                    from HPSv2.hpsv2.src.open_clip import create_model_and_transforms, get_tokenizer
+                except ModuleNotFoundError:
+                    # Existing long-rl/fastvideo Flux scripts use the lowercase package layout.
+                    from hpsv2.src.open_clip import create_model_and_transforms, get_tokenizer
 
                 open_clip_ckpt = os.environ.get(
                     "OPEN_CLIP_CKPT_PATH", "/home/qzy/models/open_clip_pytorch_model.bin"
