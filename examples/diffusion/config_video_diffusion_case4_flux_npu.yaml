@@ -1,0 +1,38 @@
+hydra:
+  searchpath:
+    - file://verl/trainer/config
+
+defaults:
+  - config_video_diffusion_case4_flux
+  - _self_
+
+data:
+  train_batch_size: 32
+  gen_batch_size: 16
+  dataloader_num_workers: 8
+  data_json_path: /home/qzy/models/flux/rl_embeddings/videos2caption.json
+
+actor_rollout_ref:
+  model:
+    path: /home/qzy/models/flux
+  actor:
+    ppo_mini_batch_size: 16
+    ppo_micro_batch_size_per_gpu: 1
+    extra:
+      dance:
+        pretrained_model_name_or_path: /home/qzy/models/flux
+        vae_model_path: /home/qzy/models/flux
+  rollout:
+    sampling_steps: 16
+    num_frames: 1
+    height: 720
+    width: 720
+    num_generations: 2
+    bestofn: 2
+
+trainer:
+  experiment_name: case4_flux_npu
+  device: npu
+  nnodes: 1
+  n_gpus_per_node: 8
+  max_train_steps: 3
