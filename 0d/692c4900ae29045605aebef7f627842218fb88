@@ -1,0 +1,69 @@
+fastvideo/dataset/latent_flux_rl_datasets.py
+  8c008ce5f4219e52 102,105-106 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a027cb64c26ef37e666c5e2","tool_type":"agent","tool_id":"Edit","line_ranges":[{"Single":102},{"Range":[105,106]}]}]}
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "0d692c4900ae29045605aebef7f627842218fb88",
+  "prompts": {
+    "8c008ce5f4219e52": {
+      "agent_id": {
+        "tool": "trae",
+        "id": "6a020b044c26ef37e666c488",
+        "model": "openrouter-1__dev"
+      },
+      "human_author": "qzy <qingzhengyu@bytedance.com>",
+      "messages": [],
+      "total_additions": 3,
+      "total_deletions": 18,
+      "accepted_lines": 3,
+      "overriden_lines": 0
+    }
+  },
+  "attestation_metadata": {
+    "fastvideo/dataset/latent_flux_rl_datasets.py": [
+      {
+        "hash": "8c008ce5f4219e52",
+        "line_ranges": [
+          {
+            "Single": 102
+          },
+          {
+            "Range": [
+              105,
+              106
+            ]
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a027cb64c26ef37e666c5e2",
+            "tool_type": "agent",
+            "tool_id": "Edit",
+            "line_ranges": [
+              {
+                "Single": 102
+              },
+              {
+                "Range": [
+                  105,
+                  106
+                ]
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "remote_transcripts": {
+    "8c008ce5f4219e52": {
+      "tool": "trae",
+      "conversation_id": "6a020b044c26ef37e666c488",
+      "session_id": "6a020b044c26ef37e666c488",
+      "status": "remote_only",
+      "message": "Remote transcript resolution is not implemented yet for TRAE prompts."
+    }
+  }
+}
