@@ -99,10 +99,11 @@ if __name__ == "__main__":
     dataloader = torch.utils.data.DataLoader(
         dataset, batch_size=2, shuffle=False, collate_fn=latent_collate_function
     )
-    for prompt_embed, prompt_attention_mask, caption in dataloader:
+    for prompt_embed, pooled_prompt_embeds, text_ids, caption in dataloader:
         print(
             prompt_embed.shape,
-            prompt_attention_mask.shape,
+            pooled_prompt_embeds.shape,
+            text_ids.shape,
             caption
         )
         import pdb

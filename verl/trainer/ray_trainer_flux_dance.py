@@ -118,28 +118,12 @@ class RayPPOTrainerDance(RayPPOTrainer):
                         },
                         meta_info={"caption": caption},
                     )
-                    self._attach_timing_context(
-                        new_batch,
-                        global_step=self.global_steps + 1,
-                        round_idx=0,
-                        lane="colocate",
-                        role="actor_rollout_ref",
-                    )
 
                 with simple_timer("trainer.generate.task", timing_raw):
                     rollout_batch = self.actor_rollout_wg.generate_sequences(new_batch)
-                self._drain_timing_events(rollout_batch)
-                self._attach_timing_context(
-                    rollout_batch,
-                    global_step=self.global_steps + 1,
-                    round_idx=0,
-                    lane="colocate",
-                    role="actor_rollout_ref",
-                )
 
                 with simple_timer("trainer.update.task", timing_raw):
                     actor_output = self.actor_rollout_wg.update_actor(rollout_batch)
-                self._drain_timing_events(actor_output)
 
             actor_metrics = actor_output.meta_info.get("metrics", {}) if actor_output is not None else {}
             current_step = self.global_steps + 1
