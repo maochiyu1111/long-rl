@@ -8,9 +8,9 @@ export TRANSFORMERS_OFFLINE=1
 
 MODEL_ROOT=${MODEL_ROOT:-/home/qzy/models}
 FLUX_MODEL_PATH=${FLUX_MODEL_PATH:-${MODEL_ROOT}/flux}
-DATA_JSON_PATH=${DATA_JSON_PATH:-${MODEL_ROOT}/flux/rl_embeddings/videos2caption.json}
+DATA_JSON_PATH=${DATA_JSON_PATH:-${MODEL_ROOT}/rl_embeddings_128_flux/videos2caption.json}
 OPEN_CLIP_CKPT_PATH=${OPEN_CLIP_CKPT_PATH:-${MODEL_ROOT}/open_clip_pytorch_model.bin}
-HPSV2_CKPT_PATH=${HPSV2_CKPT_PATH:-${MODEL_ROOT}/HPS_v2.1_compressed.pt}
+HPSV2_CKPT_PATH=${HPSV2_CKPT_PATH:-${MODEL_ROOT}/HPSv2/HPS_v2.1_compressed.pt}
 REF_SCHEDULER_PATH=${REF_SCHEDULER_PATH:-${MODEL_ROOT}/Wan2.1-T2V-1.3B-Diffusers/scheduler}
 REPORT_DIR=${REPORT_DIR:-/home/qzy/project/long-rl/outputs/single/flux_case4_step_timing_npu}
 
